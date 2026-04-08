@@ -1,0 +1,59 @@
+{
+  "name": "@yawlabs/mcp-connect",
+  "version": "0.1.0",
+  "description": "MCP orchestrator — one install, all your MCP servers, managed from the cloud",
+  "license": "MIT",
+  "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
+  "type": "module",
+  "bin": {
+    "mcp-connect": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/",
+    "typecheck": "tsc --noEmit",
+    "test:ci": "npm run build && npm test",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "undici": "^7.8.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "orchestrator",
+    "mcp-server",
+    "ai",
+    "mcp-connect",
+    "mcp-hosting"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YawLabs/mcp-connect.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YawLabs/mcp-connect/issues"
+  },
+  "homepage": "https://mcp.hosting"
+}
