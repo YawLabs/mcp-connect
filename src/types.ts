@@ -27,6 +27,29 @@ export interface UpstreamToolDef {
   annotations?: Record<string, unknown>;
 }
 
+export interface UpstreamResourceDef {
+  uri: string;
+  namespacedUri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface UpstreamPromptDef {
+  name: string;
+  namespacedName: string;
+  description?: string;
+  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
+}
+
+export interface ConnectionHealth {
+  totalCalls: number;
+  errorCount: number;
+  totalLatencyMs: number;
+  lastErrorMessage?: string;
+  lastErrorAt?: string;
+}
+
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
 
 export interface UpstreamConnection {
@@ -34,6 +57,9 @@ export interface UpstreamConnection {
   client: Client;
   transport: StdioClientTransport | StreamableHTTPClientTransport;
   tools: UpstreamToolDef[];
+  resources: UpstreamResourceDef[];
+  prompts: UpstreamPromptDef[];
+  health: ConnectionHealth;
   status: ConnectionStatus;
   error?: string;
 }

@@ -2,7 +2,13 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { log } from "./logger.js";
-import type { UpstreamConnection, UpstreamServerConfig, UpstreamToolDef } from "./types.js";
+import type {
+  UpstreamConnection,
+  UpstreamPromptDef,
+  UpstreamResourceDef,
+  UpstreamServerConfig,
+  UpstreamToolDef,
+} from "./types.js";
 
 const CONNECT_TIMEOUT = 15_000;
 
@@ -40,14 +46,19 @@ export async function connectToUpstream(config: UpstreamServerConfig): Promise<U
 
   log("info", "Connected to upstream", { name: config.name, namespace: config.namespace, type: config.type });
 
-  // Fetch tools
+  // Fetch tools, resources, prompts
   const tools = await fetchToolsFromUpstream(client, config.namespace);
+  const resources = await fetchResourcesFromUpstream(client, config.namespace);
+  const prompts = await fetchPromptsFromUpstream(client, config.namespace);
 
   return {
     config,
     client,
     transport,
     tools,
+    resources,
+    prompts,
+    health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
     status: "connected",
   };
 }
@@ -63,6 +74,37 @@ export async function disconnectFromUpstream(connection: UpstreamConnection): Pr
   }
   connection.status = "disconnected";
   log("info", "Disconnected from upstream", { namespace: connection.config.namespace });
+}
+
+export async function fetchResourcesFromUpstream(client: Client, namespace: string): Promise<UpstreamResourceDef[]> {
+  try {
+    const result = await client.listResources();
+    return (result.resources ?? []).map((r) => ({
+      uri: r.uri,
+      namespacedUri: "connect://" + namespace + "/" + r.uri,
+      name: r.name,
+      description: r.description,
+      mimeType: r.mimeType,
+    }));
+  } catch {
+    // Server may not support resources — that's fine
+    return [];
+  }
+}
+
+export async function fetchPromptsFromUpstream(client: Client, namespace: string): Promise<UpstreamPromptDef[]> {
+  try {
+    const result = await client.listPrompts();
+    return (result.prompts ?? []).map((p) => ({
+      name: p.name,
+      namespacedName: namespace + "_" + p.name,
+      description: p.description,
+      arguments: p.arguments as UpstreamPromptDef["arguments"],
+    }));
+  } catch {
+    // Server may not support prompts — that's fine
+    return [];
+  }
 }
 
 export async function fetchToolsFromUpstream(client: Client, namespace: string): Promise<UpstreamToolDef[]> {

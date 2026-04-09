@@ -1,11 +1,31 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolRequestSchema,
+  GetPromptRequestSchema,
+  ListPromptsRequestSchema,
+  ListResourcesRequestSchema,
+  ListToolsRequestSchema,
+  ReadResourceRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES } from "./meta-tools.js";
-import { type ToolRoute, buildToolList, buildToolRoutes, routeToolCall } from "./proxy.js";
+import {
+  type PromptRoute,
+  type ResourceRoute,
+  type ToolRoute,
+  buildPromptList,
+  buildPromptRoutes,
+  buildResourceList,
+  buildResourceRoutes,
+  buildToolList,
+  buildToolRoutes,
+  routePromptGet,
+  routeResourceRead,
+  routeToolCall,
+} from "./proxy.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { connectToUpstream, disconnectFromUpstream } from "./upstream.js";
 
@@ -18,6 +38,8 @@ export class ConnectServer {
   private configVersion: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
+  private resourceRoutes = new Map<string, ResourceRoute>();
+  private promptRoutes = new Map<string, PromptRoute>();
   private idleCallCounts = new Map<string, number>();
 
   private static readonly IDLE_CALL_THRESHOLD = 10;
@@ -27,8 +49,14 @@ export class ConnectServer {
     private token: string,
   ) {
     this.server = new Server(
-      { name: "mcp-connect", version: "0.1.0" },
-      { capabilities: { tools: { listChanged: true } } },
+      { name: "mcp-connect", version: "0.2.0" },
+      {
+        capabilities: {
+          tools: { listChanged: true },
+          resources: { listChanged: true },
+          prompts: { listChanged: true },
+        },
+      },
     );
     this.setupHandlers();
   }
@@ -42,6 +70,39 @@ export class ConnectServer {
       const { name, arguments: args } = request.params;
       return this.handleToolCall(name, args ?? {});
     });
+
+    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: buildResourceList(this.connections),
+    }));
+
+    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      return routeResourceRead(request.params.uri, this.resourceRoutes, this.connections);
+    });
+
+    this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+      prompts: buildPromptList(this.connections),
+    }));
+
+    this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+      return routePromptGet(
+        request.params.name,
+        request.params.arguments as Record<string, string> | undefined,
+        this.promptRoutes,
+        this.connections,
+      );
+    });
+  }
+
+  private rebuildRoutes(): void {
+    this.toolRoutes = buildToolRoutes(this.connections);
+    this.resourceRoutes = buildResourceRoutes(this.connections);
+    this.promptRoutes = buildPromptRoutes(this.connections);
+  }
+
+  private async notifyAllListsChanged(): Promise<void> {
+    await this.server.sendToolListChanged();
+    await this.server.sendResourceListChanged().catch(() => {});
+    await this.server.sendPromptListChanged().catch(() => {});
   }
 
   async start(): Promise<void> {
@@ -205,10 +266,8 @@ export class ConnectServer {
       const connection = await connectToUpstream(serverConfig);
       this.connections.set(namespace, connection);
       this.idleCallCounts.set(namespace, 0);
-      this.toolRoutes = buildToolRoutes(this.connections);
-
-      // Notify client that tool list changed
-      await this.server.sendToolListChanged();
+      this.rebuildRoutes();
+      await this.notifyAllListsChanged();
 
       const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
       return {
@@ -249,10 +308,8 @@ export class ConnectServer {
     await disconnectFromUpstream(connection);
     this.connections.delete(namespace);
     this.idleCallCounts.delete(namespace);
-    this.toolRoutes = buildToolRoutes(this.connections);
-
-    // Notify client that tool list changed
-    await this.server.sendToolListChanged();
+    this.rebuildRoutes();
+    await this.notifyAllListsChanged();
 
     return {
       content: [{ type: "text", text: 'Deactivated "' + namespace + '". Tools removed.' }],
@@ -289,8 +346,8 @@ export class ConnectServer {
     }
 
     if (toDeactivate.length > 0) {
-      this.toolRoutes = buildToolRoutes(this.connections);
-      await this.server.sendToolListChanged();
+      this.rebuildRoutes();
+      await this.notifyAllListsChanged();
     }
   }
 
@@ -338,8 +395,8 @@ export class ConnectServer {
     }
 
     if (changed) {
-      this.toolRoutes = buildToolRoutes(this.connections);
-      await this.server.sendToolListChanged();
+      this.rebuildRoutes();
+      await this.notifyAllListsChanged();
     }
   }
 
