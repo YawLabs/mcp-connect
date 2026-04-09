@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/mcp-connect",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP orchestrator — one install, all your MCP servers, managed from the cloud",
   "license": "MIT",
   "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
