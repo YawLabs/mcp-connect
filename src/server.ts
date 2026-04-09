@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -8,6 +11,7 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { request } from "undici";
 import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import { log } from "./logger.js";
@@ -164,6 +168,12 @@ export class ConnectServer {
       });
       return result;
     }
+    if (name === META_TOOLS.import_config.name) {
+      return this.handleImport(args.filepath as string);
+    }
+    if (name === META_TOOLS.health.name) {
+      return this.handleHealth();
+    }
 
     // Route to upstream — auto-reconnect if disconnected
     const route = this.toolRoutes.get(name);
@@ -206,6 +216,18 @@ export class ConnectServer {
     const latencyMs = Date.now() - startMs;
 
     if (route) {
+      // Track health stats
+      const conn = this.connections.get(route.namespace);
+      if (conn) {
+        conn.health.totalCalls++;
+        conn.health.totalLatencyMs += latencyMs;
+        if (result.isError) {
+          conn.health.errorCount++;
+          conn.health.lastErrorMessage = result.content[0]?.text;
+          conn.health.lastErrorAt = new Date().toISOString();
+        }
+      }
+
       recordConnectEvent({
         namespace: route.namespace,
         toolName: route.originalName,
@@ -455,6 +477,132 @@ export class ConnectServer {
     if (this.pollTimer.unref) {
       this.pollTimer.unref();
     }
+  }
+
+  private async handleImport(
+    filepath: string,
+  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+    if (!filepath) {
+      return { content: [{ type: "text", text: "filepath is required." }], isError: true };
+    }
+
+    try {
+      const resolved = filepath.startsWith("~") ? resolve(homedir(), filepath.slice(2)) : resolve(filepath);
+      const raw = await readFile(resolved, "utf-8");
+      const parsed = JSON.parse(raw);
+
+      // Support multiple config formats
+      const mcpServers: Record<string, any> = parsed.mcpServers || parsed;
+
+      if (typeof mcpServers !== "object" || Array.isArray(mcpServers)) {
+        return { content: [{ type: "text", text: "No mcpServers object found in " + resolved }], isError: true };
+      }
+
+      const servers: Array<{
+        name: string;
+        namespace: string;
+        type: string;
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+        url?: string;
+      }> = [];
+
+      for (const [key, value] of Object.entries(mcpServers)) {
+        if (!value || typeof value !== "object") continue;
+        // Skip ourselves
+        if (key === "mcp-connect") continue;
+
+        const namespace = key
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, "_")
+          .replace(/^_+|_+$/g, "")
+          .slice(0, 30);
+        if (!namespace) continue;
+
+        const entry: (typeof servers)[0] = {
+          name: key,
+          namespace,
+          type: (value as any).url ? "remote" : "local",
+        };
+
+        if ((value as any).command) entry.command = (value as any).command;
+        if ((value as any).args) entry.args = (value as any).args;
+        if ((value as any).env) entry.env = (value as any).env;
+        if ((value as any).url) entry.url = (value as any).url;
+
+        servers.push(entry);
+      }
+
+      if (servers.length === 0) {
+        return { content: [{ type: "text", text: "No servers found in " + resolved }], isError: true };
+      }
+
+      // POST to the bulk import endpoint
+      const res = await request(this.apiUrl.replace(/\/$/, "") + "/api/connect/import", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + this.token,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ servers }),
+        headersTimeout: 15_000,
+        bodyTimeout: 15_000,
+      });
+
+      const body = (await res.body.json()) as any;
+
+      if (res.statusCode >= 400) {
+        return {
+          content: [{ type: "text", text: "Import failed: " + (body.error || "HTTP " + res.statusCode) }],
+          isError: true,
+        };
+      }
+
+      // Refresh config to pick up imported servers
+      await this.fetchAndApplyConfig().catch(() => {});
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Imported " +
+              (body.imported || 0) +
+              " servers" +
+              (body.skipped ? ", " + body.skipped + " skipped (already exist)" : "") +
+              " from " +
+              resolved +
+              ". Use mcp_connect_discover to see them.",
+          },
+        ],
+      };
+    } catch (err: any) {
+      return { content: [{ type: "text", text: "Import error: " + err.message }], isError: true };
+    }
+  }
+
+  private handleHealth(): { content: Array<{ type: string; text: string }> } {
+    if (this.connections.size === 0) {
+      return { content: [{ type: "text", text: "No active connections." }] };
+    }
+
+    const lines: string[] = ["Connection health:\n"];
+
+    for (const [namespace, conn] of this.connections) {
+      const h = conn.health;
+      const avgLatency = h.totalCalls > 0 ? Math.round(h.totalLatencyMs / h.totalCalls) : 0;
+      const errorRate = h.totalCalls > 0 ? Math.round((h.errorCount / h.totalCalls) * 100) : 0;
+
+      lines.push("  " + namespace + " [" + conn.status + "]");
+      lines.push("    calls: " + h.totalCalls + ", errors: " + h.errorCount + " (" + errorRate + "%)");
+      lines.push("    avg latency: " + avgLatency + "ms");
+      if (h.lastErrorMessage) {
+        lines.push("    last error: " + h.lastErrorMessage + " at " + h.lastErrorAt);
+      }
+    }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 
   async shutdown(): Promise<void> {

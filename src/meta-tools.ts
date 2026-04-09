@@ -59,10 +59,50 @@ export const META_TOOLS = {
       openWorldHint: false,
     },
   },
+  import_config: {
+    name: "mcp_connect_import",
+    description:
+      "Import MCP servers from an existing config file (Claude Desktop, Cursor, VS Code, etc.). Reads the file, parses the mcpServers section, and creates connect server entries in the cloud. Supported files: claude_desktop_config.json, mcp.json, settings.json.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        filepath: {
+          type: "string",
+          description: 'Path to the MCP config file (e.g., "~/.claude/claude_desktop_config.json", ".cursor/mcp.json")',
+        },
+      },
+      required: ["filepath"],
+    },
+    annotations: {
+      title: "Import MCP Config",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  health: {
+    name: "mcp_connect_health",
+    description:
+      "Show health stats for all active MCP server connections: total calls, error count, average latency, and last error.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+    annotations: {
+      title: "Connection Health",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
 } as const;
 
 export const META_TOOL_NAMES = new Set([
   META_TOOLS.discover.name,
   META_TOOLS.activate.name,
   META_TOOLS.deactivate.name,
+  META_TOOLS.import_config.name,
+  META_TOOLS.health.name,
 ]);
