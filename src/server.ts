@@ -1,6 +1,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES } from "./meta-tools.js";
@@ -55,6 +56,8 @@ export class ConnectServer {
       this.config = { servers: [], configVersion: "" };
     }
 
+    initAnalytics(this.apiUrl, this.token);
+
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
 
@@ -71,20 +74,47 @@ export class ConnectServer {
     args: Record<string, unknown>,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     if (name === META_TOOLS.discover.name) {
+      recordConnectEvent({ namespace: null, toolName: null, action: "discover", latencyMs: null, success: true });
       return this.handleDiscover();
     }
     if (name === META_TOOLS.activate.name) {
-      return this.handleActivate(args.server as string);
+      const result = await this.handleActivate(args.server as string);
+      recordConnectEvent({
+        namespace: (args.server as string) || null,
+        toolName: null,
+        action: "activate",
+        latencyMs: null,
+        success: !result.isError,
+      });
+      return result;
     }
     if (name === META_TOOLS.deactivate.name) {
-      return this.handleDeactivate(args.server as string);
+      const result = await this.handleDeactivate(args.server as string);
+      recordConnectEvent({
+        namespace: (args.server as string) || null,
+        toolName: null,
+        action: "deactivate",
+        latencyMs: null,
+        success: !result.isError,
+      });
+      return result;
     }
 
     // Route to upstream and track usage for auto-deactivate
     const route = this.toolRoutes.get(name);
+    const startMs = Date.now();
     const result = await routeToolCall(name, args, this.toolRoutes, this.connections);
+    const latencyMs = Date.now() - startMs;
 
     if (route) {
+      recordConnectEvent({
+        namespace: route.namespace,
+        toolName: route.originalName,
+        action: "tool_call",
+        latencyMs,
+        success: !result.isError,
+        error: result.isError ? result.content[0]?.text : undefined,
+      });
       await this.trackUsageAndAutoDeactivate(route.namespace);
     }
 
@@ -335,6 +365,8 @@ export class ConnectServer {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+
+    await shutdownAnalytics();
 
     // Disconnect all upstreams
     const disconnects = Array.from(this.connections.values()).map((conn) => disconnectFromUpstream(conn));
