@@ -17,6 +17,9 @@ export class ConnectServer {
   private configVersion: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private toolRoutes = new Map<string, ToolRoute>();
+  private idleCallCounts = new Map<string, number>();
+
+  private static readonly IDLE_CALL_THRESHOLD = 10;
 
   constructor(
     private apiUrl: string,
@@ -77,7 +80,15 @@ export class ConnectServer {
       return this.handleDeactivate(args.server as string);
     }
 
-    return routeToolCall(name, args, this.toolRoutes, this.connections);
+    // Route to upstream and track usage for auto-deactivate
+    const route = this.toolRoutes.get(name);
+    const result = await routeToolCall(name, args, this.toolRoutes, this.connections);
+
+    if (route) {
+      await this.trackUsageAndAutoDeactivate(route.namespace);
+    }
+
+    return result;
   }
 
   private handleDiscover(): { content: Array<{ type: string; text: string }> } {
@@ -163,6 +174,7 @@ export class ConnectServer {
     try {
       const connection = await connectToUpstream(serverConfig);
       this.connections.set(namespace, connection);
+      this.idleCallCounts.set(namespace, 0);
       this.toolRoutes = buildToolRoutes(this.connections);
 
       // Notify client that tool list changed
@@ -206,6 +218,7 @@ export class ConnectServer {
 
     await disconnectFromUpstream(connection);
     this.connections.delete(namespace);
+    this.idleCallCounts.delete(namespace);
     this.toolRoutes = buildToolRoutes(this.connections);
 
     // Notify client that tool list changed
@@ -214,6 +227,41 @@ export class ConnectServer {
     return {
       content: [{ type: "text", text: 'Deactivated "' + namespace + '". Tools removed.' }],
     };
+  }
+
+  private async trackUsageAndAutoDeactivate(calledNamespace: string): Promise<void> {
+    // Reset idle count for the server that was just called
+    this.idleCallCounts.set(calledNamespace, 0);
+
+    // Increment idle count for all OTHER active servers
+    for (const ns of this.connections.keys()) {
+      if (ns !== calledNamespace) {
+        this.idleCallCounts.set(ns, (this.idleCallCounts.get(ns) ?? 0) + 1);
+      }
+    }
+
+    // Auto-deactivate servers that have been idle too long
+    const toDeactivate: string[] = [];
+    for (const [ns, idleCount] of this.idleCallCounts) {
+      if (idleCount >= ConnectServer.IDLE_CALL_THRESHOLD && this.connections.has(ns)) {
+        toDeactivate.push(ns);
+      }
+    }
+
+    for (const ns of toDeactivate) {
+      log("info", "Auto-deactivating idle server", { namespace: ns, idleCalls: this.idleCallCounts.get(ns) });
+      const connection = this.connections.get(ns);
+      if (connection) {
+        await disconnectFromUpstream(connection);
+        this.connections.delete(ns);
+        this.idleCallCounts.delete(ns);
+      }
+    }
+
+    if (toDeactivate.length > 0) {
+      this.toolRoutes = buildToolRoutes(this.connections);
+      await this.server.sendToolListChanged();
+    }
   }
 
   private async fetchAndApplyConfig(): Promise<void> {

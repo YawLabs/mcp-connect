@@ -2,7 +2,7 @@ export const META_TOOLS = {
   discover: {
     name: "mcp_connect_discover",
     description:
-      "List all available MCP servers configured in your mcp.hosting account. Shows server names, namespaces, types, and whether they are currently active. Call this first to see what servers are available before activating them.",
+      "List all available MCP servers. Call this FIRST before activating anything. Only activate servers you need for the CURRENT task — each one adds tools to your context. Shows server names, namespaces, tool counts, and activation status.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -18,7 +18,7 @@ export const META_TOOLS = {
   activate: {
     name: "mcp_connect_activate",
     description:
-      'Activate an MCP server by its namespace. This connects to the server and makes its tools available. After activation, the tool list will update with the new tools prefixed by the namespace (e.g., "gh_create_issue" for namespace "gh").',
+      'Activate an MCP server by namespace to load its tools. Each server adds tools to context, so only activate what you need right now. Good practice: deactivate servers you are done with before activating new ones. Tools are prefixed by namespace (e.g., "gh_create_issue").',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -40,7 +40,7 @@ export const META_TOOLS = {
   deactivate: {
     name: "mcp_connect_deactivate",
     description:
-      "Deactivate an MCP server by its namespace. This disconnects from the server and removes its tools from the available tool list. Use this to free up context when you no longer need a server.",
+      "Deactivate an MCP server to remove its tools and free context. Always deactivate servers you are finished with. Servers idle for 10+ tool calls to other servers are auto-deactivated.",
     inputSchema: {
       type: "object" as const,
       properties: {
