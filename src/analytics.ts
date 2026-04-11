@@ -33,10 +33,10 @@ async function flush(): Promise<void> {
 
   const events = buffer.splice(0, FLUSH_SIZE);
   try {
-    const res = await request(apiUrl.replace(/\/$/, "") + "/api/connect/analytics", {
+    const res = await request(`${apiUrl.replace(/\/$/, "")}/api/connect/analytics`, {
       method: "POST",
       headers: {
-        Authorization: "Bearer " + token,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ events }),

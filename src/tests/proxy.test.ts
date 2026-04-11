@@ -22,17 +22,17 @@ function makeConnection(
     transport: {} as any,
     tools: tools.map((name) => ({
       name,
-      namespacedName: namespace + "_" + name,
+      namespacedName: `${namespace}_${name}`,
       inputSchema: { type: "object" },
     })),
     resources: resources.map((uri) => ({
       uri,
-      namespacedUri: "connect://" + namespace + "/" + uri,
+      namespacedUri: `connect://${namespace}/${uri}`,
       name: uri,
     })),
     prompts: prompts.map((name) => ({
       name,
-      namespacedName: namespace + "_" + name,
+      namespacedName: `${namespace}_${name}`,
     })),
     health: { totalCalls: 0, errorCount: 0, totalLatencyMs: 0 },
     status: "connected",

@@ -18,7 +18,12 @@ import type {
 
 declare const __VERSION__: string;
 
-const CONNECT_TIMEOUT = Number.parseInt(process.env.MCP_CONNECT_TIMEOUT ?? "15000", 10) || 15_000;
+const CONNECT_TIMEOUT = (() => {
+  const env = process.env.MCP_CONNECT_TIMEOUT;
+  if (!env) return 15_000;
+  const n = Number.parseInt(env, 10);
+  return Number.isFinite(n) && n > 0 ? n : 15_000;
+})();
 
 export async function connectToUpstream(
   config: UpstreamServerConfig,
@@ -60,17 +65,13 @@ export async function connectToUpstream(
   // Connect with timeout — clear timer on success, close client on timeout
   const hint =
     config.type === "local"
-      ? " Verify that '" +
-        config.command +
-        "' is installed and the server starts within " +
-        CONNECT_TIMEOUT / 1000 +
-        " seconds."
-      : " Verify that " + config.url + " is reachable.";
+      ? ` Verify that '${config.command}' is installed and the server starts within ${CONNECT_TIMEOUT / 1000} seconds.`
+      : ` Verify that ${config.url} is reachable.`;
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(
-      () => reject(new Error("Connection timeout after " + CONNECT_TIMEOUT + "ms." + hint)),
+      () => reject(new Error(`Connection timeout after ${CONNECT_TIMEOUT}ms.${hint}`)),
       CONNECT_TIMEOUT,
     );
   });
@@ -172,7 +173,7 @@ export async function fetchResourcesFromUpstream(client: Client, namespace: stri
     const result = await client.listResources();
     return (result.resources ?? []).map((r) => ({
       uri: r.uri,
-      namespacedUri: "connect://" + namespace + "/" + r.uri,
+      namespacedUri: `connect://${namespace}/${r.uri}`,
       name: r.name,
       description: r.description,
       mimeType: r.mimeType,
@@ -188,7 +189,7 @@ export async function fetchPromptsFromUpstream(client: Client, namespace: string
     const result = await client.listPrompts();
     return (result.prompts ?? []).map((p) => ({
       name: p.name,
-      namespacedName: namespace + "_" + p.name,
+      namespacedName: `${namespace}_${p.name}`,
       description: p.description,
       arguments: p.arguments as UpstreamPromptDef["arguments"],
     }));
@@ -203,7 +204,7 @@ export async function fetchToolsFromUpstream(client: Client, namespace: string):
 
   return (result.tools ?? []).map((tool) => ({
     name: tool.name,
-    namespacedName: namespace + "_" + tool.name,
+    namespacedName: `${namespace}_${tool.name}`,
     description: tool.description,
     inputSchema: tool.inputSchema as Record<string, unknown>,
     annotations: tool.annotations as Record<string, unknown> | undefined,

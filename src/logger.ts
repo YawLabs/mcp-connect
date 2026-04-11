@@ -6,5 +6,5 @@ const minLevel: number = LOG_LEVELS[process.env.LOG_LEVEL?.toLowerCase() as LogL
 export function log(level: LogLevel, msg: string, data?: Record<string, unknown>): void {
   if (LOG_LEVELS[level] < minLevel) return;
   const entry = JSON.stringify({ level, msg, ts: new Date().toISOString(), ...data });
-  process.stderr.write(entry + "\n");
+  process.stderr.write(`${entry}\n`);
 }

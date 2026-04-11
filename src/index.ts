@@ -43,7 +43,7 @@ process.on("SIGINT", shutdown);
 
 server.start().catch((err) => {
   if (err instanceof ConfigError && err.fatal) {
-    process.stderr.write("\n  mcp-connect: " + err.message + "\n\n");
+    process.stderr.write(`\n  mcp-connect: ${err.message}\n\n`);
     process.exit(1);
   }
 

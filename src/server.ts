@@ -57,6 +57,13 @@ function envEqual(a?: Record<string, string>, b?: Record<string, string>): boole
   return keysA.every((k) => a[k] === b[k]);
 }
 
+function argsEqual(a?: string[], b?: string[]): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  return a.every((v, i) => v === b[i]);
+}
+
 export class ConnectServer {
   private server: Server;
   private connections = new Map<string, UpstreamConnection>();
@@ -231,32 +238,41 @@ export class ConnectServer {
       if (conn && conn.status === "error") {
         const serverConfig = this.config?.servers.find((s) => s.namespace === route.namespace);
         if (serverConfig) {
-          try {
-            await disconnectFromUpstream(conn);
-            const newConn = await connectToUpstream(
-              serverConfig,
-              this.onUpstreamDisconnect,
-              this.onUpstreamListChanged,
-            );
-            this.connections.set(route.namespace, newConn);
-            this.rebuildRoutes();
-            await this.notifyAllListsChanged();
-            log("info", "Auto-reconnected to upstream", { namespace: route.namespace });
-          } catch (err: any) {
+          let reconnected = false;
+          let lastErr: any;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              await disconnectFromUpstream(conn);
+              const newConn = await connectToUpstream(
+                serverConfig,
+                this.onUpstreamDisconnect,
+                this.onUpstreamListChanged,
+              );
+              this.connections.set(route.namespace, newConn);
+              this.rebuildRoutes();
+              await this.notifyAllListsChanged();
+              log("info", "Auto-reconnected to upstream", { namespace: route.namespace });
+              reconnected = true;
+              break;
+            } catch (err: any) {
+              lastErr = err;
+              if (attempt === 0) {
+                log("warn", "Auto-reconnect attempt failed, retrying", {
+                  namespace: route.namespace,
+                  error: err.message,
+                });
+                await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+              }
+            }
+          }
+          if (!reconnected) {
             conn.status = "error";
-            log("error", "Auto-reconnect failed", { namespace: route.namespace, error: err.message });
+            log("error", "Auto-reconnect failed", { namespace: route.namespace, error: lastErr.message });
             return {
               content: [
                 {
                   type: "text",
-                  text:
-                    'Server "' +
-                    route.namespace +
-                    '" disconnected and auto-reconnect failed: ' +
-                    err.message +
-                    '. Use mcp_connect_activate with server "' +
-                    route.namespace +
-                    '" to manually reconnect.',
+                  text: `Server "${route.namespace}" disconnected and auto-reconnect failed: ${lastErr.message}. Use mcp_connect_activate with server "${route.namespace}" to manually reconnect.`,
                 },
               ],
               isError: true,
@@ -266,20 +282,21 @@ export class ConnectServer {
       }
     }
 
+    // Capture connection ref before the await to avoid race with config reconciliation
+    const connForHealth = route ? this.connections.get(route.namespace) : undefined;
+
     const startMs = Date.now();
     const result = await routeToolCall(name, args, this.toolRoutes, this.connections);
     const latencyMs = Date.now() - startMs;
 
     if (route) {
-      // Track health stats
-      const conn = this.connections.get(route.namespace);
-      if (conn) {
-        conn.health.totalCalls++;
-        conn.health.totalLatencyMs += latencyMs;
+      if (connForHealth) {
+        connForHealth.health.totalCalls++;
+        connForHealth.health.totalLatencyMs += latencyMs;
         if (result.isError) {
-          conn.health.errorCount++;
-          conn.health.lastErrorMessage = result.content[0]?.text;
-          conn.health.lastErrorAt = new Date().toISOString();
+          connForHealth.health.errorCount++;
+          connForHealth.health.lastErrorMessage = result.content[0]?.text;
+          connForHealth.health.lastErrorAt = new Date().toISOString();
         }
       }
 
@@ -332,20 +349,20 @@ export class ConnectServer {
       const status = connection
         ? connection.status === "error"
           ? "ERROR (disconnected, will auto-reconnect on use)"
-          : "ACTIVE (" + connection.tools.length + " tools)"
+          : `ACTIVE (${connection.tools.length} tools)`
         : "available";
 
       const score = scores.get(server.namespace);
-      const relevance = score && score > 0 ? " (relevance: " + score + ")" : "";
+      const relevance = score && score > 0 ? ` (relevance: ${score})` : "";
 
-      lines.push("  " + server.namespace + " — " + server.name + " [" + status + "] (" + server.type + ")" + relevance);
+      lines.push(`  ${server.namespace} — ${server.name} [${status}] (${server.type})${relevance}`);
 
       // Show cached tool names for servers that aren't currently connected
       if (!connection) {
         const cached = this.toolCache.get(server.namespace);
         if (cached && cached.length > 0) {
           const toolNames = cached.map((t) => t.name).join(", ");
-          lines.push("    known tools: " + toolNames);
+          lines.push(`    known tools: ${toolNames}`);
         }
       }
     }
@@ -354,13 +371,13 @@ export class ConnectServer {
     if (inactive.length > 0) {
       lines.push("\nDisabled servers:");
       for (const server of inactive) {
-        lines.push("  " + server.namespace + " — " + server.name + " (disabled in dashboard)");
+        lines.push(`  ${server.namespace} — ${server.name} (disabled in dashboard)`);
       }
     }
 
     const activeCount = this.connections.size;
     const totalTools = Array.from(this.connections.values()).reduce((sum, c) => sum + c.tools.length, 0);
-    lines.push("\n" + activeCount + " active, " + totalTools + " tools loaded.");
+    lines.push(`\n${activeCount} active, ${totalTools} tools loaded.`);
     lines.push("Use mcp_connect_activate to activate a server by its namespace.");
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -386,14 +403,14 @@ export class ConnectServer {
       // Already active?
       const existing = this.connections.get(namespace);
       if (existing && existing.status === "connected") {
-        results.push('"' + namespace + '" is already active with ' + existing.tools.length + " tools.");
+        results.push(`"${namespace}" is already active with ${existing.tools.length} tools.`);
         continue;
       }
 
       // Find in config
       const serverConfig = this.config?.servers.find((s) => s.namespace === namespace && s.isActive);
       if (!serverConfig) {
-        results.push('"' + namespace + '" not found or disabled.');
+        results.push(`"${namespace}" not found or disabled.`);
         anyError = true;
         continue;
       }
@@ -417,20 +434,20 @@ export class ConnectServer {
           activated = true;
 
           const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
-          results.push('Activated "' + namespace + '" — ' + connection.tools.length + " tools: " + toolNames);
+          results.push(`Activated "${namespace}" — ${connection.tools.length} tools: ${toolNames}`);
           break;
         } catch (err: any) {
           lastError = err.message;
           if (attempt === 0) {
             log("warn", "Activation attempt failed, retrying", { namespace, error: err.message });
-            await new Promise((r) => setTimeout(r, 2000));
+            await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
           }
         }
       }
 
       if (!activated) {
         log("error", "Failed to activate upstream", { namespace, error: lastError });
-        results.push('Failed to activate "' + namespace + '": ' + lastError);
+        results.push(`Failed to activate "${namespace}": ${lastError}`);
         anyError = true;
       }
     }
@@ -462,7 +479,7 @@ export class ConnectServer {
     for (const namespace of namespaces) {
       const connection = this.connections.get(namespace);
       if (!connection) {
-        results.push('"' + namespace + '" is not active.');
+        results.push(`"${namespace}" is not active.`);
         continue;
       }
 
@@ -470,7 +487,7 @@ export class ConnectServer {
       this.connections.delete(namespace);
       this.idleCallCounts.delete(namespace);
       anyChanged = true;
-      results.push('Deactivated "' + namespace + '". Tools removed.');
+      results.push(`Deactivated "${namespace}". Tools removed.`);
     }
 
     if (anyChanged) {
@@ -563,7 +580,7 @@ export class ConnectServer {
       const oldConfig = connection.config;
       if (
         oldConfig.command !== newServerConfig.command ||
-        JSON.stringify(oldConfig.args) !== JSON.stringify(newServerConfig.args) ||
+        !argsEqual(oldConfig.args, newServerConfig.args) ||
         oldConfig.url !== newServerConfig.url ||
         !envEqual(oldConfig.env, newServerConfig.env)
       ) {
@@ -582,6 +599,9 @@ export class ConnectServer {
   }
 
   private startPolling(): void {
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+    }
     const poll = async () => {
       try {
         await this.fetchAndApplyConfig();
@@ -610,7 +630,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "Only MCP config files are allowed: " + ALLOWED_FILENAMES.join(", ") + ". Got: " + basename,
+            text: `Only MCP config files are allowed: ${ALLOWED_FILENAMES.join(", ")}. Got: ${basename}`,
           },
         ],
         isError: true,
@@ -628,7 +648,7 @@ export class ConnectServer {
       // Only parse if file has mcpServers key
       if (!parsed.mcpServers || typeof parsed.mcpServers !== "object" || Array.isArray(parsed.mcpServers)) {
         return {
-          content: [{ type: "text", text: "No mcpServers object found in " + resolved }],
+          content: [{ type: "text", text: `No mcpServers object found in ${resolved}` }],
           isError: true,
         };
       }
@@ -672,14 +692,23 @@ export class ConnectServer {
       }
 
       if (servers.length === 0) {
-        return { content: [{ type: "text", text: "No servers found in " + resolved }], isError: true };
+        return { content: [{ type: "text", text: `No servers found in ${resolved}` }], isError: true };
       }
 
+      // Detect namespace collisions from sanitization
+      const nsToKeys = new Map<string, string[]>();
+      for (const s of servers) {
+        const existing = nsToKeys.get(s.namespace) ?? [];
+        existing.push(s.name);
+        nsToKeys.set(s.namespace, existing);
+      }
+      const collisions = [...nsToKeys.entries()].filter(([, keys]) => keys.length > 1);
+
       // POST to the bulk import endpoint
-      const res = await request(this.apiUrl.replace(/\/$/, "") + "/api/connect/import", {
+      const res = await request(`${this.apiUrl.replace(/\/$/, "")}/api/connect/import`, {
         method: "POST",
         headers: {
-          Authorization: "Bearer " + this.token,
+          Authorization: `Bearer ${this.token}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ servers }),
@@ -696,7 +725,7 @@ export class ConnectServer {
 
       if (res.statusCode >= 400) {
         return {
-          content: [{ type: "text", text: "Import failed: " + (body.error || "HTTP " + res.statusCode) }],
+          content: [{ type: "text", text: `Import failed: ${body.error || `HTTP ${res.statusCode}`}` }],
           isError: true,
         };
       }
@@ -705,25 +734,20 @@ export class ConnectServer {
       await this.fetchAndApplyConfig().catch(() => {});
 
       const namespaceList = servers.map((s) => s.namespace).join(", ");
+      const collisionWarning =
+        collisions.length > 0
+          ? `\n\nWarning: namespace collisions detected — these names mapped to the same namespace:\n${collisions.map(([ns, keys]) => `  ${ns} ← ${keys.join(", ")}`).join("\n")}\nOnly one will be kept.`
+          : "";
       return {
         content: [
           {
             type: "text",
-            text:
-              "Imported " +
-              (body.imported || 0) +
-              " servers (" +
-              namespaceList +
-              ")" +
-              (body.skipped ? ", " + body.skipped + " skipped (already exist)" : "") +
-              " from " +
-              resolved +
-              ".\n\nNote: environment variables (API keys, tokens) were NOT imported for security — set them at mcp.hosting.\nUse mcp_connect_discover to see imported servers.",
+            text: `Imported ${body.imported || 0} servers (${namespaceList})${body.skipped ? `, ${body.skipped} skipped (already exist)` : ""} from ${resolved}.${collisionWarning}\n\nNote: environment variables (API keys, tokens) were NOT imported for security — set them at mcp.hosting.\nUse mcp_connect_discover to see imported servers.`,
           },
         ],
       };
     } catch (err: any) {
-      return { content: [{ type: "text", text: "Import error: " + err.message }], isError: true };
+      return { content: [{ type: "text", text: `Import error: ${err.message}` }], isError: true };
     }
   }
 
@@ -741,13 +765,13 @@ export class ConnectServer {
       const idleCount = this.idleCallCounts.get(namespace) ?? 0;
       const toolNames = conn.tools.map((t) => t.name).join(", ");
 
-      lines.push("  " + namespace + " [" + conn.status + "] (" + conn.config.type + ")");
-      lines.push("    tools: " + conn.tools.length + " — " + toolNames);
-      lines.push("    calls: " + h.totalCalls + ", errors: " + h.errorCount + " (" + errorRate + "%)");
-      lines.push("    avg latency: " + avgLatency + "ms");
-      lines.push("    idle: " + idleCount + "/" + ConnectServer.IDLE_CALL_THRESHOLD + " until auto-deactivate");
+      lines.push(`  ${namespace} [${conn.status}] (${conn.config.type})`);
+      lines.push(`    tools: ${conn.tools.length} — ${toolNames}`);
+      lines.push(`    calls: ${h.totalCalls}, errors: ${h.errorCount} (${errorRate}%)`);
+      lines.push(`    avg latency: ${avgLatency}ms`);
+      lines.push(`    idle: ${idleCount}/${ConnectServer.IDLE_CALL_THRESHOLD} until auto-deactivate`);
       if (h.lastErrorMessage) {
-        lines.push("    last error: " + h.lastErrorMessage + " at " + h.lastErrorAt);
+        lines.push(`    last error: ${h.lastErrorMessage} at ${h.lastErrorAt}`);
       }
     }
 

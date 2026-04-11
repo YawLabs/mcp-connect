@@ -3,12 +3,12 @@ import { log } from "./logger.js";
 import type { ConnectConfig } from "./types.js";
 
 export async function fetchConfig(apiUrl: string, token: string): Promise<ConnectConfig> {
-  const url = apiUrl.replace(/\/$/, "") + "/api/connect/config";
+  const url = `${apiUrl.replace(/\/$/, "")}/api/connect/config`;
 
   const res = await request(url, {
     method: "GET",
     headers: {
-      Authorization: "Bearer " + token,
+      Authorization: `Bearer ${token}`,
       Accept: "application/json",
     },
     headersTimeout: 10_000,
@@ -27,7 +27,7 @@ export async function fetchConfig(apiUrl: string, token: string): Promise<Connec
 
   if (res.statusCode !== 200) {
     const body = await res.body.text().catch(() => "");
-    throw new ConfigError("Config fetch failed (HTTP " + res.statusCode + "): " + body, false);
+    throw new ConfigError(`Config fetch failed (HTTP ${res.statusCode}): ${body}`, false);
   }
 
   const data = (await res.body.json()) as ConnectConfig;
@@ -35,6 +35,15 @@ export async function fetchConfig(apiUrl: string, token: string): Promise<Connec
   if (!data.servers || !Array.isArray(data.servers)) {
     throw new ConfigError("Invalid config response from server", false);
   }
+
+  // Filter out servers missing required fields
+  data.servers = data.servers.filter((s) => {
+    if (!s.id || !s.name || !s.namespace || !s.type) {
+      log("warn", "Skipping server with missing required fields", { id: s.id, name: s.name, namespace: s.namespace });
+      return false;
+    }
+    return true;
+  });
 
   // Filter out servers with invalid namespaces
   const NAMESPACE_RE = /^[a-z][a-z0-9_]{0,29}$/;

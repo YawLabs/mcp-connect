@@ -136,12 +136,12 @@ export async function routeResourceRead(
 ): Promise<{ contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }> }> {
   const route = resourceRoutes.get(uri);
   if (!route) {
-    return { contents: [{ uri, text: "Unknown resource: " + uri }] };
+    return { contents: [{ uri, text: `Unknown resource: ${uri}` }] };
   }
 
   const connection = activeConnections.get(route.namespace);
   if (!connection || connection.status !== "connected") {
-    return { contents: [{ uri, text: 'Server "' + route.namespace + '" is not connected.' }] };
+    return { contents: [{ uri, text: `Server "${route.namespace}" is not connected.` }] };
   }
 
   try {
@@ -149,7 +149,7 @@ export async function routeResourceRead(
     return result as { contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }> };
   } catch (err: any) {
     log("error", "Resource read failed", { uri, namespace: route.namespace, error: err.message });
-    return { contents: [{ uri, text: "Error: " + err.message }] };
+    return { contents: [{ uri, text: `Error: ${err.message}` }] };
   }
 }
 
@@ -161,15 +161,13 @@ export async function routePromptGet(
 ): Promise<{ messages: Array<{ role: string; content: { type: string; text: string } }> }> {
   const route = promptRoutes.get(name);
   if (!route) {
-    return { messages: [{ role: "user", content: { type: "text", text: "Unknown prompt: " + name } }] };
+    return { messages: [{ role: "user", content: { type: "text", text: `Unknown prompt: ${name}` } }] };
   }
 
   const connection = activeConnections.get(route.namespace);
   if (!connection || connection.status !== "connected") {
     return {
-      messages: [
-        { role: "user", content: { type: "text", text: 'Server "' + route.namespace + '" is not connected.' } },
-      ],
+      messages: [{ role: "user", content: { type: "text", text: `Server "${route.namespace}" is not connected.` } }],
     };
   }
 
@@ -178,7 +176,7 @@ export async function routePromptGet(
     return result as { messages: Array<{ role: string; content: { type: string; text: string } }> };
   } catch (err: any) {
     log("error", "Prompt get failed", { name, namespace: route.namespace, error: err.message });
-    return { messages: [{ role: "user", content: { type: "text", text: "Error: " + err.message } }] };
+    return { messages: [{ role: "user", content: { type: "text", text: `Error: ${err.message}` } }] };
   }
 }
 
@@ -195,10 +193,7 @@ export async function routeToolCall(
       content: [
         {
           type: "text",
-          text:
-            "Unknown tool: " +
-            toolName +
-            ". Use mcp_connect_discover to see available servers, then mcp_connect_activate to load tools.",
+          text: `Unknown tool: ${toolName}. Use mcp_connect_discover to see available servers, then mcp_connect_activate to load tools.`,
         },
       ],
       isError: true,
@@ -212,12 +207,7 @@ export async function routeToolCall(
       content: [
         {
           type: "text",
-          text:
-            'Server "' +
-            route.namespace +
-            '" is no longer connected. Use mcp_connect_activate with server "' +
-            route.namespace +
-            '" to reconnect.',
+          text: `Server "${route.namespace}" is no longer connected. Use mcp_connect_activate with server "${route.namespace}" to reconnect.`,
         },
       ],
       isError: true,
@@ -235,7 +225,7 @@ export async function routeToolCall(
     log("error", "Tool call failed", { tool: toolName, namespace: route.namespace, error: err.message });
 
     return {
-      content: [{ type: "text", text: "Error calling " + toolName + ": " + err.message }],
+      content: [{ type: "text", text: `Error calling ${toolName}: ${err.message}` }],
       isError: true,
     };
   }

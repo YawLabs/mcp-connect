@@ -15,7 +15,7 @@
       },
       "style": {
         "noNonNullAssertion": "off",
-        "useTemplate": "off"
+        "useTemplate": "warn"
       }
     }
   },
