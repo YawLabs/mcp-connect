@@ -537,10 +537,17 @@ export class ConnectServer {
   }
 
   private async fetchAndApplyConfig(): Promise<void> {
-    const newConfig = await fetchConfig(this.apiUrl, this.token);
+    // Pass the known configVersion so the server can short-circuit with
+    // 304 Not Modified when nothing changed — saves DB query, JSON
+    // serialization, and response body on the hot 60s poll path.
+    const newConfig = await fetchConfig(this.apiUrl, this.token, this.configVersion ?? undefined);
+
+    if (newConfig === null) {
+      return; // 304 Not Modified — keep current config
+    }
 
     if (newConfig.configVersion && newConfig.configVersion === this.configVersion) {
-      return; // No changes
+      return; // No changes (server didn't return 304 but hash matches)
     }
 
     // Deduplicate by namespace — keep first occurrence

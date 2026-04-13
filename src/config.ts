@@ -2,18 +2,45 @@ import { request } from "undici";
 import { log } from "./logger.js";
 import type { ConnectConfig } from "./types.js";
 
-export async function fetchConfig(apiUrl: string, token: string): Promise<ConnectConfig> {
+/**
+ * Fetch the config from mcp.hosting.
+ *
+ * Optionally pass `currentVersion` (the configVersion from the previously
+ * fetched config) to enable conditional GETs via If-None-Match. When the
+ * server responds 304 Not Modified, this returns `null` and the caller
+ * should keep its existing config unchanged.
+ *
+ * On a real config change the server returns 200 with the full body and
+ * an `ETag: "<configVersion>"` header; callers should pass the new
+ * `configVersion` on the next tick.
+ */
+export async function fetchConfig(
+  apiUrl: string,
+  token: string,
+  currentVersion?: string,
+): Promise<ConnectConfig | null> {
   const url = `${apiUrl.replace(/\/$/, "")}/api/connect/config`;
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/json",
+  };
+  if (currentVersion) {
+    headers["If-None-Match"] = `"${currentVersion}"`;
+  }
 
   const res = await request(url, {
     method: "GET",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-    },
+    headers,
     headersTimeout: 10_000,
     bodyTimeout: 10_000,
   });
+
+  if (res.statusCode === 304) {
+    // Drain body (should be empty) so the connection can be reused.
+    await res.body.text().catch(() => {});
+    return null;
+  }
 
   if (res.statusCode === 401) {
     await res.body.text().catch(() => {});
