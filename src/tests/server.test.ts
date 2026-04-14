@@ -547,6 +547,58 @@ describe("ConnectServer", () => {
     });
   });
 
+  describe("MCPH_POLL_INTERVAL env var", () => {
+    // vi.unstubAllEnvs() restores every stubbed env var after each case so
+    // test order can't leak into unrelated suites.
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("defaults to a ~60s poll when the env var is unset", () => {
+      vi.stubEnv("MCPH_POLL_INTERVAL", "");
+      const priv = getPrivate(server);
+      priv.startPolling();
+      expect(priv.pollTimer).not.toBeNull();
+      clearTimeout(priv.pollTimer);
+      priv.pollTimer = null;
+    });
+
+    it("respects a custom interval when MCPH_POLL_INTERVAL is set to a positive integer", () => {
+      vi.stubEnv("MCPH_POLL_INTERVAL", "300");
+      const priv = getPrivate(server);
+      priv.startPolling();
+      expect(priv.pollTimer).not.toBeNull();
+      clearTimeout(priv.pollTimer);
+      priv.pollTimer = null;
+    });
+
+    it("disables polling entirely when MCPH_POLL_INTERVAL=0", () => {
+      vi.stubEnv("MCPH_POLL_INTERVAL", "0");
+      const priv = getPrivate(server);
+      priv.pollTimer = null;
+      priv.startPolling();
+      expect(priv.pollTimer).toBeNull();
+    });
+
+    it("falls back to the default when the env var is garbage", () => {
+      vi.stubEnv("MCPH_POLL_INTERVAL", "not-a-number");
+      const priv = getPrivate(server);
+      priv.startPolling();
+      expect(priv.pollTimer).not.toBeNull();
+      clearTimeout(priv.pollTimer);
+      priv.pollTimer = null;
+    });
+
+    it("falls back to the default when the env var is negative", () => {
+      vi.stubEnv("MCPH_POLL_INTERVAL", "-30");
+      const priv = getPrivate(server);
+      priv.startPolling();
+      expect(priv.pollTimer).not.toBeNull();
+      clearTimeout(priv.pollTimer);
+      priv.pollTimer = null;
+    });
+  });
+
   describe("shutdown", () => {
     it("clears poll timer", async () => {
       const priv = getPrivate(server);

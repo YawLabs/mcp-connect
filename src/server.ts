@@ -36,7 +36,31 @@ import { connectToUpstream, disconnectFromUpstream } from "./upstream.js";
 
 declare const __VERSION__: string;
 
-const POLL_INTERVAL = 60_000;
+// Poll interval for fetching config from mcp.hosting (milliseconds).
+//
+// Resolution order:
+//   1. MCPH_POLL_INTERVAL env var (integer seconds). 0 disables polling
+//      entirely — config is fetched once at startup and never again; users
+//      must restart their MCP client to pick up dashboard changes.
+//   2. Default: 60 seconds. Matches the server-side `Cache-Control:
+//      private, max-age=60` on /api/connect/config, so each poll either
+//      hits the ETag short-circuit (304) or returns a body once per
+//      minute.
+//
+// Users who want a quieter client set e.g. MCPH_POLL_INTERVAL=300 (5min)
+// or MCPH_POLL_INTERVAL=0 (one-shot at startup only).
+const DEFAULT_POLL_INTERVAL_MS = 60_000;
+
+function resolvePollIntervalMs(): number {
+  const raw = process.env.MCPH_POLL_INTERVAL;
+  if (raw === undefined || raw === "") return DEFAULT_POLL_INTERVAL_MS;
+  const seconds = Number.parseInt(raw, 10);
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    log("warn", "Invalid MCPH_POLL_INTERVAL; falling back to 60s default", { value: raw });
+    return DEFAULT_POLL_INTERVAL_MS;
+  }
+  return seconds * 1000;
+}
 
 function resolveNamespaces(args: Record<string, unknown>): string[] {
   if (Array.isArray(args.servers) && args.servers.length > 0) {
@@ -609,16 +633,21 @@ export class ConnectServer {
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
     }
+    const intervalMs = resolvePollIntervalMs();
+    if (intervalMs === 0) {
+      log("info", "Config polling disabled (MCPH_POLL_INTERVAL=0). Restart mcph to pick up dashboard changes.");
+      return;
+    }
     const poll = async () => {
       try {
         await this.fetchAndApplyConfig();
       } catch (err: any) {
         log("warn", "Config poll failed", { error: err.message });
       }
-      this.pollTimer = setTimeout(poll, POLL_INTERVAL);
+      this.pollTimer = setTimeout(poll, intervalMs);
       if (this.pollTimer.unref) this.pollTimer.unref();
     };
-    this.pollTimer = setTimeout(poll, POLL_INTERVAL);
+    this.pollTimer = setTimeout(poll, intervalMs);
     if (this.pollTimer.unref) this.pollTimer.unref();
   }
 
