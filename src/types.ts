@@ -14,6 +14,14 @@ export interface UpstreamServerConfig {
   env?: Record<string, string>;
   url?: string;
   isActive: boolean;
+  // Free-text summary used by the BM25 ranker for dispatch + context-aware
+  // discover. Set in the mcp.hosting dashboard; absent on older deployments.
+  description?: string;
+  // Tools mcph reported back after the first activation in some earlier
+  // session — used to rank servers that aren't currently connected, so
+  // the ranker doesn't need to cold-start every dispatch by activating
+  // every candidate.
+  toolCache?: Array<{ name: string; description?: string }>;
 }
 
 export interface ConnectConfig {

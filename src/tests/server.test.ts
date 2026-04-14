@@ -11,10 +11,14 @@ vi.mock("undici", () => ({
   }),
 }));
 
-vi.mock("../upstream.js", () => ({
-  connectToUpstream: vi.fn(),
-  disconnectFromUpstream: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock("../upstream.js", async (importOriginal) => {
+  const actual = (await importOriginal()) as any;
+  return {
+    ...actual,
+    connectToUpstream: vi.fn(),
+    disconnectFromUpstream: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 vi.mock("../config.js", async (importOriginal) => {
   const actual = (await importOriginal()) as any;

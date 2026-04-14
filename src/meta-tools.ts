@@ -111,6 +111,34 @@ export const META_TOOLS = {
       openWorldHint: false,
     },
   },
+  dispatch: {
+    name: "mcp_connect_dispatch",
+    description:
+      'Activate the best configured MCP server(s) for a natural-language task. Describe what you want to do ("create a github issue for the login bug", "post a summary to slack", "query the prod postgres") and mcph will rank all configured servers with BM25, activate the top match, and expose its tools so you can call them. Prefer this over calling discover+activate separately when you have a concrete task. Default budget is 1 to keep the tool list focused; raise it only if you genuinely need multiple servers for one task.',
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        intent: {
+          type: "string",
+          description:
+            'What you want to accomplish, in plain English (e.g., "file a github issue titled Fix login bug")',
+        },
+        budget: {
+          type: "number",
+          description:
+            "How many top-ranked servers to activate. Defaults to 1. Cap is 10. Raise only when one task genuinely needs multiple servers.",
+        },
+      },
+      required: ["intent"],
+    },
+    annotations: {
+      title: "Dispatch to Best Server",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
 } as const;
 
 export const META_TOOL_NAMES = new Set([
@@ -119,4 +147,5 @@ export const META_TOOL_NAMES = new Set([
   META_TOOLS.deactivate.name,
   META_TOOLS.import_config.name,
   META_TOOLS.health.name,
+  META_TOOLS.dispatch.name,
 ]);

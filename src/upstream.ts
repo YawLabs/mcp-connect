@@ -25,6 +25,44 @@ const CONNECT_TIMEOUT = (() => {
   return Number.isFinite(n) && n > 0 ? n : 15_000;
 })();
 
+// Cap captured stderr so a chatty server can't balloon mcph's memory.
+// 8KB tail is plenty to see the last error message — servers that emit
+// multi-megabyte output to stderr before crashing are doing something
+// pathological anyway.
+const STDERR_RING_CAP = 8 * 1024;
+
+// Error categories surfaced to the caller. The dispatch/activate handlers
+// use these to compose actionable messages rather than leaking raw SDK
+// error strings.
+export type ActivationFailureCategory =
+  | "spawn_failure" // command not found / ENOENT
+  | "install_failure" // process spawned but exited non-zero before handshake
+  | "init_timeout" // process running but didn't complete init within CONNECT_TIMEOUT
+  | "protocol_error" // handshake completed but something downstream failed
+  | "unknown";
+
+export class ActivationError extends Error {
+  constructor(
+    message: string,
+    public readonly category: ActivationFailureCategory,
+    public readonly stderrTail?: string,
+    public readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "ActivationError";
+  }
+}
+
+function categorizeSpawnError(err: unknown): ActivationFailureCategory {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Node's child_process surfaces ENOENT as the most common spawn failure —
+  // binary isn't on PATH. Other codes (EACCES, EPERM) are rare enough to
+  // bucket under spawn_failure too.
+  if (/ENOENT|not found|cannot find|command failed to start/i.test(msg)) return "spawn_failure";
+  if (/EACCES|permission denied/i.test(msg)) return "spawn_failure";
+  return "unknown";
+}
+
 export async function connectToUpstream(
   config: UpstreamServerConfig,
   onDisconnect?: (namespace: string) => void,
@@ -36,6 +74,11 @@ export async function connectToUpstream(
   );
 
   let transport: StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport;
+  // Rolling 8KB tail of the child's stderr — captured so activation
+  // errors can surface the actual failure reason ("GITHUB_TOKEN is
+  // required", "npm ERR! 404") instead of a generic "handshake timed
+  // out". Only populated for local/stdio transports.
+  let stderrRing = "";
 
   if (config.type === "local") {
     if (!config.command) {
@@ -43,12 +86,19 @@ export async function connectToUpstream(
     }
 
     const { MCPH_TOKEN: _excluded, ...parentEnv } = process.env;
-    transport = new StdioClientTransport({
+    const stdioTransport = new StdioClientTransport({
       command: config.command,
       args: config.args ?? [],
       env: { ...parentEnv, ...config.env } as Record<string, string>,
-      stderr: "ignore",
+      stderr: "pipe",
     });
+    // Attach the stderr listener *before* the transport is started so we
+    // never lose the earliest output (install errors, missing-env errors,
+    // etc. that get written before the server crashes on init).
+    stdioTransport.stderr?.on("data", (chunk: Buffer) => {
+      stderrRing = (stderrRing + chunk.toString("utf8")).slice(-STDERR_RING_CAP);
+    });
+    transport = stdioTransport;
   } else {
     if (!config.url) {
       throw new Error("url is required for remote servers");
@@ -62,18 +112,17 @@ export async function connectToUpstream(
     }
   }
 
-  // Connect with timeout — clear timer on success, close client on timeout
-  const hint =
-    config.type === "local"
-      ? ` Verify that '${config.command}' is installed and the server starts within ${CONNECT_TIMEOUT / 1000} seconds.`
-      : ` Verify that ${config.url} is reachable.`;
-
+  // Connect with timeout — clear timer on success, close client on timeout.
+  // Errors are categorized (spawn/install/timeout/protocol) so the caller
+  // can produce an actionable message for the LLM. stderr tail is included
+  // when available — it's the part that usually explains the real failure.
+  let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`Connection timeout after ${CONNECT_TIMEOUT}ms.${hint}`)),
-      CONNECT_TIMEOUT,
-    );
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(`Connection timeout after ${CONNECT_TIMEOUT}ms`));
+    }, CONNECT_TIMEOUT);
   });
   try {
     await Promise.race([client.connect(transport), timeoutPromise]);
@@ -83,7 +132,39 @@ export async function connectToUpstream(
     try {
       await client.close();
     } catch {}
-    throw err;
+
+    // Classify the failure. If the child wrote anything to stderr, we
+    // almost certainly have the real reason — install failures from
+    // npx/uvx, missing env vars, typo'd package names all surface there.
+    const trimmedStderr = stderrRing.trim();
+    let category: ActivationFailureCategory;
+    let message: string;
+
+    if (config.type !== "local") {
+      category = timedOut ? "init_timeout" : "protocol_error";
+      message = timedOut
+        ? `Remote server at ${config.url} did not respond within ${CONNECT_TIMEOUT / 1000}s. Verify the URL is reachable.`
+        : `Remote server at ${config.url} refused the connection.`;
+    } else if (timedOut) {
+      category = "init_timeout";
+      message = `Server "${config.namespace}" started but didn't complete the MCP handshake within ${CONNECT_TIMEOUT / 1000}s.${
+        trimmedStderr ? ` stderr tail: ${trimmedStderr.slice(-500)}` : ""
+      }`;
+    } else if (trimmedStderr.length > 0) {
+      // Non-timeout error with stderr → the child likely exited before
+      // the handshake (install failure, missing env var, bad args).
+      category = "install_failure";
+      message = `Server "${config.namespace}" failed to start. stderr: ${trimmedStderr.slice(-500)}`;
+    } else {
+      category = categorizeSpawnError(err);
+      if (category === "spawn_failure") {
+        message = `Command '${config.command}' is not on PATH or is not executable. Verify the runtime is installed (e.g. Node.js for npx, Python for uvx).`;
+      } else {
+        message = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    throw new ActivationError(message, category, trimmedStderr || undefined, err);
   }
 
   log("info", "Connected to upstream", { name: config.name, namespace: config.namespace, type: config.type });

@@ -30,9 +30,10 @@ import {
   routeResourceRead,
   routeToolCall,
 } from "./proxy.js";
-import { scoreRelevance } from "./relevance.js";
+import { type RankableServer, rankServers, scoreRelevance } from "./relevance.js";
+import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
-import { connectToUpstream, disconnectFromUpstream } from "./upstream.js";
+import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./upstream.js";
 
 declare const __VERSION__: string;
 
@@ -191,6 +192,7 @@ export class ConnectServer {
     }
 
     initAnalytics(this.apiUrl, this.token);
+    initToolReport(this.apiUrl, this.token);
 
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
@@ -209,7 +211,16 @@ export class ConnectServer {
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     if (name === META_TOOLS.discover.name) {
       recordConnectEvent({ namespace: null, toolName: null, action: "discover", latencyMs: null, success: true });
-      return this.handleDiscover(args.context as string | undefined);
+      // When the LLM supplies task context, automatically warm the top
+      // confident candidate so a one-shot discover() is enough to start
+      // calling tools. Ambiguous queries fall through to the manual list.
+      return this.handleDiscoverWithAutoWarm(args.context as string | undefined);
+    }
+    if (name === META_TOOLS.dispatch.name) {
+      const intent = typeof args.intent === "string" ? args.intent : "";
+      const budget = typeof args.budget === "number" && Number.isFinite(args.budget) ? args.budget : 1;
+      recordConnectEvent({ namespace: null, toolName: null, action: "activate", latencyMs: null, success: true });
+      return this.handleDispatch(intent, budget);
     }
     if (name === META_TOOLS.activate.name) {
       const namespaces = resolveNamespaces(args);
@@ -338,7 +349,82 @@ export class ConnectServer {
     return result;
   }
 
+  // Build RankableServer inputs for BM25 — uses live tool metadata when
+  // the server is connected in this session, otherwise falls back to the
+  // in-memory toolCache (populated from prior activations this session)
+  // and finally the persistent toolCache shipped in the config payload.
+  private rankableFor(server: UpstreamServerConfig): RankableServer {
+    const connection = this.connections.get(server.namespace);
+    const liveTools = connection?.tools.map((t) => ({ name: t.name, description: t.description }));
+    const sessionCache = this.toolCache.get(server.namespace);
+    const persistedCache = server.toolCache;
+    return {
+      namespace: server.namespace,
+      name: server.name,
+      description: server.description,
+      tools: liveTools ?? sessionCache ?? persistedCache ?? [],
+    };
+  }
+
+  // Auto-warm confidence gate — applied to discover(context) so a single
+  // clearly-winning server gets activated without the LLM needing to
+  // follow up with a separate activate call. Default ON; flip off with
+  // MCPH_AUTO_ACTIVATE=0 if it causes surprise.
+  private static readonly AUTO_ACTIVATE_ENABLED = (() => {
+    const raw = process.env.MCPH_AUTO_ACTIVATE;
+    return raw === undefined || raw === "" || raw === "1" || raw.toLowerCase() === "true";
+  })();
+  // Top score must clear this floor AND the gap over the runner-up must
+  // be convincing before we auto-activate. Values tuned by intuition;
+  // when we have real usage data we can re-pick them.
+  private static readonly AUTO_ACTIVATE_MIN_SCORE = 1.0;
+  private static readonly AUTO_ACTIVATE_MARGIN = 1.3;
+
   private handleDiscover(context?: string): { content: Array<{ type: string; text: string }> } {
+    return this.buildDiscoverOutput(context, /* alreadyWarmed */ false);
+  }
+
+  private async handleDiscoverWithAutoWarm(
+    context?: string,
+  ): Promise<{ content: Array<{ type: string; text: string }> }> {
+    if (!context || !ConnectServer.AUTO_ACTIVATE_ENABLED) return this.handleDiscover(context);
+
+    const activeServers = (this.config?.servers ?? []).filter((s) => s.isActive);
+    if (activeServers.length === 0) return this.handleDiscover(context);
+
+    const ranked = rankServers(
+      context,
+      activeServers.map((s) => this.rankableFor(s)),
+    );
+
+    // Only auto-warm if one candidate dominates: top score clears the
+    // floor and either stands alone or beats the runner-up by the
+    // margin. Ambiguous queries fall through to the manual-pick list.
+    const top = ranked[0];
+    const second = ranked[1];
+    const topWinsDecisively =
+      top !== undefined &&
+      top.score >= ConnectServer.AUTO_ACTIVATE_MIN_SCORE &&
+      (second === undefined || top.score / (second.score || 1e-6) >= ConnectServer.AUTO_ACTIVATE_MARGIN);
+
+    if (!topWinsDecisively || !top) return this.handleDiscover(context);
+
+    // Already active — nothing to warm. Surface that fact in the output.
+    const existing = this.connections.get(top.namespace);
+    if (existing && existing.status === "connected") return this.handleDiscover(context);
+
+    const result = await this.activateOne(top.namespace);
+    if (result.ok) {
+      log("info", "Auto-warmed top-ranked server on discover", { namespace: top.namespace, score: top.score });
+    }
+
+    return this.buildDiscoverOutput(context, result.ok);
+  }
+
+  private buildDiscoverOutput(
+    context: string | undefined,
+    autoWarmed: boolean,
+  ): { content: Array<{ type: string; text: string }> } {
     if (!this.config || this.config.servers.length === 0) {
       return {
         content: [
@@ -352,21 +438,32 @@ export class ConnectServer {
 
     const activeServers = this.config.servers.filter((s) => s.isActive);
 
-    // Score and sort by relevance if context provided
-    let sorted: typeof activeServers;
+    // Score and sort using corpus-wide BM25 when context is provided.
+    // Servers that don't match any query term simply fall out of the
+    // ranked list; we append them at the end so the LLM still sees what's
+    // available without them cluttering the top of the list.
     const scores = new Map<string, number>();
+    let sorted: typeof activeServers;
     if (context) {
-      for (const server of activeServers) {
-        const connection = this.connections.get(server.namespace);
-        const tools = connection?.tools ?? this.toolCache.get(server.namespace) ?? [];
-        scores.set(server.namespace, scoreRelevance(context, server, tools));
-      }
-      sorted = [...activeServers].sort((a, b) => (scores.get(b.namespace) ?? 0) - (scores.get(a.namespace) ?? 0));
+      const ranked = rankServers(
+        context,
+        activeServers.map((s) => this.rankableFor(s)),
+      );
+      for (const r of ranked) scores.set(r.namespace, r.score);
+      const rankedSet = new Set(ranked.map((r) => r.namespace));
+      const rest = activeServers.filter((s) => !rankedSet.has(s.namespace));
+      const matched = ranked
+        .map((r) => activeServers.find((s) => s.namespace === r.namespace))
+        .filter((s): s is UpstreamServerConfig => s !== undefined);
+      sorted = [...matched, ...rest];
     } else {
       sorted = activeServers;
     }
 
     const lines: string[] = [context ? "Servers ranked by relevance:\n" : "Available MCP servers:\n"];
+    if (autoWarmed && sorted.length > 0) {
+      lines.push(`Auto-activated "${sorted[0].namespace}" — top match for your query.\n`);
+    }
 
     for (const server of sorted) {
       const connection = this.connections.get(server.namespace);
@@ -377,13 +474,13 @@ export class ConnectServer {
         : "available";
 
       const score = scores.get(server.namespace);
-      const relevance = score && score > 0 ? ` (relevance: ${score})` : "";
+      const relevance = score && score > 0 ? ` (relevance: ${score.toFixed(2)})` : "";
 
       lines.push(`  ${server.namespace} — ${server.name} [${status}] (${server.type})${relevance}`);
 
       // Show cached tool names for servers that aren't currently connected
       if (!connection) {
-        const cached = this.toolCache.get(server.namespace);
+        const cached = this.toolCache.get(server.namespace) ?? server.toolCache;
         if (cached && cached.length > 0) {
           const toolNames = cached.map((t) => t.name).join(", ");
           lines.push(`    known tools: ${toolNames}`);
@@ -402,9 +499,84 @@ export class ConnectServer {
     const activeCount = this.connections.size;
     const totalTools = Array.from(this.connections.values()).reduce((sum, c) => sum + c.tools.length, 0);
     lines.push(`\n${activeCount} active, ${totalTools} tools loaded.`);
-    lines.push("Use mcp_connect_activate to activate a server by its namespace.");
+    lines.push(
+      context
+        ? "Use mcp_connect_dispatch(intent) to activate the best server in one step, or mcp_connect_activate to pick explicitly."
+        : "Use mcp_connect_activate to activate a server by its namespace.",
+    );
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // Activate a single server by namespace. Shared by handleActivate,
+  // handleDispatch, and handleDiscoverWithAutoWarm so error handling,
+  // retries, caching, and tool-report round-trips live in one place.
+  //
+  // Returns:
+  //   { ok: true, message } — already connected or newly connected
+  //   { ok: false, message, isChanged: false } — failed or not in config
+  private async activateOne(
+    namespace: string,
+  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }> {
+    const existing = this.connections.get(namespace);
+    if (existing && existing.status === "connected") {
+      return {
+        ok: true,
+        isChanged: false,
+        message: `"${namespace}" is already active with ${existing.tools.length} tools.`,
+        serverId: existing.config.id,
+      };
+    }
+
+    const serverConfig = this.config?.servers.find((s) => s.namespace === namespace && s.isActive);
+    if (!serverConfig) {
+      return { ok: false, isChanged: false, message: `"${namespace}" not found or disabled.` };
+    }
+
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const connection = await connectToUpstream(serverConfig, this.onUpstreamDisconnect, this.onUpstreamListChanged);
+        this.connections.set(namespace, connection);
+        this.idleCallCounts.set(namespace, 0);
+        const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
+        this.toolCache.set(namespace, toolMeta);
+
+        // Persist the tool list so inactive servers can still be ranked
+        // on cold starts. Fire-and-forget — failure is non-fatal.
+        if (toolMeta.length > 0) {
+          reportTools(serverConfig.id, toolMeta).catch(() => {});
+        }
+
+        const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
+        return {
+          ok: true,
+          isChanged: true,
+          serverId: serverConfig.id,
+          message: `Activated "${namespace}" — ${connection.tools.length} tools: ${toolNames}`,
+        };
+      } catch (err) {
+        lastError = err;
+        if (attempt === 0) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log("warn", "Activation attempt failed, retrying", { namespace, error: msg });
+          await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
+        }
+      }
+    }
+
+    log("error", "Failed to activate upstream", {
+      namespace,
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+
+    // Prefer the ActivationError's message (includes stderr tail + category
+    // hint) over the raw SDK error. Falls back cleanly for transport errors.
+    const message =
+      lastError instanceof ActivationError
+        ? `Failed to activate "${namespace}": ${lastError.message}`
+        : `Failed to activate "${namespace}": ${lastError instanceof Error ? lastError.message : String(lastError)}`;
+    return { ok: false, isChanged: false, message };
   }
 
   private async handleActivate(
@@ -424,56 +596,10 @@ export class ConnectServer {
     let anyError = false;
 
     for (const namespace of namespaces) {
-      // Already active?
-      const existing = this.connections.get(namespace);
-      if (existing && existing.status === "connected") {
-        results.push(`"${namespace}" is already active with ${existing.tools.length} tools.`);
-        continue;
-      }
-
-      // Find in config
-      const serverConfig = this.config?.servers.find((s) => s.namespace === namespace && s.isActive);
-      if (!serverConfig) {
-        results.push(`"${namespace}" not found or disabled.`);
-        anyError = true;
-        continue;
-      }
-
-      let lastError = "";
-      let activated = false;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const connection = await connectToUpstream(
-            serverConfig,
-            this.onUpstreamDisconnect,
-            this.onUpstreamListChanged,
-          );
-          this.connections.set(namespace, connection);
-          this.idleCallCounts.set(namespace, 0);
-          this.toolCache.set(
-            namespace,
-            connection.tools.map((t) => ({ name: t.name, description: t.description })),
-          );
-          anyChanged = true;
-          activated = true;
-
-          const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
-          results.push(`Activated "${namespace}" — ${connection.tools.length} tools: ${toolNames}`);
-          break;
-        } catch (err: any) {
-          lastError = err.message;
-          if (attempt === 0) {
-            log("warn", "Activation attempt failed, retrying", { namespace, error: err.message });
-            await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
-          }
-        }
-      }
-
-      if (!activated) {
-        log("error", "Failed to activate upstream", { namespace, error: lastError });
-        results.push(`Failed to activate "${namespace}": ${lastError}`);
-        anyError = true;
-      }
+      const r = await this.activateOne(namespace);
+      results.push(r.message);
+      if (r.isChanged) anyChanged = true;
+      if (!r.ok) anyError = true;
     }
 
     if (anyChanged) {
@@ -483,6 +609,82 @@ export class ConnectServer {
 
     return {
       content: [{ type: "text", text: results.join("\n") }],
+      isError: anyError && !anyChanged ? true : undefined,
+    };
+  }
+
+  // Smart-routing meta-tool. The LLM describes the task in plain English
+  // ("create a github issue for this bug"); mcph ranks configured servers
+  // with BM25 and activates the top N, then lets the LLM call the now-
+  // exposed tools normally. Default budget is 1 because over-activating
+  // pollutes the tool list in the LLM's context with noise.
+  private async handleDispatch(
+    intent: string,
+    budget: number,
+  ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+    const trimmed = intent?.trim?.() ?? "";
+    if (trimmed.length === 0) {
+      return {
+        content: [{ type: "text", text: "intent is required. Describe the task you want to accomplish." }],
+        isError: true,
+      };
+    }
+    if (!this.config || this.config.servers.length === 0) {
+      return {
+        content: [{ type: "text", text: "No servers configured. Add servers at mcp.hosting to get started." }],
+        isError: true,
+      };
+    }
+
+    const activeServers = this.config.servers.filter((s) => s.isActive);
+    if (activeServers.length === 0) {
+      return {
+        content: [
+          { type: "text", text: "No servers enabled. Enable servers at mcp.hosting or re-run mcp_connect_discover." },
+        ],
+        isError: true,
+      };
+    }
+
+    const ranked = rankServers(
+      trimmed,
+      activeServers.map((s) => this.rankableFor(s)),
+    );
+
+    if (ranked.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No configured server matches "${trimmed}". Use mcp_connect_discover to see what's available, or add a relevant server at mcp.hosting.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const safeBudget = Math.max(1, Math.min(10, Math.floor(budget)));
+    const winners = ranked.slice(0, safeBudget);
+
+    const results: string[] = [];
+    let anyChanged = false;
+    let anyError = false;
+
+    for (const winner of winners) {
+      const r = await this.activateOne(winner.namespace);
+      results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
+      if (r.isChanged) anyChanged = true;
+      if (!r.ok) anyError = true;
+    }
+
+    if (anyChanged) {
+      this.rebuildRoutes();
+      await this.notifyAllListsChanged();
+    }
+
+    const header = `Dispatched "${trimmed}" — activated top ${winners.length} of ${ranked.length} matching server${ranked.length === 1 ? "" : "s"}.\n`;
+    return {
+      content: [{ type: "text", text: header + results.join("\n") }],
       isError: anyError && !anyChanged ? true : undefined,
     };
   }
