@@ -25,6 +25,8 @@
 - [x] **Resource proxying** — Proxy MCP resources from upstream servers, not just tools
 - [x] **Prompt proxying** — Proxy MCP prompts from upstream servers
 - [ ] **Per-tool activation** — Activate specific tools from a server instead of all tools (category-based subsets)
+- [ ] **Signature-on-demand meta-tool** — A `mcp_connect_read_tool` that returns a single tool's schema + docs without activating its server. For servers with many tools where the model only needs 1–2, loads 1–2 schemas instead of the whole catalog. One step beyond per-tool activation: no activation event at all. (Pattern borrowed from Bifrost Code Mode's `list → read → execute` surface.)
+- [ ] **Orchestration sandbox** — A `mcp_connect_exec` meta-tool that runs a short sandboxed script (Starlark or a narrow JS subset) making multiple upstream tool calls in one round-trip. Saves both prompt-token replay and response round-trips when the model wants to do `a = call_x(); b = call_y(a); return b`. Sandboxed: no imports, no network, no fs — only tool calls + basic control flow.
 - [ ] **Marketplace integration** — Browse and one-click add servers from the mcp.hosting marketplace directly through discover()
 - [ ] **Multi-device config sync** — Same token, same config, across all machines (already works implicitly, but needs marketing)
 
