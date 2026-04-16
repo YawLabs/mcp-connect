@@ -70,9 +70,31 @@ describe("resolveUvSpawn with uv present", () => {
     const { spawnSync } = await import("node:child_process");
     const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
     if (probe.status !== 0) return;
-    // When the bootstrap resolves `uv` to the PATH version, `uvx`
-    // gets left alone (PATH version of uvx is authoritative).
+    // uvx is sugar for `uv tool run`. Previously we passed uvx
+    // through unchanged when uv was on PATH, which broke when uv.exe
+    // was reachable but uvx.exe wasn't (Windows PATHEXT cases, or
+    // partial installs). Always-rewriting means the spawn target is
+    // always uv, which we've already confirmed is reachable.
     const result = await resolveUvSpawn("uvx", ["mcp-server-fetch"]);
-    expect(result).toEqual({ command: "uvx", args: ["mcp-server-fetch"] });
+    expect(result).toEqual({ command: "uv", args: ["tool", "run", "mcp-server-fetch"] });
+  });
+
+  it("preserves additional args when rewriting uvx", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
+    if (probe.status !== 0) return;
+    const result = await resolveUvSpawn("uvx", ["--from", "mcp-server-fetch", "--transport", "stdio"]);
+    expect(result).toEqual({
+      command: "uv",
+      args: ["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"],
+    });
+  });
+
+  it("rewrites uvx with empty args", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const probe = spawnSync("uv", ["--version"], { stdio: "ignore" });
+    if (probe.status !== 0) return;
+    const result = await resolveUvSpawn("uvx", []);
+    expect(result).toEqual({ command: "uv", args: ["tool", "run"] });
   });
 });

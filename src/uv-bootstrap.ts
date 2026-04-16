@@ -250,17 +250,33 @@ async function resolveUv(): Promise<string> {
 // Rewrite a spawn target so uv/uvx resolves to our managed binary
 // when the user doesn't have it. Returns the (possibly new) command +
 // args to hand to StdioClientTransport. No-op for any other command.
+//
+// Historical note: we used to pass `uvx` through unchanged when `uv`
+// was found on PATH, assuming uvx ships alongside. That assumption
+// broke on Windows when a user installed uv via a path that didn't
+// extend PATHEXT to uvx.exe (or only dropped uv.exe somewhere), so
+// `spawn("uvx", ...)` hit `'uvx' is not recognized` from cmd.exe and
+// activation failed. Since `uvx ARGS` is documented as sugar for
+// `uv tool run ARGS`, we ALWAYS rewrite uvx to the canonical form
+// using whichever `uv` we have — PATH or bootstrapped. That makes the
+// actual spawn target always `uv`, which we've already verified is
+// reachable (either because onPath("uv") said so, or we just
+// downloaded it).
 export async function resolveUvSpawn(command: string, args: string[]): Promise<{ command: string; args: string[] }> {
   if (command !== "uv" && command !== "uvx") return { command, args };
 
   const uvBin = await ensureUv();
-  // Already on PATH — leave the original command alone (let the OS
-  // resolve it, including any user-preferred version).
-  if (uvBin === "uv") return { command, args };
 
-  // uvx is sugar for `uv tool run`. When we substitute the managed
-  // `uv` binary we have to reconstruct the uvx semantics ourselves.
-  if (command === "uvx") return { command: uvBin, args: ["tool", "run", ...args] };
+  if (command === "uvx") {
+    // Always rewrite to `uv tool run`. Works regardless of whether
+    // uvBin is the literal "uv" (PATH) or an absolute path
+    // (bootstrapped cache). Avoids requiring uvx.exe separately.
+    return { command: uvBin, args: ["tool", "run", ...args] };
+  }
+
+  // command === "uv" — pass through. uvBin is either "uv" (PATH) or
+  // the absolute path to our managed binary; either way, the spawn
+  // target resolves correctly.
   return { command: uvBin, args };
 }
 
