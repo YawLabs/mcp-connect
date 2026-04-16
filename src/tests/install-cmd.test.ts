@@ -215,7 +215,7 @@ describe("runInstall — preserves existing entries", () => {
     mkdirSync(join(synthHome, ".claude"));
     writeFileSync(
       join(synthHome, ".claude", "settings.json"),
-      JSON.stringify({ model: "claude-opus-4-7", mcpServers: { tokenmeter: { url: "https://x" } } }, null, 2),
+      JSON.stringify({ model: "claude-opus-4-7", mcpServers: { spend: { url: "https://x" } } }, null, 2),
     );
     const cap = captureIo();
     const r = await runInstall({
@@ -229,7 +229,7 @@ describe("runInstall — preserves existing entries", () => {
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude", "settings.json"), "utf8"));
     expect(client.model).toBe("claude-opus-4-7");
-    expect(client.mcpServers.tokenmeter).toEqual({ url: "https://x" });
+    expect(client.mcpServers.spend).toEqual({ url: "https://x" });
     expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
   });
 });
