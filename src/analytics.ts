@@ -4,7 +4,7 @@ import { log } from "./logger.js";
 export interface ConnectAnalyticsEvent {
   namespace: string | null;
   toolName: string | null;
-  action: "discover" | "activate" | "deactivate" | "tool_call" | "import" | "health";
+  action: "discover" | "activate" | "deactivate" | "tool_call" | "import" | "health" | "suggest";
   latencyMs: number | null;
   success: boolean;
   error?: string;

@@ -19,6 +19,7 @@ import { type ActivationFailure, healthFactor } from "./health-score.js";
 import { LearningStore } from "./learning.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES } from "./meta-tools.js";
+import { PackDetector } from "./pack-detect.js";
 import { type Profile, loadEffectiveProfile, profileAllows } from "./profile.js";
 import { type ProgressReporter, createProgressReporter } from "./progress.js";
 import {
@@ -122,6 +123,11 @@ export class ConnectServer {
   // Session-scoped usage learning — nudges dispatch toward namespaces
   // that have been genuinely useful this session. See learning.ts.
   private readonly learning = new LearningStore();
+  // Session-scoped chain detection — watches proxied tool calls across
+  // namespaces and surfaces recurring multi-server patterns as suggested
+  // "packs". Observation-only; never activates anything. Meta-tool calls
+  // are deliberately excluded because they aren't user workflow.
+  private readonly packDetector = new PackDetector();
 
   private static readonly IDLE_CALL_THRESHOLD = (() => {
     const env = process.env.MCP_CONNECT_IDLE_THRESHOLD;
@@ -335,6 +341,10 @@ export class ConnectServer {
       recordConnectEvent({ namespace: null, toolName: null, action: "health", latencyMs: null, success: true });
       return this.handleHealth();
     }
+    if (name === META_TOOLS.suggest.name) {
+      recordConnectEvent({ namespace: null, toolName: null, action: "suggest", latencyMs: null, success: true });
+      return this.handleSuggest();
+    }
 
     // Route to upstream — auto-reconnect if disconnected
     const route = this.toolRoutes.get(name);
@@ -413,6 +423,13 @@ export class ConnectServer {
         success: !result.isError,
         error: result.isError ? result.content[0]?.text : undefined,
       });
+      // Only count successful calls toward chain detection. An errored
+      // call isn't a real usage signal — the user likely abandons or
+      // retries on a different server. Meta-tools were short-circuited
+      // above so they never reach this point.
+      if (!result.isError) {
+        this.packDetector.recordCall(route.namespace, route.originalName, Date.now());
+      }
       await this.trackUsageAndAutoDeactivate(route.namespace);
     }
 
@@ -1346,6 +1363,46 @@ export class ConnectServer {
         lines.push(`    last error: ${h.lastErrorMessage} at ${h.lastErrorAt}`);
       }
     }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // Pack suggestion. Surfaces recurring multi-server tool-call sequences
+  // observed in this session. Observation only — never activates
+  // anything. Ranked by frequency primarily, with recency as a tiebreak
+  // so the hottest-most-recent pattern sits at the top.
+  private handleSuggest(): { content: Array<{ type: string; text: string }> } {
+    const detected = this.packDetector.detectChains();
+    if (detected.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No recurring multi-server patterns yet. Keep using tools across servers — once the same 2-3 server combination recurs in quick succession, it will show up here as a suggested pack.",
+          },
+        ],
+      };
+    }
+
+    // Rank by frequency (primary) then recency (secondary). Both matter:
+    // a pattern that repeated 5 times hours ago still beats one that
+    // repeated twice last minute, but at equal frequency fresher wins.
+    const ranked = [...detected].sort((a, b) => {
+      if (b.frequency !== a.frequency) return b.frequency - a.frequency;
+      return b.lastSeenAt - a.lastSeenAt;
+    });
+
+    const lines: string[] = [
+      `Detected ${ranked.length} recurring server pack${ranked.length === 1 ? "" : "s"} in this session:\n`,
+    ];
+    for (const pack of ranked) {
+      const nsList = pack.namespaces.join(", ");
+      const secondsAgo = Math.max(0, Math.round((Date.now() - pack.lastSeenAt) / 1000));
+      lines.push(`  {${nsList}} — seen ${pack.frequency} times (last ${secondsAgo}s ago)`);
+    }
+    lines.push(
+      "\nTo activate a pack in one step next time, call mcp_connect_dispatch with an intent that spans these servers.",
+    );
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }

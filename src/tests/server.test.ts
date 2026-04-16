@@ -549,6 +549,66 @@ describe("ConnectServer", () => {
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Unknown tool");
     });
+
+    it("records successful proxied calls into the pack detector", async () => {
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      await priv.handleToolCall("gh_create_issue", {});
+      const history = priv.packDetector.getHistory();
+      expect(history.length).toBe(1);
+      expect(history[0].namespace).toBe("gh");
+      expect(history[0].toolName).toBe("create_issue");
+    });
+
+    it("does not record errored proxied calls into the pack detector", async () => {
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.client.callTool = vi.fn().mockRejectedValue(new Error("upstream failed"));
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      await priv.handleToolCall("gh_create_issue", {});
+      expect(priv.packDetector.getHistory().length).toBe(0);
+    });
+
+    it("does not record meta-tool calls into the pack detector", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([]);
+      await priv.handleToolCall("mcp_connect_discover", {});
+      await priv.handleToolCall("mcp_connect_health", {});
+      expect(priv.packDetector.getHistory().length).toBe(0);
+    });
+
+    it("routes meta-tool suggest and returns friendly message with no patterns", async () => {
+      const priv = getPrivate(server);
+      const result = await priv.handleToolCall("mcp_connect_suggest", {});
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain("No recurring multi-server patterns yet");
+    });
+
+    it("routes meta-tool suggest and lists detected packs ranked by frequency", async () => {
+      const priv = getPrivate(server);
+      const t0 = 1_000_000;
+      // Seed two bursts that each contain {gh, linear}
+      priv.packDetector.recordCall("gh", "a", t0);
+      priv.packDetector.recordCall("linear", "b", t0 + 1_000);
+      priv.packDetector.recordCall("gh", "c", t0 + 5 * 60_000);
+      priv.packDetector.recordCall("linear", "d", t0 + 5 * 60_000 + 1_000);
+
+      const result = await priv.handleToolCall("mcp_connect_suggest", {});
+      expect(result.isError).toBeUndefined();
+      const text = result.content[0].text;
+      expect(text).toContain("Detected 1 recurring server pack");
+      expect(text).toContain("gh");
+      expect(text).toContain("linear");
+      expect(text).toContain("seen 2 times");
+    });
   });
 
   describe("MCPH_POLL_INTERVAL env var", () => {

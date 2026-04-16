@@ -139,6 +139,22 @@ export const META_TOOLS = {
       openWorldHint: false,
     },
   },
+  suggest: {
+    name: "mcp_connect_suggest",
+    description:
+      "Surface recurring multi-server tool-call patterns observed in this session as suggested 'packs' you could dispatch in one step. Observation-only — this never activates anything. When you see the same 2-3 servers used together in short bursts more than once, the pattern is surfaced here so a future workflow can call mcp_connect_dispatch with one intent instead of juggling discover+activate for each server. Returns a friendly 'no patterns yet' message when nothing has recurred.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+    annotations: {
+      title: "Suggest Server Packs",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
 } as const;
 
 export const META_TOOL_NAMES = new Set([
@@ -148,4 +164,5 @@ export const META_TOOL_NAMES = new Set([
   META_TOOLS.import_config.name,
   META_TOOLS.health.name,
   META_TOOLS.dispatch.name,
+  META_TOOLS.suggest.name,
 ]);
