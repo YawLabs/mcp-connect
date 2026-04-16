@@ -343,6 +343,56 @@ describe("ConnectServer", () => {
       await priv.trackUsageAndAutoDeactivate("gh");
       expect(priv.connections.has("slack")).toBe(true);
     });
+
+    it("records called namespace in rolling history", async () => {
+      const priv = getPrivate(server);
+      priv.connections.set("gh", makeConnection("gh"));
+
+      await priv.trackUsageAndAutoDeactivate("gh");
+      expect(priv.recentToolCalls.length).toBe(1);
+      expect(priv.recentToolCalls[0].namespace).toBe("gh");
+      expect(typeof priv.recentToolCalls[0].at).toBe("number");
+    });
+
+    it("gives a bursty namespace adaptive patience past the baseline", async () => {
+      const priv = getPrivate(server);
+      priv.connections.set("gh", makeConnection("gh"));
+      priv.connections.set("slack", makeConnection("slack"));
+
+      const baseline = (ConnectServer as any).IDLE_CALL_THRESHOLD as number;
+      const now = Date.now();
+      // Seed history with recent slack activity so slack has earned
+      // adaptive patience. 5 recent calls → bonus 10 → threshold 20.
+      for (let i = 0; i < 5; i++) {
+        priv.recentToolCalls.push({ namespace: "slack", at: now - i * 1000 });
+      }
+      // Push slack one tick away from the STATIC baseline.
+      priv.idleCallCounts.set("slack", baseline - 1);
+
+      await priv.trackUsageAndAutoDeactivate("gh");
+
+      // Slack now sits at exactly baseline idle calls, but the
+      // adaptive threshold is higher — it should stay connected.
+      expect(priv.connections.has("slack")).toBe(true);
+      expect(priv.idleCallCounts.get("slack")).toBe(baseline);
+    });
+
+    it("still deactivates a bursty namespace once idle exceeds adaptive cap", async () => {
+      const priv = getPrivate(server);
+      priv.connections.set("gh", makeConnection("gh"));
+      priv.connections.set("slack", makeConnection("slack"));
+
+      const now = Date.now();
+      // Give slack some recent activity (earns adaptive patience).
+      for (let i = 0; i < 3; i++) {
+        priv.recentToolCalls.push({ namespace: "slack", at: now - i * 1000 });
+      }
+      // Set slack way over the adaptive ceiling (50) so it's definitely toast.
+      priv.idleCallCounts.set("slack", 60);
+
+      await priv.trackUsageAndAutoDeactivate("gh");
+      expect(priv.connections.has("slack")).toBe(false);
+    });
   });
 
   describe("reconcileConfig", () => {
