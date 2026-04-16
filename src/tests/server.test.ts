@@ -28,6 +28,8 @@ vi.mock("../config.js", async (importOriginal) => {
   };
 });
 
+import { fetchConfig } from "../config.js";
+
 vi.mock("../analytics.js", () => ({
   initAnalytics: vi.fn(),
   recordConnectEvent: vi.fn(),
@@ -784,5 +786,200 @@ describe("argsEqual (via reconcileConfig)", () => {
 
     await priv.reconcileConfig(makeConfig([makeServerConfig({ namespace: "gh", args: undefined })]));
     expect(priv.connections.has("gh")).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Concurrency and atomicity regression tests. These cover the three
+// races exposed by the review:
+//   1. activateOne — two concurrent callers for the same namespace must
+//      share one spawn, not race to double-spawn.
+//   2. fetchAndApplyConfig — this.config must be set before reconcile's
+//      awaits so readers don't observe the stale config mid-reconcile.
+//   3. handleToolCall — the routes map captured at method entry must be
+//      used for the actual call, even if rebuildRoutes fires during
+//      the auto-reconnect awaits.
+// ─────────────────────────────────────────────────────────────────────────
+describe("activateOne dedup", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://mcp.hosting", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("dedupes two concurrent activations of the same namespace to one spawn", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+
+    // Hold the connectToUpstream promise open so both activateOne
+    // callers can enqueue before the first resolves.
+    let resolveConnect: (conn: UpstreamConnection) => void = () => {};
+    const connectPromise = new Promise<UpstreamConnection>((r) => {
+      resolveConnect = r;
+    });
+    vi.mocked(connectToUpstream).mockReturnValueOnce(connectPromise);
+
+    const p1 = priv.activateOne("gh");
+    const p2 = priv.activateOne("gh");
+
+    // Both should be awaiting the same in-flight promise at this point.
+    expect(priv.activationInflight.has("gh")).toBe(true);
+
+    resolveConnect(makeConnection("gh", ["create_issue"]));
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    expect(r1.ok).toBe(true);
+    expect(r2.ok).toBe(true);
+    // Critical: only ONE spawn happened despite two parallel activations.
+    expect(connectToUpstream).toHaveBeenCalledTimes(1);
+    // Map entry cleared after settle.
+    expect(priv.activationInflight.has("gh")).toBe(false);
+  });
+
+  it("clears the inflight entry after failure so a later call can retry", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+
+    vi.mocked(connectToUpstream).mockRejectedValue(new Error("down"));
+
+    const r1 = await priv.activateOne("gh");
+    expect(r1.ok).toBe(false);
+    expect(priv.activationInflight.has("gh")).toBe(false);
+
+    // Second call should retry, not return the failed promise from #1.
+    vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["x"]));
+    const r2 = await priv.activateOne("gh");
+    expect(r2.ok).toBe(true);
+  });
+});
+
+describe("fetchAndApplyConfig atomicity", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://mcp.hosting", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("updates this.config and configVersion before reconcileConfig's awaits", async () => {
+    const priv = getPrivate(server);
+    // Seed the "old" config: one active upstream gh.
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.configVersion = "old-v";
+    priv.connections.set("gh", makeConnection("gh"));
+
+    // The new config removes gh. reconcileConfig will disconnect it
+    // and await the disconnect. That await is our observation point:
+    // by then, this.config should already be the NEW config.
+    vi.mocked(fetchConfig).mockResolvedValueOnce({ servers: [], configVersion: "new-v" } as any);
+
+    let seenVersion: string | null = null;
+    let seenServerCount: number | null = null;
+    vi.mocked(disconnectFromUpstream).mockImplementationOnce(async () => {
+      seenVersion = priv.configVersion;
+      seenServerCount = priv.config.servers.length;
+    });
+
+    await priv.fetchAndApplyConfig();
+
+    // If the old code ordering were still in place, these would see
+    // the stale config (configVersion "old-v", 1 server).
+    expect(seenVersion).toBe("new-v");
+    expect(seenServerCount).toBe(0);
+  });
+
+  it("prunes expired activationFailures before fetching new config", async () => {
+    const priv = getPrivate(server);
+    const sixMinutesAgo = Date.now() - 6 * 60 * 1000;
+    priv.activationFailures.set("old", { at: sixMinutesAgo, message: "stale" });
+    priv.activationFailures.set("recent", { at: Date.now(), message: "fresh" });
+
+    // 304 shortcut — we only care that the prune sweep ran at the top.
+    vi.mocked(fetchConfig).mockResolvedValueOnce(null as any);
+
+    await priv.fetchAndApplyConfig();
+
+    expect(priv.activationFailures.has("old")).toBe(false);
+    expect(priv.activationFailures.has("recent")).toBe(true);
+  });
+});
+
+describe("handleToolCall route snapshot", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://mcp.hosting", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("uses the route snapshot even if toolRoutes is swapped mid-call", async () => {
+    const priv = getPrivate(server);
+    const errorConn = makeConnection("gh", ["create_issue"], "error");
+    priv.connections.set("gh", errorConn);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.rebuildRoutes();
+
+    const freshConn = makeConnection("gh", ["create_issue"]);
+    freshConn.client.callTool = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "ok after reconnect" }],
+    });
+
+    // Simulate an unrelated rebuild swapping this.toolRoutes during
+    // the reconnect await. With the old code, the subsequent
+    // routeToolCall would run against the empty Map and return an
+    // "Unknown tool" error. With the snapshot, it still resolves.
+    vi.mocked(connectToUpstream).mockImplementationOnce(async () => {
+      priv.toolRoutes = new Map();
+      return freshConn;
+    });
+
+    const result = await priv.handleToolCall("gh_create_issue", {});
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toBe("ok after reconnect");
+  });
+});
+
+describe("handleImport path validation", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://mcp.hosting", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("rejects a resolved path whose basename is not an allowed MCP config filename", async () => {
+    const priv = getPrivate(server);
+    // Traversal that normalizes to a resolved basename of "passwd" —
+    // must be rejected even though the raw string has "mcp.json" in it.
+    const result = await priv.handleImport("mcp.json/../etc/passwd");
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("Only MCP config files are allowed");
+  });
+
+  it("still accepts a real allowed basename", async () => {
+    const priv = getPrivate(server);
+    // This path points to a file that doesn't exist; we just want to
+    // confirm the basename check doesn't reject it before readFile runs.
+    const result = await priv.handleImport("./nonexistent/mcp.json");
+    // Either readFile errors or mcpServers-shape check errors — but
+    // NOT the allowed-filename check.
+    expect(result.content[0].text).not.toContain("Only MCP config files are allowed");
   });
 });

@@ -1,0 +1,12 @@
+# Normalize line endings. Without this, Windows checkouts convert LF→CRLF
+# in the working tree (driven by core.autocrlf=true) and `git status` lights
+# up every TS file as modified every time it's touched. Storing LF in the
+# repo and LF in the working tree keeps diffs clean on every platform.
+* text=auto eol=lf
+
+# Binary files that must not be normalized.
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+*.tar.gz binary

@@ -15,7 +15,7 @@ import { request } from "undici";
 import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import { detectMissingCredentials } from "./credentials.js";
-import { type ActivationFailure, healthFactor } from "./health-score.js";
+import { ACTIVATION_FAILURE_TTL_MS, type ActivationFailure, healthFactor } from "./health-score.js";
 import { HISTORY_LIMIT, type ToolCallRecord, adaptiveThreshold, pushToolCall } from "./idle-ttl.js";
 import { LearningStore } from "./learning.js";
 import { log } from "./logger.js";
@@ -129,6 +129,16 @@ export class ConnectServer {
   // Cleared on shutdown — persistence belongs in the mcp.hosting
   // dashboard, these are a "get me running now" shortcut.
   private elicitedEnv = new Map<string, Record<string, string>>();
+  // In-flight activation promises, keyed by namespace. Dedupes
+  // concurrent activation attempts for the same namespace so that two
+  // tool calls landing on a disconnected upstream don't each spawn
+  // their own child process. Second and subsequent callers await the
+  // same promise as the first; the entry is cleared when the promise
+  // settles (success or failure).
+  private activationInflight = new Map<
+    string,
+    Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }>
+  >();
   // Session-scoped usage learning — nudges dispatch toward namespaces
   // that have been genuinely useful this session. See learning.ts.
   private readonly learning = new LearningStore();
@@ -156,7 +166,7 @@ export class ConnectServer {
     private token: string,
   ) {
     this.server = new Server(
-      { name: "mcph", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "0.0.0" },
+      { name: "mcph", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
       {
         capabilities: {
           tools: { listChanged: true },
@@ -211,7 +221,16 @@ export class ConnectServer {
   private readonly onUpstreamListChanged = (ns: string) => {
     log("info", "Upstream list changed, rebuilding routes", { namespace: ns });
     this.rebuildRoutes();
-    this.notifyAllListsChanged().catch(() => {});
+    this.notifyAllListsChanged().catch((err: Error) => {
+      // Logged rather than silenced — a failure here means the client
+      // won't know tools/resources/prompts just changed, which cascades
+      // into confusing "unknown tool" errors on the next call. Worth
+      // surfacing so the failure isn't invisible.
+      log("warn", "Failed to notify client of upstream list change", {
+        namespace: ns,
+        error: err?.message ?? String(err),
+      });
+    });
   };
 
   private rebuildRoutes(): void {
@@ -230,9 +249,18 @@ export class ConnectServer {
   }
 
   private async notifyAllListsChanged(): Promise<void> {
-    await this.server.sendToolListChanged().catch(() => {});
-    await this.server.sendResourceListChanged().catch(() => {});
-    await this.server.sendPromptListChanged().catch(() => {});
+    // Each send is independent — one failure shouldn't cancel the
+    // others. Log so the failure is visible without throwing, since
+    // callers treat this as a fire-and-forget notification.
+    await this.server.sendToolListChanged().catch((err: Error) => {
+      log("warn", "sendToolListChanged failed", { error: err?.message ?? String(err) });
+    });
+    await this.server.sendResourceListChanged().catch((err: Error) => {
+      log("warn", "sendResourceListChanged failed", { error: err?.message ?? String(err) });
+    });
+    await this.server.sendPromptListChanged().catch((err: Error) => {
+      log("warn", "sendPromptListChanged failed", { error: err?.message ?? String(err) });
+    });
   }
 
   async start(): Promise<void> {
@@ -271,7 +299,7 @@ export class ConnectServer {
     // ignores stale snapshots. Subsequent reports happen on each new
     // mcph startup, which is sufficient for "what runtimes are
     // installed" since it changes rarely.
-    reportRuntimes().catch(() => {});
+    reportRuntimes().catch((err: Error) => log("warn", "reportRuntimes failed", { error: err?.message }));
     // Prewarm the uv bootstrap if any configured server needs it. Fire
     // and forget — ensureUv() is memoized, so the first activation
     // awaits the same in-flight promise rather than triggering a
@@ -361,8 +389,15 @@ export class ConnectServer {
       return this.handleSuggest();
     }
 
-    // Route to upstream — auto-reconnect if disconnected
-    const route = this.toolRoutes.get(name);
+    // Snapshot routes at method entry. rebuildRoutes() may fire during
+    // the auto-reconnect awaits below (via onUpstreamListChanged from
+    // any other connection, or via trackUsageAndAutoDeactivate on a
+    // concurrent tool call) and replace this.toolRoutes with a fresh
+    // Map. Re-reading this.toolRoutes later would dispatch against a
+    // map whose contents don't match the route we already captured —
+    // so use the snapshot consistently from lookup through call.
+    const routes = this.toolRoutes;
+    const route = routes.get(name);
     if (route) {
       const conn = this.connections.get(route.namespace);
       if (conn && conn.status === "error") {
@@ -416,7 +451,9 @@ export class ConnectServer {
     const connForHealth = route ? this.connections.get(route.namespace) : undefined;
 
     const startMs = Date.now();
-    const result = await routeToolCall(name, args, this.toolRoutes, this.connections);
+    // Route against the snapshot, not this.toolRoutes, so a rebuild
+    // between the initial lookup and this call can't misdirect us.
+    const result = await routeToolCall(name, args, routes, this.connections);
     const latencyMs = Date.now() - startMs;
 
     if (route) {
@@ -674,10 +711,38 @@ export class ConnectServer {
   // handleDispatch, and handleDiscoverWithAutoWarm so error handling,
   // retries, caching, and tool-report round-trips live in one place.
   //
+  // Dedup guarantee: two concurrent callers for the same namespace
+  // share one in-flight activation. Without this, a tool call landing
+  // on a disconnected upstream while another tool call was already
+  // trying to reactivate the same namespace would spawn a duplicate
+  // child process; the second set() would win and the first would leak
+  // until its transport noticed. See activationInflight.
+  //
   // Returns:
   //   { ok: true, message } — already connected or newly connected
   //   { ok: false, message, isChanged: false } — failed or not in config
-  private async activateOne(
+  private activateOne(
+    namespace: string,
+    progress?: ProgressReporter,
+  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }> {
+    const inflight = this.activationInflight.get(namespace);
+    if (inflight) {
+      progress?.(`"${namespace}" activation already in flight — awaiting existing attempt`);
+      return inflight;
+    }
+    const promise = this.runActivateOne(namespace, progress).finally(() => {
+      // Clear only if this promise is still the registered one. If a
+      // retry path (maybeElicitAndRetry → activateOne) has already
+      // registered a follow-up, leave that one in place.
+      if (this.activationInflight.get(namespace) === promise) {
+        this.activationInflight.delete(namespace);
+      }
+    });
+    this.activationInflight.set(namespace, promise);
+    return promise;
+  }
+
+  private async runActivateOne(
     namespace: string,
     progress?: ProgressReporter,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }> {
@@ -730,7 +795,9 @@ export class ConnectServer {
         // Persist the tool list so inactive servers can still be ranked
         // on cold starts. Fire-and-forget — failure is non-fatal.
         if (toolMeta.length > 0) {
-          reportTools(serverConfig.id, toolMeta).catch(() => {});
+          reportTools(serverConfig.id, toolMeta).catch((err: Error) =>
+            log("warn", "reportTools failed", { namespace, error: err?.message }),
+          );
         }
 
         const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
@@ -861,9 +928,12 @@ export class ConnectServer {
 
     this.elicitedEnv.set(namespace, { ...alreadyElicited, ...values });
     progress?.("Got credentials — retrying activation");
-    // Recurse — activateOne will merge elicitedEnv on this attempt.
-    // Returns directly so callers see the retry result verbatim.
-    return this.activateOne(namespace, progress);
+    // Recurse — runActivateOne merges elicitedEnv on this attempt.
+    // Call runActivateOne directly (not activateOne) because we're
+    // already inside the in-flight activation promise registered by
+    // activateOne; going through the wrapper again would deadlock on
+    // our own entry in activationInflight.
+    return this.runActivateOne(namespace, progress);
   }
 
   private async handleActivate(
@@ -1145,6 +1215,13 @@ export class ConnectServer {
   }
 
   private async fetchAndApplyConfig(): Promise<void> {
+    // Evict expired activation failures. healthFactor() checks the TTL
+    // at read-time, so stale entries never produce a wrong penalty —
+    // but without a sweep the map grows unbounded across a long
+    // session. Piggyback the sweep on each poll so it costs nothing
+    // extra.
+    this.pruneExpiredActivationFailures();
+
     // Pass the known configVersion so the server can short-circuit with
     // 304 Not Modified when nothing changed — saves DB query, JSON
     // serialization, and response body on the hot 60s poll path.
@@ -1169,9 +1246,26 @@ export class ConnectServer {
       return true;
     });
 
-    await this.reconcileConfig(newConfig);
+    // Swap the config reference BEFORE reconcileConfig awaits. Other
+    // handlers (handleActivate, handleDispatch, handleDiscover) read
+    // this.config synchronously and can interleave at every await
+    // point below. With the old order, a caller in the middle of
+    // reconcile would see the stale config — and could try to
+    // activate a namespace that's about to be disconnected, racing
+    // the reconcile. Setting config first means readers see the
+    // intended-future state; the connection map is the authority for
+    // "what's actually running" and catches up shortly after.
     this.config = newConfig;
     this.configVersion = newConfig.configVersion;
+    await this.reconcileConfig(newConfig);
+  }
+
+  private pruneExpiredActivationFailures(now: number = Date.now()): void {
+    for (const [ns, failure] of this.activationFailures) {
+      if (now - failure.at > ACTIVATION_FAILURE_TTL_MS) {
+        this.activationFailures.delete(ns);
+      }
+    }
   }
 
   private async reconcileConfig(newConfig: ConnectConfig): Promise<void> {
@@ -1244,26 +1338,34 @@ export class ConnectServer {
       return { content: [{ type: "text", text: "filepath is required." }], isError: true };
     }
 
-    // Security: only allow known MCP config filenames
+    // Security: only allow known MCP config filenames. The check must
+    // run on the RESOLVED path's basename, not the caller-supplied
+    // string — otherwise `some/dir/mcp.json/../../../etc/passwd` would
+    // have basename "passwd" and correctly fail, but a path like
+    // `/weird/place/claude_desktop_config.json` would succeed at the
+    // basename check even though the intent was to restrict reads to
+    // well-known MCP config locations. Computing the basename on
+    // `resolved` normalizes `..` segments and handles ~ expansion
+    // before we decide whether the file is allowed.
     const ALLOWED_FILENAMES = ["claude_desktop_config.json", "mcp.json", "settings.json", "mcp_config.json"];
-    const basename = filepath.split(/[/\\]/).pop() || "";
-    if (!ALLOWED_FILENAMES.includes(basename)) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Only MCP config files are allowed: ${ALLOWED_FILENAMES.join(", ")}. Got: ${basename}`,
-          },
-        ],
-        isError: true,
-      };
-    }
 
     try {
       const resolved =
         filepath.startsWith("~/") || filepath.startsWith("~\\")
           ? resolve(homedir(), filepath.slice(2))
           : resolve(filepath);
+      const resolvedBasename = resolved.split(/[/\\]/).pop() || "";
+      if (!ALLOWED_FILENAMES.includes(resolvedBasename)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Only MCP config files are allowed: ${ALLOWED_FILENAMES.join(", ")}. Got: ${resolvedBasename}`,
+            },
+          ],
+          isError: true,
+        };
+      }
       const raw = await readFile(resolved, "utf-8");
       const parsed = JSON.parse(raw);
 
@@ -1353,7 +1455,9 @@ export class ConnectServer {
       }
 
       // Refresh config to pick up imported servers
-      await this.fetchAndApplyConfig().catch(() => {});
+      await this.fetchAndApplyConfig().catch((err: Error) =>
+        log("warn", "Post-import config refresh failed", { error: err?.message }),
+      );
 
       const namespaceList = servers.map((s) => s.namespace).join(", ");
       const collisionWarning =

@@ -32,6 +32,15 @@ const CONNECT_TIMEOUT = (() => {
 // pathological anyway.
 const STDERR_RING_CAP = 8 * 1024;
 
+// Per-category cap on how many entries we'll accept from a single
+// upstream server. Without this a buggy or malicious server could
+// return millions of tools and balloon mcph's memory. 1000 is well
+// above what any real MCP server exposes today, and we log+truncate
+// rather than reject so a slightly-over-cap server still works.
+export const MAX_TOOLS_PER_SERVER = 1000;
+export const MAX_RESOURCES_PER_SERVER = 1000;
+export const MAX_PROMPTS_PER_SERVER = 1000;
+
 // Error categories surfaced to the caller. The dispatch/activate handlers
 // use these to compose actionable messages rather than leaking raw SDK
 // error strings.
@@ -70,7 +79,7 @@ export async function connectToUpstream(
   onListChanged?: (namespace: string) => void,
 ): Promise<UpstreamConnection> {
   const client = new Client(
-    { name: "mcph", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "0.0.0" },
+    { name: "mcph", version: typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev" },
     { capabilities: {} },
   );
 
@@ -215,31 +224,58 @@ export async function connectToUpstream(
       status: "connected" as const,
     });
 
-    // Subscribe to upstream list changes so we pick up dynamic tools/resources/prompts
+    // Subscribe to upstream list changes so we pick up dynamic tools/resources/prompts.
+    //
+    // Each handler serializes onto a per-category chain so two rapid
+    // notifications from the same upstream can't race fetchXFromUpstream
+    // in parallel. Without this, back-to-back ToolListChanged events
+    // would launch two concurrent listTools() calls; whichever resolves
+    // last wins connection.tools, and onListChanged fires twice (each
+    // rebuilding routes). The chain preserves ordering and bounds
+    // in-flight fetches to one per category.
     if (onListChanged) {
-      client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
-        try {
-          connection.tools = await fetchToolsFromUpstream(client, config.namespace);
-          onListChanged(config.namespace);
-        } catch (err: any) {
-          log("warn", "Failed to refresh tools from upstream", { namespace: config.namespace, error: err.message });
-        }
+      let toolsChain: Promise<void> = Promise.resolve();
+      let resourcesChain: Promise<void> = Promise.resolve();
+      let promptsChain: Promise<void> = Promise.resolve();
+
+      client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+        toolsChain = toolsChain.then(async () => {
+          try {
+            connection.tools = await fetchToolsFromUpstream(client, config.namespace);
+            onListChanged(config.namespace);
+          } catch (err: any) {
+            log("warn", "Failed to refresh tools from upstream", { namespace: config.namespace, error: err.message });
+          }
+        });
+        return toolsChain;
       });
-      client.setNotificationHandler(ResourceListChangedNotificationSchema, async () => {
-        try {
-          connection.resources = await fetchResourcesFromUpstream(client, config.namespace);
-          onListChanged(config.namespace);
-        } catch (err: any) {
-          log("warn", "Failed to refresh resources from upstream", { namespace: config.namespace, error: err.message });
-        }
+      client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+        resourcesChain = resourcesChain.then(async () => {
+          try {
+            connection.resources = await fetchResourcesFromUpstream(client, config.namespace);
+            onListChanged(config.namespace);
+          } catch (err: any) {
+            log("warn", "Failed to refresh resources from upstream", {
+              namespace: config.namespace,
+              error: err.message,
+            });
+          }
+        });
+        return resourcesChain;
       });
-      client.setNotificationHandler(PromptListChangedNotificationSchema, async () => {
-        try {
-          connection.prompts = await fetchPromptsFromUpstream(client, config.namespace);
-          onListChanged(config.namespace);
-        } catch (err: any) {
-          log("warn", "Failed to refresh prompts from upstream", { namespace: config.namespace, error: err.message });
-        }
+      client.setNotificationHandler(PromptListChangedNotificationSchema, () => {
+        promptsChain = promptsChain.then(async () => {
+          try {
+            connection.prompts = await fetchPromptsFromUpstream(client, config.namespace);
+            onListChanged(config.namespace);
+          } catch (err: any) {
+            log("warn", "Failed to refresh prompts from upstream", {
+              namespace: config.namespace,
+              error: err.message,
+            });
+          }
+        });
+        return promptsChain;
       });
     }
 
@@ -268,7 +304,15 @@ export async function disconnectFromUpstream(connection: UpstreamConnection): Pr
 export async function fetchResourcesFromUpstream(client: Client, namespace: string): Promise<UpstreamResourceDef[]> {
   try {
     const result = await client.listResources();
-    return (result.resources ?? []).map((r) => ({
+    const raw = result.resources ?? [];
+    if (raw.length > MAX_RESOURCES_PER_SERVER) {
+      log("warn", "Upstream returned more resources than cap; truncating", {
+        namespace,
+        reported: raw.length,
+        cap: MAX_RESOURCES_PER_SERVER,
+      });
+    }
+    return raw.slice(0, MAX_RESOURCES_PER_SERVER).map((r) => ({
       uri: r.uri,
       namespacedUri: `connect://${namespace}/${r.uri}`,
       name: r.name,
@@ -284,7 +328,15 @@ export async function fetchResourcesFromUpstream(client: Client, namespace: stri
 export async function fetchPromptsFromUpstream(client: Client, namespace: string): Promise<UpstreamPromptDef[]> {
   try {
     const result = await client.listPrompts();
-    return (result.prompts ?? []).map((p) => ({
+    const raw = result.prompts ?? [];
+    if (raw.length > MAX_PROMPTS_PER_SERVER) {
+      log("warn", "Upstream returned more prompts than cap; truncating", {
+        namespace,
+        reported: raw.length,
+        cap: MAX_PROMPTS_PER_SERVER,
+      });
+    }
+    return raw.slice(0, MAX_PROMPTS_PER_SERVER).map((p) => ({
       name: p.name,
       namespacedName: `${namespace}_${p.name}`,
       description: p.description,
@@ -298,8 +350,16 @@ export async function fetchPromptsFromUpstream(client: Client, namespace: string
 
 export async function fetchToolsFromUpstream(client: Client, namespace: string): Promise<UpstreamToolDef[]> {
   const result = await client.listTools();
+  const raw = result.tools ?? [];
+  if (raw.length > MAX_TOOLS_PER_SERVER) {
+    log("warn", "Upstream returned more tools than cap; truncating", {
+      namespace,
+      reported: raw.length,
+      cap: MAX_TOOLS_PER_SERVER,
+    });
+  }
 
-  return (result.tools ?? []).map((tool) => ({
+  return raw.slice(0, MAX_TOOLS_PER_SERVER).map((tool) => ({
     name: tool.name,
     namespacedName: `${namespace}_${tool.name}`,
     description: tool.description,
