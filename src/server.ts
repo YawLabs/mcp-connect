@@ -14,6 +14,7 @@ import {
 import { request } from "undici";
 import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
 import { ConfigError, fetchConfig } from "./config.js";
+import { type ActivationFailure, healthFactor } from "./health-score.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES } from "./meta-tools.js";
 import { type Profile, loadProfile, profileAllows } from "./profile.js";
@@ -107,6 +108,9 @@ export class ConnectServer {
   private idleCallCounts = new Map<string, number>();
   private toolCache = new Map<string, Array<{ name: string; description?: string }>>();
   private profile: Profile | null = null;
+  // Short-term memory of activation failures; used by dispatch to
+  // down-rank recently-flaky servers. Cleared on successful activation.
+  private activationFailures = new Map<string, ActivationFailure>();
 
   private static readonly IDLE_CALL_THRESHOLD = (() => {
     const env = process.env.MCP_CONNECT_IDLE_THRESHOLD;
@@ -671,6 +675,9 @@ export class ConnectServer {
         }
 
         const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
+        // Activation succeeded — clear any stale penalty so a recovered
+        // server isn't permanently demoted for a transient past failure.
+        this.activationFailures.delete(namespace);
         return {
           ok: true,
           isChanged: true,
@@ -690,6 +697,14 @@ export class ConnectServer {
     log("error", "Failed to activate upstream", {
       namespace,
       error: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+
+    // Record the failure so dispatch down-ranks this namespace for a
+    // few minutes. The TTL is short enough that a fixed server (user
+    // edited dashboard env, for example) recovers quickly on next poll.
+    this.activationFailures.set(namespace, {
+      at: Date.now(),
+      message: lastError instanceof Error ? lastError.message : String(lastError),
     });
 
     // Prefer the ActivationError's message (includes stderr tail + category
@@ -785,7 +800,18 @@ export class ConnectServer {
     // Two-stage: local BM25 filters to a shortlist, /api/connect/rerank
     // semantically reorders it via Voyage. Falls back to BM25 alone when
     // rerank is off or times out, so dispatch is robust in every mode.
-    const ranked = await this.twoStageRank(trimmed, activeServers);
+    const rankedRaw = await this.twoStageRank(trimmed, activeServers);
+    // Apply health-aware penalty: recent activation failures and high
+    // error rates shrink the score so dispatch prefers working servers
+    // when multiple match. Never boosts above raw score — all else
+    // equal, prefer the one that works.
+    const ranked = rankedRaw
+      .map((r) => ({
+        namespace: r.namespace,
+        score:
+          r.score * healthFactor(this.connections.get(r.namespace)?.health, this.activationFailures.get(r.namespace)),
+      }))
+      .sort((a, b) => b.score - a.score);
 
     if (ranked.length === 0) {
       return {
