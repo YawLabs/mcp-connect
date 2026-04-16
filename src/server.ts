@@ -14,8 +14,13 @@ import {
 import { request } from "undici";
 import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
 import { ConfigError, fetchConfig } from "./config.js";
+import { detectMissingCredentials } from "./credentials.js";
+import { type ActivationFailure, healthFactor } from "./health-score.js";
+import { LearningStore } from "./learning.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES } from "./meta-tools.js";
+import { type Profile, loadProfile, profileAllows } from "./profile.js";
+import { type ProgressReporter, createProgressReporter } from "./progress.js";
 import {
   type PromptRoute,
   type ResourceRoute,
@@ -33,6 +38,7 @@ import {
 import { type RankableServer, rankServers, scoreRelevance } from "./relevance.js";
 import { initRerank, rerank } from "./rerank.js";
 import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
+import { buildCandidates, shouldTiebreak, tiebreakViaSampling } from "./sampling-rank.js";
 import { initTestRunner, startTestRunner, stopTestRunner } from "./test-runner.js";
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
@@ -104,6 +110,18 @@ export class ConnectServer {
   private promptRoutes = new Map<string, PromptRoute>();
   private idleCallCounts = new Map<string, number>();
   private toolCache = new Map<string, Array<{ name: string; description?: string }>>();
+  private profile: Profile | null = null;
+  // Short-term memory of activation failures; used by dispatch to
+  // down-rank recently-flaky servers. Cleared on successful activation.
+  private activationFailures = new Map<string, ActivationFailure>();
+  // Session-scoped credential overrides supplied by the user via MCP
+  // elicitation when a server's stderr indicated a missing env var.
+  // Cleared on shutdown — persistence belongs in the mcp.hosting
+  // dashboard, these are a "get me running now" shortcut.
+  private elicitedEnv = new Map<string, Record<string, string>>();
+  // Session-scoped usage learning — nudges dispatch toward namespaces
+  // that have been genuinely useful this session. See learning.ts.
+  private readonly learning = new LearningStore();
 
   private static readonly IDLE_CALL_THRESHOLD = (() => {
     const env = process.env.MCP_CONNECT_IDLE_THRESHOLD;
@@ -126,6 +144,10 @@ export class ConnectServer {
         },
       },
     );
+    // mcph itself does not handle elicitation or sampling requests; it
+    // originates them. The capability declaration for originated features
+    // is implicit — the client advertises whether IT supports receiving
+    // them, which we check via getClientCapabilities() before prompting.
     this.setupHandlers();
   }
 
@@ -134,9 +156,9 @@ export class ConnectServer {
       tools: buildToolList(this.connections),
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const { name, arguments: args } = request.params;
-      return this.handleToolCall(name, args ?? {});
+      return this.handleToolCall(name, args ?? {}, extra);
     });
 
     this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
@@ -177,6 +199,15 @@ export class ConnectServer {
     this.promptRoutes = buildPromptRoutes(this.connections);
   }
 
+  // Active servers, narrowed by the project profile if one is loaded.
+  // Centralizing this here means discover/dispatch/auto-warm all see the
+  // same set — no accidental bypass of the profile via a second code path.
+  private getProfiledActiveServers(): UpstreamServerConfig[] {
+    const all = (this.config?.servers ?? []).filter((s) => s.isActive);
+    if (!this.profile) return all;
+    return all.filter((s) => profileAllows(this.profile, s.namespace));
+  }
+
   private async notifyAllListsChanged(): Promise<void> {
     await this.server.sendToolListChanged().catch(() => {});
     await this.server.sendResourceListChanged().catch(() => {});
@@ -184,6 +215,18 @@ export class ConnectServer {
   }
 
   async start(): Promise<void> {
+    // Project profile: walks up from cwd for .mcph.json so a repo can
+    // declare which configured servers are allowed inside it. Failure
+    // is silent — fail-open so a bad profile doesn't brick the session.
+    this.profile = await loadProfile(process.cwd()).catch(() => null);
+    if (this.profile) {
+      log("info", "Loaded project profile", {
+        path: this.profile.path,
+        allow: this.profile.servers,
+        block: this.profile.blocked,
+      });
+    }
+
     // Fetch config — non-fatal errors allow startup with empty config
     try {
       await this.fetchAndApplyConfig();
@@ -230,23 +273,25 @@ export class ConnectServer {
   private async handleToolCall(
     name: string,
     args: Record<string, unknown>,
+    extra?: { sendNotification?: any; _meta?: Record<string, unknown> },
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
+    const progress = createProgressReporter(extra);
     if (name === META_TOOLS.discover.name) {
       recordConnectEvent({ namespace: null, toolName: null, action: "discover", latencyMs: null, success: true });
       // When the LLM supplies task context, automatically warm the top
       // confident candidate so a one-shot discover() is enough to start
       // calling tools. Ambiguous queries fall through to the manual list.
-      return this.handleDiscoverWithAutoWarm(args.context as string | undefined);
+      return this.handleDiscoverWithAutoWarm(args.context as string | undefined, progress);
     }
     if (name === META_TOOLS.dispatch.name) {
       const intent = typeof args.intent === "string" ? args.intent : "";
       const budget = typeof args.budget === "number" && Number.isFinite(args.budget) ? args.budget : 1;
       recordConnectEvent({ namespace: null, toolName: null, action: "activate", latencyMs: null, success: true });
-      return this.handleDispatch(intent, budget);
+      return this.handleDispatch(intent, budget, progress);
     }
     if (name === META_TOOLS.activate.name) {
       const namespaces = resolveNamespaces(args);
-      const result = await this.handleActivate(namespaces);
+      const result = await this.handleActivate(namespaces, progress);
       for (const ns of namespaces) {
         recordConnectEvent({
           namespace: ns,
@@ -466,10 +511,11 @@ export class ConnectServer {
 
   private async handleDiscoverWithAutoWarm(
     context?: string,
+    progress?: ProgressReporter,
   ): Promise<{ content: Array<{ type: string; text: string }> }> {
     if (!context || !ConnectServer.AUTO_ACTIVATE_ENABLED) return this.handleDiscover(context);
 
-    const activeServers = (this.config?.servers ?? []).filter((s) => s.isActive);
+    const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) return this.handleDiscover(context);
 
     const ranked = rankServers(
@@ -493,7 +539,8 @@ export class ConnectServer {
     const existing = this.connections.get(top.namespace);
     if (existing && existing.status === "connected") return this.handleDiscover(context);
 
-    const result = await this.activateOne(top.namespace);
+    progress?.(`Auto-warming top candidate "${top.namespace}"`);
+    const result = await this.activateOne(top.namespace, progress);
     if (result.ok) {
       log("info", "Auto-warmed top-ranked server on discover", { namespace: top.namespace, score: top.score });
     }
@@ -516,7 +563,7 @@ export class ConnectServer {
       };
     }
 
-    const activeServers = this.config.servers.filter((s) => s.isActive);
+    const activeServers = this.getProfiledActiveServers();
 
     // Score and sort using corpus-wide BM25 when context is provided.
     // Servers that don't match any query term simply fall out of the
@@ -597,9 +644,11 @@ export class ConnectServer {
   //   { ok: false, message, isChanged: false } — failed or not in config
   private async activateOne(
     namespace: string,
+    progress?: ProgressReporter,
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string }> {
     const existing = this.connections.get(namespace);
     if (existing && existing.status === "connected") {
+      progress?.(`"${namespace}" already active`);
       return {
         ok: true,
         isChanged: false,
@@ -613,10 +662,31 @@ export class ConnectServer {
       return { ok: false, isChanged: false, message: `"${namespace}" not found or disabled.` };
     }
 
+    if (!profileAllows(this.profile, namespace)) {
+      return {
+        ok: false,
+        isChanged: false,
+        message: `"${namespace}" is not allowed by the project profile at ${this.profile?.path}.`,
+      };
+    }
+
+    // Merge any session-elicited env over the server's configured env.
+    // Elicited values only apply inside this mcph process lifetime.
+    const elicited = this.elicitedEnv.get(namespace);
+    const effectiveConfig = elicited ? { ...serverConfig, env: { ...serverConfig.env, ...elicited } } : serverConfig;
+
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const connection = await connectToUpstream(serverConfig, this.onUpstreamDisconnect, this.onUpstreamListChanged);
+        progress?.(
+          attempt === 0 ? `Spawning "${namespace}" upstream…` : `Retrying "${namespace}" (attempt ${attempt + 1})…`,
+        );
+        const connection = await connectToUpstream(
+          effectiveConfig,
+          this.onUpstreamDisconnect,
+          this.onUpstreamListChanged,
+        );
+        progress?.(`"${namespace}" loaded ${connection.tools.length} tools`);
         this.connections.set(namespace, connection);
         this.idleCallCounts.set(namespace, 0);
         const toolMeta = connection.tools.map((t) => ({ name: t.name, description: t.description }));
@@ -629,6 +699,9 @@ export class ConnectServer {
         }
 
         const toolNames = connection.tools.map((t) => t.namespacedName).join(", ");
+        // Activation succeeded — clear any stale penalty so a recovered
+        // server isn't permanently demoted for a transient past failure.
+        this.activationFailures.delete(namespace);
         return {
           ok: true,
           isChanged: true,
@@ -645,9 +718,26 @@ export class ConnectServer {
       }
     }
 
+    // Before giving up, see if the failure looks like a missing credential
+    // and the client supports elicitation. If both hold, ask the user for
+    // the missing values and retry exactly once — one round-trip max.
+    //
+    // Guarded by the haven't-just-tried-this-credential check: if elicited
+    // values are already present for every detected name, don't ask twice.
+    const elicitedRetry = await this.maybeElicitAndRetry(namespace, lastError, progress);
+    if (elicitedRetry) return elicitedRetry;
+
     log("error", "Failed to activate upstream", {
       namespace,
       error: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+
+    // Record the failure so dispatch down-ranks this namespace for a
+    // few minutes. The TTL is short enough that a fixed server (user
+    // edited dashboard env, for example) recovers quickly on next poll.
+    this.activationFailures.set(namespace, {
+      at: Date.now(),
+      message: lastError instanceof Error ? lastError.message : String(lastError),
     });
 
     // Prefer the ActivationError's message (includes stderr tail + category
@@ -659,8 +749,91 @@ export class ConnectServer {
     return { ok: false, isChanged: false, message };
   }
 
+  // If the activation error names a missing credential (e.g. "GITHUB_TOKEN
+  // is required") AND the client supports elicitation, ask the user for
+  // the values inline and retry activation once. Returns the retry result
+  // on success, or null when we can't/shouldn't elicit. Single-round only —
+  // we don't want to pester the user with a loop on every retry failure.
+  private async maybeElicitAndRetry(
+    namespace: string,
+    lastError: unknown,
+    progress?: ProgressReporter,
+  ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string } | null> {
+    const stderr = lastError instanceof ActivationError ? lastError.stderrTail : undefined;
+    const errMessage = lastError instanceof Error ? lastError.message : String(lastError);
+    const haystack = [stderr, errMessage].filter(Boolean).join("\n");
+    const missing = detectMissingCredentials(haystack);
+    if (missing.length === 0) return null;
+
+    // Skip if we've already elicited these exact values — that means we
+    // already tried with the user's input and it still failed, so more
+    // prompting won't help.
+    const alreadyElicited = this.elicitedEnv.get(namespace);
+    if (alreadyElicited && missing.every((k) => k in alreadyElicited)) return null;
+
+    const caps = this.server.getClientCapabilities();
+    if (!caps?.elicitation) {
+      log("info", "Detected missing credentials but client does not support elicitation", {
+        namespace,
+        missing,
+      });
+      return null;
+    }
+
+    // Build an object-schema elicitation with one string field per missing
+    // credential. Descriptions are minimal on purpose — we don't know the
+    // semantic purpose of each env var.
+    const properties: Record<string, { type: "string"; title: string; description: string }> = {};
+    for (const key of missing) {
+      properties[key] = {
+        type: "string",
+        title: key,
+        description: `The value for ${key} required by "${namespace}". Stored only for this mcph session.`,
+      };
+    }
+
+    progress?.(`Asking for ${missing.length === 1 ? "credential" : "credentials"}: ${missing.join(", ")}`);
+
+    let result: Awaited<ReturnType<Server["elicitInput"]>>;
+    try {
+      result = await this.server.elicitInput({
+        message: `"${namespace}" can't start without ${missing.join(", ")}. Provide ${missing.length === 1 ? "it" : "them"} to retry, or decline to cancel.`,
+        requestedSchema: {
+          type: "object",
+          properties,
+          required: missing,
+        },
+      });
+    } catch (err) {
+      log("warn", "Elicitation request failed", {
+        namespace,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+
+    if (result.action !== "accept" || !result.content) {
+      log("info", "User declined credential elicitation", { namespace, action: result.action });
+      return null;
+    }
+
+    const values: Record<string, string> = {};
+    for (const key of missing) {
+      const v = result.content[key];
+      if (typeof v === "string" && v.length > 0) values[key] = v;
+    }
+    if (Object.keys(values).length === 0) return null;
+
+    this.elicitedEnv.set(namespace, { ...alreadyElicited, ...values });
+    progress?.("Got credentials — retrying activation");
+    // Recurse — activateOne will merge elicitedEnv on this attempt.
+    // Returns directly so callers see the retry result verbatim.
+    return this.activateOne(namespace, progress);
+  }
+
   private async handleActivate(
     namespaces: string[],
+    progress?: ProgressReporter,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     if (namespaces.length === 0) {
       return {
@@ -675,12 +848,17 @@ export class ConnectServer {
     let anyChanged = false;
     let anyError = false;
 
+    const total = namespaces.length;
+    let i = 0;
     for (const namespace of namespaces) {
-      const r = await this.activateOne(namespace);
+      i += 1;
+      progress?.(`Activating ${namespace} (${i}/${total})`, i - 1, total);
+      const r = await this.activateOne(namespace, progress);
       results.push(r.message);
       if (r.isChanged) anyChanged = true;
       if (!r.ok) anyError = true;
     }
+    progress?.(anyChanged ? "Done" : "No changes", total, total);
 
     if (anyChanged) {
       this.rebuildRoutes();
@@ -701,6 +879,7 @@ export class ConnectServer {
   private async handleDispatch(
     intent: string,
     budget: number,
+    progress?: ProgressReporter,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const trimmed = intent?.trim?.() ?? "";
     if (trimmed.length === 0) {
@@ -716,20 +895,40 @@ export class ConnectServer {
       };
     }
 
-    const activeServers = this.config.servers.filter((s) => s.isActive);
+    const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) {
+      const note = this.profile
+        ? ` (project profile at ${this.profile.path} restricts which servers are available)`
+        : "";
       return {
         content: [
-          { type: "text", text: "No servers enabled. Enable servers at mcp.hosting or re-run mcp_connect_discover." },
+          {
+            type: "text",
+            text: `No servers enabled${note}. Enable servers at mcp.hosting or re-run mcp_connect_discover.`,
+          },
         ],
         isError: true,
       };
     }
 
+    progress?.(`Ranking ${activeServers.length} servers…`);
     // Two-stage: local BM25 filters to a shortlist, /api/connect/rerank
     // semantically reorders it via Voyage. Falls back to BM25 alone when
     // rerank is off or times out, so dispatch is robust in every mode.
-    const ranked = await this.twoStageRank(trimmed, activeServers);
+    const rankedRaw = await this.twoStageRank(trimmed, activeServers);
+    // Apply health-aware penalty: recent activation failures and high
+    // error rates shrink the score so dispatch prefers working servers
+    // when multiple match. Never boosts above raw score — all else
+    // equal, prefer the one that works.
+    const ranked = rankedRaw
+      .map((r) => ({
+        namespace: r.namespace,
+        score:
+          r.score *
+          healthFactor(this.connections.get(r.namespace)?.health, this.activationFailures.get(r.namespace)) *
+          this.learning.boostFactor(r.namespace),
+      }))
+      .sort((a, b) => b.score - a.score);
 
     if (ranked.length === 0) {
       return {
@@ -743,6 +942,29 @@ export class ConnectServer {
       };
     }
 
+    // Sampling tiebreak: when BM25+rerank+health rank the top-2
+    // candidates within a close margin, ask the client LLM to choose.
+    // Uses the same model the user is already running — no extra
+    // provider key, no extra cost from mcph's side. Silently skips if
+    // the client doesn't advertise the sampling capability.
+    if (budget === 1 && shouldTiebreak(ranked)) {
+      progress?.("Top candidates close — asking LLM to pick…");
+      const serversByNamespace = new Map(activeServers.map((s) => [s.namespace, s]));
+      const candidates = buildCandidates(ranked.slice(0, 3), serversByNamespace, this.toolCache);
+      const picked = await tiebreakViaSampling(this.server, trimmed, candidates);
+      if (picked) {
+        const winner = ranked.find((r) => r.namespace === picked);
+        if (winner) {
+          // Re-sort so the LLM's pick sits at position 0; preserve the
+          // rest of the order so budget>1 callers still see a stable list.
+          const rest = ranked.filter((r) => r.namespace !== picked);
+          ranked.length = 0;
+          ranked.push(winner, ...rest);
+          progress?.(`LLM chose ${picked}`);
+        }
+      }
+    }
+
     const safeBudget = Math.max(1, Math.min(10, Math.floor(budget)));
     const winners = ranked.slice(0, safeBudget);
 
@@ -750,12 +972,22 @@ export class ConnectServer {
     let anyChanged = false;
     let anyError = false;
 
+    let i = 0;
     for (const winner of winners) {
-      const r = await this.activateOne(winner.namespace);
+      i += 1;
+      progress?.(`Activating ${winner.namespace} (${i}/${winners.length})`, i - 1, winners.length);
+      const r = await this.activateOne(winner.namespace, progress);
       results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
       if (r.isChanged) anyChanged = true;
       if (!r.ok) anyError = true;
+      // Treat a successful activation as a positive dispatch signal.
+      // Actual tool-call success is tracked via trackUsageAndAutoDeactivate
+      // on the proxy path, so dispatch-success is the right granularity
+      // here — we're grading the routing decision, not the tool call.
+      this.learning.recordDispatch(winner.namespace);
+      if (r.ok) this.learning.recordSuccess(winner.namespace);
     }
+    progress?.("Dispatch complete", winners.length, winners.length);
 
     if (anyChanged) {
       this.rebuildRoutes();
@@ -1070,11 +1302,20 @@ export class ConnectServer {
   }
 
   private handleHealth(): { content: Array<{ type: string; text: string }> } {
-    if (this.connections.size === 0) {
-      return { content: [{ type: "text", text: "No active connections." }] };
+    const lines: string[] = [];
+    if (this.profile) {
+      lines.push(`Project profile: ${this.profile.path}`);
+      if (this.profile.servers?.length) lines.push(`  allow: ${this.profile.servers.join(", ")}`);
+      if (this.profile.blocked?.length) lines.push(`  block: ${this.profile.blocked.join(", ")}`);
+      lines.push("");
     }
 
-    const lines: string[] = ["Connection health:\n"];
+    if (this.connections.size === 0) {
+      lines.push("No active connections.");
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
+    lines.push("Connection health:\n");
 
     for (const [namespace, conn] of this.connections) {
       const h = conn.health;
