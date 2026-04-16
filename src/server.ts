@@ -37,6 +37,7 @@ import { initTestRunner, startTestRunner, stopTestRunner } from "./test-runner.j
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./upstream.js";
+import { ensureUv } from "./uv-bootstrap.js";
 
 declare const __VERSION__: string;
 
@@ -204,6 +205,15 @@ export class ConnectServer {
     // mcph startup, which is sufficient for "what runtimes are
     // installed" since it changes rarely.
     reportRuntimes().catch(() => {});
+    // Prewarm the uv bootstrap if any configured server needs it. Fire
+    // and forget — ensureUv() is memoized, so the first activation
+    // awaits the same in-flight promise rather than triggering a
+    // second download. This moves the 2–10s first-run cost off the
+    // activation path (where it could collide with CONNECT_TIMEOUT)
+    // and onto startup, where it's expected.
+    if (this.config?.servers.some((s) => s.command === "uv" || s.command === "uvx")) {
+      ensureUv().catch((err: Error) => log("warn", "uv prewarm failed", { error: err?.message }));
+    }
     startTestRunner();
 
     const transport = new StdioServerTransport();

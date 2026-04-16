@@ -15,6 +15,7 @@ import type {
   UpstreamServerConfig,
   UpstreamToolDef,
 } from "./types.js";
+import { resolveUvSpawn } from "./uv-bootstrap.js";
 
 declare const __VERSION__: string;
 
@@ -86,9 +87,16 @@ export async function connectToUpstream(
     }
 
     const { MCPH_TOKEN: _excluded, ...parentEnv } = process.env;
+    // Rewrite `uv`/`uvx` to our managed binary when the user doesn't
+    // have one on PATH. No-op for every other command. Any failure
+    // here (unsupported platform, download/checksum failure) bubbles
+    // out and is caught by the ActivationError handler below — the
+    // stderr tail will be empty, so we fall through to the
+    // categorizeSpawnError path with the actual error message.
+    const resolved = await resolveUvSpawn(config.command, config.args ?? []);
     const stdioTransport = new StdioClientTransport({
-      command: config.command,
-      args: config.args ?? [],
+      command: resolved.command,
+      args: resolved.args,
       env: { ...parentEnv, ...config.env } as Record<string, string>,
       stderr: "pipe",
     });
