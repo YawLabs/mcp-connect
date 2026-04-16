@@ -893,7 +893,14 @@ export class ConnectServer {
       if (r.isChanged) anyChanged = true;
       if (!r.ok) anyError = true;
     }
-    progress?.(anyChanged ? "Done" : "No changes", total, total);
+    // NB: no trailing "Done" progress notification here. MCP clients
+    // delete the progress token synchronously when the response arrives,
+    // but notification handlers run as microtasks — so a progress sent
+    // right before the response loses a race with _onresponse cleanup
+    // and arrives at a token the client has already freed. That looks
+    // like a fatal "unknown token" error to Claude Code and drops the
+    // whole transport. The response itself IS the completion signal;
+    // the tail-end progress would be redundant anyway.
 
     if (anyChanged) {
       this.rebuildRoutes();
@@ -1022,7 +1029,8 @@ export class ConnectServer {
       this.learning.recordDispatch(winner.namespace);
       if (r.ok) this.learning.recordSuccess(winner.namespace);
     }
-    progress?.("Dispatch complete", winners.length, winners.length);
+    // No trailing "Dispatch complete" progress — see handleActivate for
+    // the client-side race this avoids.
 
     if (anyChanged) {
       this.rebuildRoutes();
