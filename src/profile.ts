@@ -18,8 +18,17 @@ import { log } from "./logger.js";
 // Both fields are optional. An empty/malformed file is logged and
 // ignored — failing closed on a user project config would break every
 // tool call, which is worse than the profile just not being applied.
+//
+// User-global profile: a .mcph.json at $HOME provides personal defaults
+// ("here are the servers I trust for any project"). When both a project
+// and a user-global profile are present, the project one wins where it
+// speaks — see mergeProfiles() for the exact semantics.
 export interface Profile {
   path: string;
+  // When a user-global profile was merged with a project-local one,
+  // userPath records the user-global file so handleHealth() can show
+  // both sources. Absent for single-source profiles.
+  userPath?: string;
   servers?: string[];
   blocked?: string[];
 }
@@ -49,11 +58,10 @@ export async function findProfilePath(start: string): Promise<string | null> {
   return null;
 }
 
-export async function loadProfile(start: string): Promise<Profile | null> {
-  const override = process.env.MCPH_PROFILE;
-  const path = override ? resolve(override) : await findProfilePath(start);
-  if (!path) return null;
-
+// Reads and parses a single profile file at `path`. Returns null on any
+// I/O or JSON error — fail-open matches the philosophy of the rest of
+// the module (a bad profile shouldn't brick the session).
+async function readProfileAt(path: string): Promise<Profile | null> {
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
@@ -89,6 +97,82 @@ export async function loadProfile(start: string): Promise<Profile | null> {
     : undefined;
 
   return { path, servers, blocked };
+}
+
+// Loads the project-local profile: either MCPH_PROFILE (explicit
+// override) or the first .mcph.json found walking up from `start`.
+// Returns null if neither is found.
+export async function loadProfile(start: string): Promise<Profile | null> {
+  const override = process.env.MCPH_PROFILE;
+  const path = override ? resolve(override) : await findProfilePath(start);
+  if (!path) return null;
+  return readProfileAt(path);
+}
+
+// Loads the user-global profile at ~/.mcph.json. Returns null if the
+// file doesn't exist or can't be parsed — fail-open like everything
+// else in this module.
+export async function loadUserGlobalProfile(): Promise<Profile | null> {
+  const path = join(resolve(homedir()), PROFILE_FILENAME);
+  return readProfileAt(path);
+}
+
+// Merge a project-local profile with a user-global one. The rules:
+//   - servers (allow-list): project wins if it sets it; otherwise fall
+//     back to user-global. "The project explicitly says what it wants."
+//   - blocked (deny-list): union. A server blocked in either scope
+//     stays blocked. Denies compose; you can't un-block from a narrower
+//     scope.
+//   - path: the project path (the primary identity for display).
+//   - userPath: the user-global path, so handleHealth() can render both.
+// Either input may be null; if both are null the caller should have
+// short-circuited already, but we return null defensively.
+export function mergeProfiles(project: Profile | null, userGlobal: Profile | null): Profile | null {
+  if (!project && !userGlobal) return null;
+  if (!project) return userGlobal;
+  if (!userGlobal) return project;
+
+  const servers = project.servers !== undefined ? project.servers : userGlobal.servers;
+
+  let blocked: string[] | undefined;
+  if (project.blocked || userGlobal.blocked) {
+    const union = new Set<string>([...(userGlobal.blocked ?? []), ...(project.blocked ?? [])]);
+    blocked = [...union];
+  }
+
+  return {
+    path: project.path,
+    userPath: userGlobal.path,
+    servers,
+    blocked,
+  };
+}
+
+// Loads the effective profile for a session, orchestrating project and
+// user-global discovery. Rules:
+//   - If MCPH_PROFILE is set, treat it as project-local and IGNORE
+//     user-global entirely. The override is explicit; don't surprise
+//     the caller by silently merging in $HOME/.mcph.json.
+//   - Else: walk up from `start` for a project-local .mcph.json.
+//     - If found, also load user-global and merge.
+//     - If not found, fall back to user-global alone.
+//   - Returns null if nothing is loadable.
+export async function loadEffectiveProfile(start: string): Promise<Profile | null> {
+  if (process.env.MCPH_PROFILE) {
+    return loadProfile(start);
+  }
+
+  const projectPath = await findProfilePath(start);
+  const project = projectPath ? await readProfileAt(projectPath) : null;
+  const userHome = resolve(homedir());
+  const userGlobalPath = join(userHome, PROFILE_FILENAME);
+  // If the project-local profile IS the user-global one (user ran mcph
+  // from $HOME with no deeper profile), don't double-load it — that
+  // would produce userPath === path in the merged output, which is
+  // confusing in handleHealth().
+  const userGlobal = projectPath === userGlobalPath ? null : await loadUserGlobalProfile();
+
+  return mergeProfiles(project, userGlobal);
 }
 
 // Returns true iff `namespace` is allowed by the (possibly absent) profile.

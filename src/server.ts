@@ -19,7 +19,7 @@ import { type ActivationFailure, healthFactor } from "./health-score.js";
 import { LearningStore } from "./learning.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES } from "./meta-tools.js";
-import { type Profile, loadProfile, profileAllows } from "./profile.js";
+import { type Profile, loadEffectiveProfile, profileAllows } from "./profile.js";
 import { type ProgressReporter, createProgressReporter } from "./progress.js";
 import {
   type PromptRoute,
@@ -215,13 +215,16 @@ export class ConnectServer {
   }
 
   async start(): Promise<void> {
-    // Project profile: walks up from cwd for .mcph.json so a repo can
-    // declare which configured servers are allowed inside it. Failure
-    // is silent — fail-open so a bad profile doesn't brick the session.
-    this.profile = await loadProfile(process.cwd()).catch(() => null);
+    // Project + user-global profile: walks up from cwd for .mcph.json
+    // (project-local) and also checks ~/.mcph.json (user-global). When
+    // both exist, project wins for the allow-list and blocks union —
+    // see mergeProfiles() in profile.ts. Failure is silent — fail-open
+    // so a bad profile doesn't brick the session.
+    this.profile = await loadEffectiveProfile(process.cwd()).catch(() => null);
     if (this.profile) {
-      log("info", "Loaded project profile", {
+      log("info", "Loaded profile", {
         path: this.profile.path,
+        userPath: this.profile.userPath,
         allow: this.profile.servers,
         block: this.profile.blocked,
       });
@@ -1304,7 +1307,17 @@ export class ConnectServer {
   private handleHealth(): { content: Array<{ type: string; text: string }> } {
     const lines: string[] = [];
     if (this.profile) {
-      lines.push(`Project profile: ${this.profile.path}`);
+      // Label depends on which sources were loaded. If userPath is set,
+      // both a project-local and a user-global profile contributed; show
+      // both so it's obvious what's applied. Otherwise it's one or the
+      // other — we can't tell which from `path` alone, so the generic
+      // "Profile:" label covers both cases.
+      if (this.profile.userPath) {
+        lines.push(`Project profile: ${this.profile.path}`);
+        lines.push(`User profile:    ${this.profile.userPath}`);
+      } else {
+        lines.push(`Profile: ${this.profile.path}`);
+      }
       if (this.profile.servers?.length) lines.push(`  allow: ${this.profile.servers.join(", ")}`);
       if (this.profile.blocked?.length) lines.push(`  block: ${this.profile.blocked.join(", ")}`);
       lines.push("");
