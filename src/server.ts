@@ -16,6 +16,7 @@ import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytic
 import { ConfigError, fetchConfig } from "./config.js";
 import { detectMissingCredentials } from "./credentials.js";
 import { type ActivationFailure, healthFactor } from "./health-score.js";
+import { HISTORY_LIMIT, type ToolCallRecord, adaptiveThreshold, pushToolCall } from "./idle-ttl.js";
 import { LearningStore } from "./learning.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES } from "./meta-tools.js";
@@ -110,6 +111,14 @@ export class ConnectServer {
   private resourceRoutes = new Map<string, ResourceRoute>();
   private promptRoutes = new Map<string, PromptRoute>();
   private idleCallCounts = new Map<string, number>();
+  // Rolling history of recent tool calls (namespace + timestamp) used to
+  // compute the adaptive idle threshold per-namespace. Bounded to
+  // HISTORY_LIMIT entries so long sessions don't grow memory unbounded.
+  private recentToolCalls: ToolCallRecord[] = [];
+  // Track which namespaces have already had their adaptive-patience
+  // skip logged this session — we only want the "see the mechanism in
+  // action" log once per namespace, not every single idle tick.
+  private adaptiveSkipLogged = new Set<string>();
   private toolCache = new Map<string, Array<{ name: string; description?: string }>>();
   private profile: Profile | null = null;
   // Short-term memory of activation failures; used by dispatch to
@@ -129,6 +138,12 @@ export class ConnectServer {
   // are deliberately excluded because they aren't user workflow.
   private readonly packDetector = new PackDetector();
 
+  // Baseline idle-call threshold. A namespace with NO recent activity
+  // gets deactivated after this many non-matching tool calls; bursty
+  // namespaces get proportionally more patience via adaptiveThreshold()
+  // (see idle-ttl.ts). The env var MCP_CONNECT_IDLE_THRESHOLD overrides
+  // the baseline — it does NOT disable the adaptive cap, which is a
+  // safety valve clamping the final threshold to [5, 50].
   private static readonly IDLE_CALL_THRESHOLD = (() => {
     const env = process.env.MCP_CONNECT_IDLE_THRESHOLD;
     if (!env) return 10;
@@ -1044,6 +1059,7 @@ export class ConnectServer {
       await disconnectFromUpstream(connection);
       this.connections.delete(namespace);
       this.idleCallCounts.delete(namespace);
+      this.adaptiveSkipLogged.delete(namespace);
       anyChanged = true;
       results.push(`Deactivated "${namespace}". Tools removed.`);
     }
@@ -1060,8 +1076,16 @@ export class ConnectServer {
   }
 
   private async trackUsageAndAutoDeactivate(calledNamespace: string): Promise<void> {
-    // Reset idle count for the server that was just called
+    // Record this call in the rolling history BEFORE computing per-ns
+    // thresholds — so adaptive bonuses reflect the fact we just called
+    // this namespace (protects it from deactivation on a back-to-back
+    // burst where another ns happens to tick over the baseline).
+    pushToolCall(this.recentToolCalls, { namespace: calledNamespace, at: Date.now() }, HISTORY_LIMIT);
+    // Reset idle count for the server that was just called, and forget
+    // any previous "we already logged the patience message for you"
+    // marker — the next time it goes idle we want a fresh log.
     this.idleCallCounts.set(calledNamespace, 0);
+    this.adaptiveSkipLogged.delete(calledNamespace);
 
     // Increment idle count for all OTHER active servers
     for (const ns of this.connections.keys()) {
@@ -1070,11 +1094,28 @@ export class ConnectServer {
       }
     }
 
-    // Auto-deactivate servers that have been idle too long
+    // Auto-deactivate servers that have been idle too long, using an
+    // adaptive per-namespace threshold so bursty upstreams get more
+    // patience. The baseline is the static IDLE_CALL_THRESHOLD (env
+    // var-overridable); the adaptive function adds a bonus based on
+    // that namespace's recent activity.
     const toDeactivate: string[] = [];
     for (const [ns, idleCount] of this.idleCallCounts) {
-      if (idleCount >= ConnectServer.IDLE_CALL_THRESHOLD && this.connections.has(ns)) {
+      if (!this.connections.has(ns)) continue;
+      const threshold = adaptiveThreshold(ns, this.recentToolCalls, ConnectServer.IDLE_CALL_THRESHOLD);
+      if (idleCount >= threshold) {
         toDeactivate.push(ns);
+      } else if (idleCount >= ConnectServer.IDLE_CALL_THRESHOLD && !this.adaptiveSkipLogged.has(ns)) {
+        // We would have deactivated under the static threshold but the
+        // adaptive bonus is keeping this ns alive. Log once per ns so
+        // users can see the mechanism doing its job, then stay quiet.
+        log("info", "Adaptive idle patience keeping bursty upstream alive", {
+          namespace: ns,
+          idleCalls: idleCount,
+          baseline: ConnectServer.IDLE_CALL_THRESHOLD,
+          adaptiveThreshold: threshold,
+        });
+        this.adaptiveSkipLogged.add(ns);
       }
     }
 
@@ -1085,6 +1126,7 @@ export class ConnectServer {
         await disconnectFromUpstream(connection);
         this.connections.delete(ns);
         this.idleCallCounts.delete(ns);
+        this.adaptiveSkipLogged.delete(ns);
       }
     }
 
@@ -1137,6 +1179,7 @@ export class ConnectServer {
         await disconnectFromUpstream(connection);
         this.connections.delete(namespace);
         this.idleCallCounts.delete(namespace);
+        this.adaptiveSkipLogged.delete(namespace);
         changed = true;
         continue;
       }
@@ -1153,6 +1196,7 @@ export class ConnectServer {
         await disconnectFromUpstream(connection);
         this.connections.delete(namespace);
         this.idleCallCounts.delete(namespace);
+        this.adaptiveSkipLogged.delete(namespace);
         changed = true;
       }
     }
@@ -1352,13 +1396,14 @@ export class ConnectServer {
       const avgLatency = h.totalCalls > 0 ? Math.round(h.totalLatencyMs / h.totalCalls) : 0;
       const errorRate = h.totalCalls > 0 ? Math.round((h.errorCount / h.totalCalls) * 100) : 0;
       const idleCount = this.idleCallCounts.get(namespace) ?? 0;
+      const idleLimit = adaptiveThreshold(namespace, this.recentToolCalls, ConnectServer.IDLE_CALL_THRESHOLD);
       const toolNames = conn.tools.map((t) => t.name).join(", ");
 
       lines.push(`  ${namespace} [${conn.status}] (${conn.config.type})`);
       lines.push(`    tools: ${conn.tools.length} — ${toolNames}`);
       lines.push(`    calls: ${h.totalCalls}, errors: ${h.errorCount} (${errorRate}%)`);
       lines.push(`    avg latency: ${avgLatency}ms`);
-      lines.push(`    idle: ${idleCount}/${ConnectServer.IDLE_CALL_THRESHOLD} until auto-deactivate`);
+      lines.push(`    idle: ${idleCount}/${idleLimit} until auto-deactivate`);
       if (h.lastErrorMessage) {
         lines.push(`    last error: ${h.lastErrorMessage} at ${h.lastErrorAt}`);
       }
