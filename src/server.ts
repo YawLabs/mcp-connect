@@ -12,7 +12,7 @@ import {
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { request } from "undici";
-import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
+import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
 import { formatShadowLine } from "./cli-shadows.js";
 import { type Profile, loadEffectiveProfile, profileAllows } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
@@ -661,6 +661,25 @@ export class ConnectServer {
         success: !result.isError,
         error: result.isError ? result.content[0]?.text : undefined,
       });
+
+      // Token-cost telemetry. serverId is null on the mcph side — the
+      // backend keys analytics on (accountId, scope='connect', namespace)
+      // via toolName/namespace when the server row isn't addressable by
+      // UUID client-side.
+      try {
+        const argsBytes = Buffer.byteLength(JSON.stringify(args ?? {}), "utf8");
+        const resultBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
+        recordDispatchEvent({
+          scope: "connect",
+          serverId: null,
+          toolName: route.originalName,
+          requestBytes: argsBytes,
+          responseBytesRaw: resultBytes,
+        });
+      } catch {
+        // JSON.stringify can throw on cyclic structures — telemetry is
+        // strictly best-effort, never fail the tool call for it.
+      }
       // Only count successful calls toward chain detection. An errored
       // call isn't a real usage signal — the user likely abandons or
       // retries on a different server. Meta-tools were short-circuited
