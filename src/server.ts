@@ -234,7 +234,7 @@ export class ConnectServer {
 
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: buildToolList(this.connections),
+      tools: buildToolList(this.connections, this.getDeferredServers()),
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -284,7 +284,7 @@ export class ConnectServer {
   };
 
   private rebuildRoutes(): void {
-    this.toolRoutes = buildToolRoutes(this.connections);
+    this.toolRoutes = buildToolRoutes(this.connections, this.getDeferredServers());
     this.resourceRoutes = buildResourceRoutes(this.connections);
     this.promptRoutes = buildPromptRoutes(this.connections);
   }
@@ -296,6 +296,25 @@ export class ConnectServer {
     const all = (this.config?.servers ?? []).filter((s) => s.isActive);
     if (!this.profile) return all;
     return all.filter((s) => profileAllows(this.profile, s.namespace));
+  }
+
+  // Configured-but-not-currently-connected servers that have a persisted
+  // toolCache. Fed into buildToolList/buildToolRoutes so the LLM can see
+  // their tools in tools/list before activation; first tools/call on any
+  // of those tools triggers lazy activation via activateOne in
+  // handleToolCall. Merges in any in-session toolCache (this.toolCache)
+  // that hasn't yet been persisted to the dashboard, so recently-used
+  // servers that got idle-evicted still appear as deferred.
+  private getDeferredServers(): UpstreamServerConfig[] {
+    const out: UpstreamServerConfig[] = [];
+    for (const server of this.getProfiledActiveServers()) {
+      if (this.connections.has(server.namespace)) continue;
+      const sessionCache = this.toolCache.get(server.namespace);
+      const cache = sessionCache && sessionCache.length > 0 ? sessionCache : server.toolCache;
+      if (!cache || cache.length === 0) continue;
+      out.push(cache === server.toolCache ? server : { ...server, toolCache: cache });
+    }
+    return out;
   }
 
   private async notifyAllListsChanged(): Promise<void> {
@@ -480,8 +499,51 @@ export class ConnectServer {
     // Map. Re-reading this.toolRoutes later would dispatch against a
     // map whose contents don't match the route we already captured —
     // so use the snapshot consistently from lookup through call.
-    const routes = this.toolRoutes;
-    const route = routes.get(name);
+    let routes = this.toolRoutes;
+    let route = routes.get(name);
+
+    // Deferred route: the server was advertised in tools/list from its
+    // cached tool set but isn't connected yet. Activate now, rebuild
+    // routes, notify the client that the list changed (so the real
+    // inputSchema supersedes the placeholder), then re-dispatch through
+    // the fresh routes. activateOne dedupes concurrent activations and
+    // handles elicitation + retries.
+    if (route?.deferred) {
+      progress?.(`Activating "${route.namespace}" on first tools/call…`);
+      const activation = await this.activateOne(route.namespace, progress);
+      if (!activation.ok) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Server "${route.namespace}" could not be activated on first call: ${activation.message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (activation.isChanged) {
+        this.rebuildRoutes();
+        await this.notifyAllListsChanged();
+      }
+      // Re-snapshot against fresh routes. If the upstream no longer
+      // exposes a tool by this name (cache was stale), fall through to
+      // the routes.get(name) miss path below with a clear message.
+      routes = this.toolRoutes;
+      route = routes.get(name);
+      if (!route || route.deferred) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Tool "${name}" is no longer available after activating "${activation.serverId ? activation.serverId : name}" — the upstream's tool set changed. Call mcp_connect_discover to see current tools.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     if (route) {
       const conn = this.connections.get(route.namespace);
       if (conn && conn.status === "error") {

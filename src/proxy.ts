@@ -1,10 +1,33 @@
 import { log } from "./logger.js";
 import { META_TOOLS } from "./meta-tools.js";
-import type { UpstreamConnection } from "./types.js";
+import type { UpstreamConnection, UpstreamServerConfig } from "./types.js";
 
 export interface ToolRoute {
   namespace: string;
   originalName: string;
+  // True when this route points at a server that isn't currently
+  // connected but has a persisted toolCache — the call handler is
+  // expected to activate the upstream on first tools/call, rebuild
+  // routes, and re-dispatch. Not set (or false) for routes backed by
+  // an active connection.
+  deferred?: boolean;
+}
+
+// Permissive placeholder schema for deferred tools. We don't have the
+// upstream's real inputSchema until it's been activated; clients that
+// validate locally need *something*, and `additionalProperties: true`
+// lets any shape through. The real schema takes over after activation
+// via list_changed.
+const DEFERRED_INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {},
+  additionalProperties: true,
+};
+
+function deferredDescription(server: UpstreamServerConfig, cachedDesc: string | undefined): string {
+  const base = cachedDesc?.trim();
+  const suffix = `[mcph: server "${server.namespace}" not yet connected — first call activates it]`;
+  return base ? `${base}\n\n${suffix}` : suffix;
 }
 
 export interface ResourceRoute {
@@ -35,7 +58,10 @@ export interface BuiltinResource {
   read: () => Promise<ResourceContents> | ResourceContents;
 }
 
-export function buildToolList(activeConnections: Map<string, UpstreamConnection>): Array<{
+export function buildToolList(
+  activeConnections: Map<string, UpstreamConnection>,
+  inactiveWithCache: UpstreamServerConfig[] = [],
+): Array<{
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
@@ -47,6 +73,7 @@ export function buildToolList(activeConnections: Map<string, UpstreamConnection>
     inputSchema: Record<string, unknown>;
     annotations?: Record<string, unknown>;
   }> = [];
+  const seen = new Set<string>();
 
   // Meta-tools first
   for (const meta of Object.values(META_TOOLS)) {
@@ -56,6 +83,7 @@ export function buildToolList(activeConnections: Map<string, UpstreamConnection>
       inputSchema: meta.inputSchema as Record<string, unknown>,
       annotations: meta.annotations as Record<string, unknown>,
     });
+    seen.add(meta.name);
   }
 
   // Active upstream tools
@@ -67,13 +95,35 @@ export function buildToolList(activeConnections: Map<string, UpstreamConnection>
         inputSchema: tool.inputSchema,
         annotations: tool.annotations,
       });
+      seen.add(tool.namespacedName);
+    }
+  }
+
+  // Deferred tools from inactive-but-configured servers. Active entries
+  // above win any collision — a tool the client just saw backed by a
+  // live connection must not be silently swapped for a placeholder.
+  for (const server of inactiveWithCache) {
+    if (activeConnections.has(server.namespace)) continue;
+    if (!server.toolCache || server.toolCache.length === 0) continue;
+    for (const cached of server.toolCache) {
+      const namespacedName = `${server.namespace}_${cached.name}`;
+      if (seen.has(namespacedName)) continue;
+      tools.push({
+        name: namespacedName,
+        description: deferredDescription(server, cached.description),
+        inputSchema: DEFERRED_INPUT_SCHEMA,
+      });
+      seen.add(namespacedName);
     }
   }
 
   return tools;
 }
 
-export function buildToolRoutes(activeConnections: Map<string, UpstreamConnection>): Map<string, ToolRoute> {
+export function buildToolRoutes(
+  activeConnections: Map<string, UpstreamConnection>,
+  inactiveWithCache: UpstreamServerConfig[] = [],
+): Map<string, ToolRoute> {
   const routes = new Map<string, ToolRoute>();
 
   for (const conn of activeConnections.values()) {
@@ -81,6 +131,22 @@ export function buildToolRoutes(activeConnections: Map<string, UpstreamConnectio
       routes.set(tool.namespacedName, {
         namespace: conn.config.namespace,
         originalName: tool.name,
+      });
+    }
+  }
+
+  // Deferred routes. Skip names that already route to an active
+  // connection — the active route is authoritative.
+  for (const server of inactiveWithCache) {
+    if (activeConnections.has(server.namespace)) continue;
+    if (!server.toolCache || server.toolCache.length === 0) continue;
+    for (const cached of server.toolCache) {
+      const namespacedName = `${server.namespace}_${cached.name}`;
+      if (routes.has(namespacedName)) continue;
+      routes.set(namespacedName, {
+        namespace: server.namespace,
+        originalName: cached.name,
+        deferred: true,
       });
     }
   }

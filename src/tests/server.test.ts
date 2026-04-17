@@ -602,6 +602,46 @@ describe("ConnectServer", () => {
       expect(result.content[0].text).toContain("Unknown tool");
     });
 
+    it("auto-activates a deferred upstream on first tools/call and re-dispatches", async () => {
+      // v0.13: the LLM sees gh_create_issue in tools/list because we
+      // advertised it from toolCache before activation. When the LLM
+      // calls it, we activate gh, rebuild routes, notify list_changed,
+      // then re-dispatch through the fresh (non-deferred) route.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", toolCache: [{ name: "create_issue", description: "cached" }] }),
+      ]);
+      priv.rebuildRoutes();
+      // Pre-call sanity: the route is a deferred placeholder.
+      expect(priv.toolRoutes.get("gh_create_issue")?.deferred).toBe(true);
+
+      const freshConn = makeConnection("gh", ["create_issue"]);
+      freshConn.client.callTool = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "issue created post-activation" }],
+      });
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(freshConn);
+
+      const result = await priv.handleToolCall("gh_create_issue", { title: "hi" });
+      expect(connectToUpstream).toHaveBeenCalled();
+      expect(result.content[0].text).toBe("issue created post-activation");
+      // Post-activation the route is live (no deferred flag).
+      expect(priv.toolRoutes.get("gh_create_issue")?.deferred).toBeUndefined();
+    });
+
+    it("surfaces activation failure when a deferred tool can't connect", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", toolCache: [{ name: "create_issue" }] })]);
+      priv.rebuildRoutes();
+
+      vi.mocked(connectToUpstream)
+        .mockRejectedValueOnce(new Error("spawn failed"))
+        .mockRejectedValueOnce(new Error("spawn failed"));
+
+      const result = await priv.handleToolCall("gh_create_issue", {});
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("could not be activated");
+    });
+
     it("records successful proxied calls into the pack detector", async () => {
       const priv = getPrivate(server);
       const conn = makeConnection("gh", ["create_issue"]);

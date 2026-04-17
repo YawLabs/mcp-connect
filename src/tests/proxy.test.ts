@@ -10,7 +10,21 @@ import {
   buildToolRoutes,
   routeResourceRead,
 } from "../proxy.js";
-import type { UpstreamConnection } from "../types.js";
+import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
+
+function makeInactiveServer(
+  namespace: string,
+  cachedTools: Array<{ name: string; description?: string }>,
+): UpstreamServerConfig {
+  return {
+    id: `id-${namespace}`,
+    name: namespace,
+    namespace,
+    type: "local",
+    isActive: true,
+    toolCache: cachedTools,
+  };
+}
 
 function makeConnection(
   namespace: string,
@@ -87,6 +101,75 @@ describe("buildToolRoutes", () => {
     const routes = buildToolRoutes(connections);
     expect(routes.size).toBe(2);
     expect(routes.get("slack_send_message")).toEqual({ namespace: "slack", originalName: "send_message" });
+  });
+});
+
+describe("buildToolList — deferred tools from inactive-but-cached servers", () => {
+  it("emits deferred entries with a permissive placeholder schema", () => {
+    const connections = new Map<string, UpstreamConnection>();
+    const inactive = [makeInactiveServer("gh", [{ name: "create_issue", description: "open a new issue" }])];
+    const tools = buildToolList(connections, inactive);
+    const entry = tools.find((t) => t.name === "gh_create_issue");
+    expect(entry).toBeDefined();
+    // Permissive placeholder — the upstream's real schema is unknown
+    // until first activation, so any-object is the safest stand-in.
+    expect(entry?.inputSchema).toEqual({ type: "object", properties: {}, additionalProperties: true });
+    // Cached description is preserved; a bracketed mcph note is appended
+    // so the client knows activation hasn't happened yet.
+    expect(entry?.description).toContain("open a new issue");
+    expect(entry?.description).toContain("not yet connected");
+  });
+
+  it("an active connection with the same namespace wins over a deferred entry", () => {
+    // Safety rail: if a server's real tool set exposes create_issue AND
+    // its cached tools also include create_issue, the LIVE definition
+    // (real inputSchema, real description) must not be shadowed by a
+    // placeholder — clients would see their valid call fail validation.
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", ["create_issue"]));
+    const inactive = [makeInactiveServer("gh", [{ name: "create_issue", description: "stale cached version" }])];
+    const tools = buildToolList(connections, inactive);
+    const ghTools = tools.filter((t) => t.name === "gh_create_issue");
+    expect(ghTools.length).toBe(1);
+    // The live schema { type: "object" } from makeConnection, not the
+    // placeholder — ensures we didn't overwrite.
+    expect(ghTools[0].inputSchema).toEqual({ type: "object" });
+  });
+
+  it("skips inactive servers whose toolCache is missing or empty", () => {
+    const connections = new Map<string, UpstreamConnection>();
+    const inactive: UpstreamServerConfig[] = [
+      { id: "a", name: "a", namespace: "a", type: "local", isActive: true },
+      { id: "b", name: "b", namespace: "b", type: "local", isActive: true, toolCache: [] },
+    ];
+    const tools = buildToolList(connections, inactive);
+    const meta = Object.keys(META_TOOLS).length;
+    expect(tools.length).toBe(meta);
+  });
+});
+
+describe("buildToolRoutes — deferred routes", () => {
+  it("marks deferred: true for routes generated from toolCache", () => {
+    const connections = new Map<string, UpstreamConnection>();
+    const inactive = [makeInactiveServer("gh", [{ name: "create_issue" }])];
+    const routes = buildToolRoutes(connections, inactive);
+    const route = routes.get("gh_create_issue");
+    expect(route).toEqual({ namespace: "gh", originalName: "create_issue", deferred: true });
+  });
+
+  it("an active route takes precedence over a deferred one for the same name", () => {
+    const connections = new Map<string, UpstreamConnection>();
+    connections.set("gh", makeConnection("gh", ["create_issue"]));
+    const inactive = [makeInactiveServer("gh", [{ name: "create_issue" }])];
+    const routes = buildToolRoutes(connections, inactive);
+    const route = routes.get("gh_create_issue");
+    // No deferred flag — the active route wins. Without this rule a
+    // tools/call on a live tool could get routed through the deferred
+    // branch and activateOne would be called on an already-connected
+    // server, racing with the real dispatch.
+    expect(route?.deferred).toBeUndefined();
+    expect(route?.namespace).toBe("gh");
+    expect(route?.originalName).toBe("create_issue");
   });
 });
 
