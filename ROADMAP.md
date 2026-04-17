@@ -3,10 +3,10 @@
 ## Phase 1 — v0.1 (Complete)
 
 - [x] Cloud-configured, locally-executed MCP orchestrator
-- [x] discover / activate / deactivate meta-tools
+- [x] discover / load / unload meta-tools
 - [x] Local server spawning (stdio) + remote server connections (HTTP)
 - [x] Namespace-based tool routing
-- [x] tools/list_changed notifications on activate/deactivate
+- [x] tools/list_changed notifications on load/unload
 - [x] 60s config polling with version hash comparison
 - [x] Auto-unload servers idle for 10+ tool calls
 - [x] Directive tool descriptions for context-aware LLM behavior

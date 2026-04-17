@@ -1800,20 +1800,32 @@ export class ConnectServer {
       }
 
       // Refresh config so the new server shows up in discover immediately.
-      // Best-effort — failure just means the next 60s poll will catch it.
-      await this.fetchAndApplyConfig().catch((err: Error) =>
-        log("warn", "Post-install config refresh failed", { error: err?.message }),
-      );
+      // Race against a 3s timeout — if the backend is slow, the install
+      // itself already succeeded and the next 60s poll will catch the new
+      // namespace; better to return than hang the tool call. If the race
+      // loses, we tell the model to expect a brief delay so it doesn't
+      // immediately call activate on a namespace the client hasn't seen.
+      let configFresh = true;
+      try {
+        await Promise.race([
+          this.fetchAndApplyConfig(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("refresh timeout")), 3000)),
+        ]);
+      } catch (err) {
+        configFresh = false;
+        log("warn", "Post-install config refresh failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
 
-      const nextStep =
-        payload.type === "local"
-          ? `Call mcp_connect_activate with namespace "${payload.namespace}" to load its tools into this session.`
-          : `Call mcp_connect_activate with namespace "${payload.namespace}" to load its tools.`;
+      const activateHint = configFresh
+        ? `Call mcp_connect_activate with namespace "${payload.namespace}" to load its tools${payload.type === "local" ? " into this session" : ""}.`
+        : `The new server will appear in mcp_connect_discover within ~60s. If the first mcp_connect_activate("${payload.namespace}") reports an unknown namespace, wait a minute and retry.`;
       return {
         content: [
           {
             type: "text",
-            text: `Installed "${payload.name}" (namespace "${payload.namespace}"). ${nextStep}`,
+            text: `Installed "${payload.name}" (namespace "${payload.namespace}"). ${activateHint}`,
           },
         ],
       };
