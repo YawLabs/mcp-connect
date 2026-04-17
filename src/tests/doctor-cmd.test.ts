@@ -7,7 +7,7 @@ function writeMcphConfig(root: string, filename: string, obj: unknown): void {
   writeFileSync(join(root, ".mcph", filename), JSON.stringify(obj));
 }
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { runDoctor } from "../doctor-cmd.js";
+import { runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
 
 let synthHome: string;
@@ -151,6 +151,73 @@ describe("runDoctor — client detection", () => {
       out: cap.out,
     });
     expect(cap.text()).toMatch(/run `mcph install claude-code`/);
+  });
+});
+
+describe("scanShellHistoryForShadows", () => {
+  it("counts shadowed CLI invocations in bash history", () => {
+    writeFileSync(
+      join(synthHome, ".bash_history"),
+      ["npm audit", "ls -la", "tailscale status", "npm deprecate foo bar", "cd ~"].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    const npm = hits.find((h) => h.cli === "npm");
+    const ts = hits.find((h) => h.cli === "tailscale");
+    expect(npm?.count).toBe(2);
+    expect(ts?.count).toBe(1);
+    expect(npm?.namespaces).toContain("npmjs");
+  });
+
+  it("parses zsh extended-history metadata prefix", () => {
+    writeFileSync(
+      join(synthHome, ".zsh_history"),
+      [": 1700000000:0;npm audit", ": 1700000001:0;gh pr list", "bare line without prefix"].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "gh")?.count).toBe(1);
+  });
+
+  it("strips leading env-var assignments and sudo", () => {
+    writeFileSync(
+      join(synthHome, ".bash_history"),
+      ["FOO=bar npm search lodash", "sudo kubectl get pods", "DEBUG=1 FOO=baz aws s3 ls"].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "kubectl")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "aws")?.count).toBe(1);
+  });
+
+  it("strips an absolute path from the leading binary", () => {
+    writeFileSync(
+      join(synthHome, ".bash_history"),
+      ["/usr/local/bin/npm audit", "/opt/homebrew/bin/tailscale up"].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits.find((h) => h.cli === "npm")?.count).toBe(1);
+    expect(hits.find((h) => h.cli === "tailscale")?.count).toBe(1);
+  });
+
+  it("returns [] when no history files exist", () => {
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits).toEqual([]);
+  });
+
+  it("ignores commands that don't match a shadowed CLI", () => {
+    writeFileSync(join(synthHome, ".bash_history"), ["ls -la", "echo hi", "cat foo.txt", "pwd"].join("\n"));
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits).toEqual([]);
+  });
+
+  it("sorts hits by count descending", () => {
+    writeFileSync(
+      join(synthHome, ".bash_history"),
+      ["tailscale up", "npm audit", "npm search foo", "npm view bar"].join("\n"),
+    );
+    const hits = scanShellHistoryForShadows({ home: synthHome, env: {} });
+    expect(hits[0].cli).toBe("npm");
+    expect(hits[0].count).toBe(3);
   });
 });
 

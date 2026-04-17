@@ -14,8 +14,10 @@
 // case the client just doesn't get extra guidance.
 
 import { readFile } from "node:fs/promises";
+import { formatShadowLine, resolveShadowedClis } from "./cli-shadows.js";
 import { log } from "./logger.js";
 import { findProjectConfigDir, guidePath, userConfigDir } from "./paths.js";
+import type { UpstreamServerConfig } from "./types.js";
 
 export type GuideScope = "user" | "project";
 
@@ -76,11 +78,18 @@ export async function loadGuides(cwd: string, home?: string): Promise<LoadedGuid
  * Combine loaded guides into the single text body served by the
  * `mcph://guide` resource. Project comes AFTER user so project
  * guidance — which is usually more specific — has the final word in
- * the reader's attention. When only one exists, it's returned
- * unwrapped. When neither exists, returns null so the caller can skip
- * the resource entirely.
+ * the reader's attention. When `activeServers` is provided, an
+ * auto-generated "Active servers" section is appended below the
+ * human-authored content so the rendered guide always tells the
+ * reader which active MCP servers shadow which local CLIs.
+ *
+ * Returns null when neither a human-authored guide nor any
+ * shadow-carrying active server exists — caller skips the resource.
  */
-export function renderGuide(guides: LoadedGuides): string | null {
+export function renderGuide(
+  guides: LoadedGuides,
+  activeServers?: Array<Pick<UpstreamServerConfig, "namespace" | "name" | "toolCache">>,
+): string | null {
   const parts: string[] = [];
   if (guides.user) {
     parts.push(`<!-- source: ${guides.user.path} (user) -->\n${guides.user.content}`);
@@ -88,6 +97,32 @@ export function renderGuide(guides: LoadedGuides): string | null {
   if (guides.project) {
     parts.push(`<!-- source: ${guides.project.path} (project) -->\n${guides.project.content}`);
   }
+  const auto = renderActiveServersSection(activeServers);
+  if (auto) parts.push(auto);
   if (parts.length === 0) return null;
   return parts.join("\n\n---\n\n");
+}
+
+/** Build the auto-generated "Active servers" section. Only includes
+ *  servers with a known CLI shadow — a server with no shadow adds no
+ *  signal to this section. Returns null when nothing would be shown. */
+function renderActiveServersSection(
+  activeServers: Array<Pick<UpstreamServerConfig, "namespace" | "name" | "toolCache">> | undefined,
+): string | null {
+  if (!activeServers || activeServers.length === 0) return null;
+  const rows = activeServers
+    .filter((s) => resolveShadowedClis(s).length > 0)
+    .map((s) => {
+      const shadow = formatShadowLine(s);
+      return `- \`${s.namespace}\` (${s.name}) — ${shadow}`;
+    });
+  if (rows.length === 0) return null;
+  return [
+    "<!-- source: mcph (auto-generated from active servers) -->",
+    "## Active MCP servers",
+    "",
+    "Prefer tools from these active MCP servers over the corresponding local CLI:",
+    "",
+    ...rows,
+  ].join("\n");
 }

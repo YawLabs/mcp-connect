@@ -29,6 +29,7 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { CONFIG_FILENAME, CURRENT_SCHEMA_VERSION, loadMcphConfig } from "./config-loader.js";
 import {
+  CLAUDE_CODE_ALLOW_PATTERN,
   CURRENT_OS,
   ENTRY_NAME,
   INSTALL_TARGETS,
@@ -36,6 +37,7 @@ import {
   type InstallOS,
   type InstallScope,
   buildLaunchEntry,
+  resolveClaudeCodeSettingsPath,
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
@@ -233,16 +235,30 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const mcphConfigPath = join(home, CONFIG_DIRNAME, CONFIG_FILENAME);
   const mcphConfigJson = await composeMcphConfig(mcphConfigPath, token);
 
+  // Claude Code: also ensure `permissions.allow` carries our pattern so
+  // the user isn't re-prompted for every mcph tool call. No-op for other
+  // clients (Claude Desktop / Cursor / VS Code have their own permission
+  // models). Preserves all existing settings — we only union the pattern
+  // into `permissions.allow` and write the file back verbatim otherwise.
+  const settingsPatch =
+    opts.clientId === "claude-code"
+      ? await prepareClaudeCodeSettingsPatch({
+          scope,
+          home,
+          projectDir,
+          os,
+        })
+      : null;
+
   if (opts.dryRun) {
     log("\n--- dry run: would write the following ---");
     log(`\n# ${resolved.absolute}\n${clientJson}`);
     if (writeMcphConfig) log(`# ${mcphConfigPath}\n${mcphConfigJson}`);
-    return {
-      written: [],
-      wouldWrite: writeMcphConfig ? [resolved.absolute, mcphConfigPath] : [resolved.absolute],
-      messages,
-      exitCode: 0,
-    };
+    if (settingsPatch?.changed) log(`# ${settingsPatch.path}\n${settingsPatch.nextJson}`);
+    const wouldWrite = [resolved.absolute];
+    if (writeMcphConfig) wouldWrite.push(mcphConfigPath);
+    if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
+    return { written: [], wouldWrite, messages, exitCode: 0 };
   }
 
   // Write client config (creating parent dirs if missing).
@@ -277,9 +293,92 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     written.push(mcphConfigPath);
   }
 
+  // Claude Code: merge permissions.allow into settings.json so tool
+  // calls don't prompt. Best-effort: any failure here is logged but does
+  // NOT fail the overall install — the launch entry is already written.
+  if (settingsPatch?.changed) {
+    try {
+      await mkdir(dirname(settingsPatch.path), { recursive: true });
+      await writeFile(settingsPatch.path, settingsPatch.nextJson, "utf8");
+      log(`Wrote ${settingsPatch.path} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow)`);
+      written.push(settingsPatch.path);
+    } catch (e) {
+      err(
+        `mcph install: warning — failed to patch ${settingsPatch.path}: ${(e as Error).message}. You may be re-prompted for each mcph tool call; add "${CLAUDE_CODE_ALLOW_PATTERN}" to permissions.allow to silence.`,
+      );
+    }
+  }
+
   if (target.notes) log(`Note: ${target.notes}`);
   log(`\n✓ ${target.label} is configured. Restart it to pick up the new MCP server.`);
   return { written, wouldWrite: [], messages, exitCode: 0 };
+}
+
+/** Read `settings.json` (or settings.local.json) for the given scope,
+ *  compute the next version with the mcph allow-pattern unioned into
+ *  `permissions.allow`, and return both the path and the rendered JSON.
+ *  Returns `changed: false` when the pattern is already present — caller
+ *  can skip the write entirely. Returns null for scopes that have no
+ *  corresponding settings file. Malformed existing files are left
+ *  untouched (changed: false, with a warning printed by the caller). */
+async function prepareClaudeCodeSettingsPatch(opts: {
+  scope: InstallScope;
+  home: string;
+  projectDir: string | undefined;
+  os: InstallOS;
+}): Promise<{ path: string; nextJson: string; changed: boolean } | null> {
+  const path = resolveClaudeCodeSettingsPath(opts.scope, {
+    home: opts.home,
+    projectDir: opts.projectDir,
+    os: opts.os,
+  });
+  if (!path) return null;
+
+  let existing: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      const raw = await readFile(path, "utf8");
+      if (raw.trim().length > 0) {
+        const parsed = parseJsonc(raw);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          existing = parsed as Record<string, unknown>;
+        } else {
+          // Not an object — leave alone, return no-change.
+          return { path, nextJson: "", changed: false };
+        }
+      }
+    } catch {
+      // Malformed settings.json — don't try to rewrite; let the user fix it.
+      return { path, nextJson: "", changed: false };
+    }
+  }
+
+  const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+  // If nothing changed, signal no-op to the caller.
+  const before = JSON.stringify(existing);
+  const after = JSON.stringify(merged);
+  if (before === after) return { path, nextJson: "", changed: false };
+  return { path, nextJson: `${JSON.stringify(merged, null, 2)}\n`, changed: true };
+}
+
+/** Union `patterns` into `existing.permissions.allow`, preserving every
+ *  other key. Deduplicates by string equality so repeated installs don't
+ *  grow the list. Exported for tests. */
+export function mergePermissionsAllow(existing: Record<string, unknown>, patterns: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...existing };
+  const prev = out.permissions;
+  const perms: Record<string, unknown> =
+    typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
+  const prevAllow = perms.allow;
+  const allow: string[] = Array.isArray(prevAllow)
+    ? (prevAllow as unknown[]).filter((x): x is string => typeof x === "string")
+    : [];
+  for (const p of patterns) {
+    if (!allow.includes(p)) allow.push(p);
+  }
+  perms.allow = allow;
+  out.permissions = perms;
+  return out;
 }
 
 async function promptCollision(path: string, io: InstallCommandOptions["io"]): Promise<"overwrite" | "skip" | "abort"> {

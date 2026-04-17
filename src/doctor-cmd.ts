@@ -15,6 +15,8 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
+import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
   type LoadedConfigFile,
@@ -135,6 +137,24 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   if (config.warnings.length > 0) {
     print("WARNINGS");
     for (const w of config.warnings) print(`  ! ${w}`);
+    print("");
+  }
+
+  // Shell-history CLI-shadow scan. Reads recent bash/zsh/PowerShell
+  // history lines and flags any that invoked a CLI an MCP server
+  // shadows (per the static registry in cli-shadows.ts). Non-fatal —
+  // purely informational. History files may not exist, may be
+  // unreadable, or may use a format we can't parse; any failure is
+  // silently skipped and this section is omitted.
+  const shadowHits = scanShellHistoryForShadows({ home, env });
+  if (shadowHits.length > 0) {
+    print("SHADOWED CLI USAGE (recent shell history)");
+    print("  Commands below have MCP servers that can replace them;");
+    print("  activate the server and prefer its tools over the CLI.");
+    for (const hit of shadowHits) {
+      const pluralHit = hit.count === 1 ? "time" : "times";
+      print(`  ${hit.cli.padEnd(12)} ${hit.count} ${pluralHit} → server(s): ${hit.namespaces.join(", ")}`);
+    }
     print("");
   }
 
@@ -359,6 +379,130 @@ async function fetchLatestVersion(override?: () => Promise<string | null>): Prom
   } finally {
     clearTimeout(timer);
   }
+}
+
+export interface ShadowHit {
+  cli: string;
+  count: number;
+  namespaces: string[];
+}
+
+// How many lines from the tail of each history file we examine. 500 is
+// long enough to catch a day or two of normal terminal usage without
+// loading massive archives into memory. History files grow unbounded
+// on many setups — reading the whole thing would be wasteful here.
+const SHELL_HISTORY_TAIL_LINES = 500;
+
+/** Scan recent bash / zsh / PowerShell history for commands that an
+ *  MCP server shadows. Returns a sorted (count desc) list of hits.
+ *  Any I/O error on a history file is swallowed — this is purely
+ *  diagnostic, never fatal. */
+export function scanShellHistoryForShadows(opts: {
+  home: string;
+  env: NodeJS.ProcessEnv;
+}): ShadowHit[] {
+  const shadowMap = cliToNamespaces();
+  const counts = new Map<string, number>();
+
+  for (const source of shellHistorySources(opts)) {
+    const lines = readTailLines(source.path, SHELL_HISTORY_TAIL_LINES);
+    for (const raw of lines) {
+      const cmd = source.extractCommand(raw);
+      if (!cmd) continue;
+      const binary = extractLeadingBinary(cmd);
+      if (!binary) continue;
+      if (!shadowMap.has(binary)) continue;
+      counts.set(binary, (counts.get(binary) ?? 0) + 1);
+    }
+  }
+
+  const hits: ShadowHit[] = [];
+  for (const [cli, count] of counts) {
+    const namespaces = shadowMap.get(cli) ?? [];
+    hits.push({ cli, count, namespaces });
+  }
+  hits.sort((a, b) => b.count - a.count);
+  return hits;
+}
+
+interface ShellHistorySource {
+  path: string;
+  /** Given a raw line, return the command or null to skip. */
+  extractCommand: (line: string) => string | null;
+}
+
+function shellHistorySources(opts: {
+  home: string;
+  env: NodeJS.ProcessEnv;
+}): ShellHistorySource[] {
+  const sources: ShellHistorySource[] = [];
+  sources.push({ path: join(opts.home, ".bash_history"), extractCommand: (l) => l.trim() || null });
+  sources.push({
+    path: join(opts.home, ".zsh_history"),
+    // Zsh extended-history lines look like `: 1700000000:0;npm audit`.
+    // Strip the metadata prefix so we get just the command.
+    extractCommand: (l) => {
+      const trimmed = l.trim();
+      if (!trimmed) return null;
+      if (trimmed.startsWith(":")) {
+        const semi = trimmed.indexOf(";");
+        return semi === -1 ? null : trimmed.slice(semi + 1);
+      }
+      return trimmed;
+    },
+  });
+  const appData = opts.env.APPDATA;
+  if (appData) {
+    sources.push({
+      path: join(appData, "Microsoft", "Windows", "PowerShell", "PSReadLine", "ConsoleHost_history.txt"),
+      extractCommand: (l) => l.trim() || null,
+    });
+  }
+  return sources;
+}
+
+function readTailLines(path: string, n: number): string[] {
+  try {
+    const raw = readFileSync(path, "utf8");
+    const all = raw.split(/\r?\n/);
+    return all.length <= n ? all : all.slice(all.length - n);
+  } catch {
+    return [];
+  }
+}
+
+// Pull the leading binary out of a shell command, stripping any
+// leading env-var assignments (`FOO=bar CMD=quux cmd arg`), `sudo`,
+// and path-style invocations (`/usr/local/bin/npm` → `npm`). Returns
+// null for lines we can't confidently parse (pipes, command
+// substitution, assignments only).
+function extractLeadingBinary(command: string): string | null {
+  let rest = command.trimStart();
+  if (!rest) return null;
+  // Drop leading control chars like `! ` (bang-prefixed history
+  // references from bash shouldn't even land here, but defensive).
+  if (rest.startsWith("!")) return null;
+  // Strip leading env-var assignments.
+  while (/^[A-Z_][A-Z0-9_]*=/i.test(rest)) {
+    const space = rest.indexOf(" ");
+    if (space === -1) return null;
+    rest = rest.slice(space + 1).trimStart();
+  }
+  // Strip `sudo` / `time` / `command` prefixes.
+  const prefixes = ["sudo", "time", "command", "exec"];
+  const firstWord = rest.split(/\s+/)[0];
+  if (prefixes.includes(firstWord)) {
+    const space = rest.indexOf(" ");
+    if (space === -1) return null;
+    rest = rest.slice(space + 1).trimStart();
+  }
+  const first = rest.split(/\s+/)[0];
+  if (!first) return null;
+  // Reject pipes, redirects, subshells, empty assignments.
+  if (/[|&;<>()`$]/.test(first)) return null;
+  // Strip path prefix — we match on the binary name.
+  const slash = Math.max(first.lastIndexOf("/"), first.lastIndexOf("\\"));
+  return slash === -1 ? first : first.slice(slash + 1);
 }
 
 // Tiny semver compare — full semver is overkill; we only need to

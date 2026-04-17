@@ -145,4 +145,44 @@ describe("renderGuide", () => {
     expect(projIdx).toBeGreaterThan(userIdx);
     expect(out).toContain("---");
   });
+
+  it("appends an 'Active servers' auto-section when activeServers carry shadows", () => {
+    const out = renderGuide(
+      {
+        user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u-body" },
+        project: null,
+      },
+      [
+        { namespace: "npmjs", name: "npm registry" },
+        { namespace: "linear", name: "Linear" }, // no shadow → must be filtered
+      ],
+    );
+    expect(out).toContain("## Active MCP servers");
+    expect(out).toContain("`npmjs`");
+    expect(out).toContain("npm registry");
+    expect(out).not.toContain("Linear"); // no shadow → not in auto section
+  });
+
+  it("omits the auto-section when no active server shadows any CLI", () => {
+    const out = renderGuide(
+      {
+        user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u-body" },
+        project: null,
+      },
+      [{ namespace: "linear", name: "Linear" }],
+    );
+    expect(out).not.toContain("Active MCP servers");
+  });
+
+  it("returns the auto-section alone when no human-authored guide exists", () => {
+    // User has no MCPH.md but an active npmjs server — the guide
+    // resource still carries signal, so we surface it.
+    const out = renderGuide({ user: null, project: null }, [{ namespace: "npmjs", name: "npm registry" }]);
+    expect(out).toContain("Active MCP servers");
+    expect(out).toContain("`npmjs`");
+  });
+
+  it("still returns null when guides are empty AND no shadows apply", () => {
+    expect(renderGuide({ user: null, project: null }, [{ namespace: "linear", name: "Linear" }])).toBeNull();
+  });
 });

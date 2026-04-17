@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { request } from "undici";
 import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
+import { formatShadowLine } from "./cli-shadows.js";
 import { type Profile, loadEffectiveProfile, profileAllows } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import { detectMissingCredentials } from "./credentials.js";
@@ -103,6 +104,21 @@ function argsEqual(a?: string[], b?: string[]): boolean {
   return a.every((v, i) => v === b[i]);
 }
 
+// Tokenizer for the discover "matches" summary. Mirrors relevance.ts's
+// split-on-non-alphanumeric behavior so the summary's per-tool match
+// logic lines up with BM25's ranking logic. Kept local rather than
+// exported from relevance.ts because the MIN_TOKEN_LEN of 3 used
+// there would drop short but meaningful query words like "pr" / "ci"
+// here — the summary is cosmetic, so a looser threshold is fine.
+function tokenizeForSummary(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((w) => w.length >= 2),
+  );
+}
+
 export class ConnectServer {
   private server: Server;
   private connections = new Map<string, UpstreamConnection>();
@@ -164,6 +180,18 @@ export class ConnectServer {
   // are deliberately excluded because they aren't user workflow.
   private readonly packDetector = new PackDetector();
 
+  // Short-TTL dedup cache for discover output. Agents often call
+  // discover twice in quick succession (e.g. once to list, again after
+  // a failed activate) — the second call returns the same text if
+  // nothing has changed. Keyed on (configVersion, context, autoWarmed,
+  // active-namespace-set) so activate/deactivate naturally invalidates.
+  private discoverCache: {
+    key: string;
+    result: { content: Array<{ type: string; text: string }> };
+    expires: number;
+  } | null = null;
+  private static readonly DISCOVER_CACHE_TTL_MS = 3000;
+
   // Baseline idle-call threshold. A namespace with NO recent activity
   // gets deactivated after this many non-matching tool calls; bursty
   // namespaces get proportionally more patience via adaptiveThreshold()
@@ -204,7 +232,7 @@ export class ConnectServer {
   // `this.guides` once, but tests and future hot-reload code paths may
   // mutate it, and the cost of rebuilding is negligible.
   private getBuiltinResources(): BuiltinResource[] {
-    const body = renderGuide(this.guides);
+    const body = renderGuide(this.guides, this.getProfiledActiveServers());
     if (!body) return [];
     return [
       {
@@ -216,10 +244,11 @@ export class ConnectServer {
         read: () => {
           // Flip the session flag — the meta-tools one-shot nudge keys
           // off this so we only remind the client to read the guide if
-          // they haven't yet. Re-render at read time in case guides
-          // were hot-reloaded (not done today, but free to support).
+          // they haven't yet. Re-render at read time so the auto
+          // "Active servers" section reflects the current connection
+          // set, not the one at list time.
           this.guideRead = true;
-          const text = renderGuide(this.guides) ?? "";
+          const text = renderGuide(this.guides, this.getProfiledActiveServers()) ?? "";
           return { contents: [{ uri: "mcph://guide", text, mimeType: "text/markdown" }] };
         },
       },
@@ -638,6 +667,27 @@ export class ConnectServer {
   // the server is connected in this session, otherwise falls back to the
   // in-memory toolCache (populated from prior activations this session)
   // and finally the persistent toolCache shipped in the config payload.
+  // Pick up to five tool names from the server whose own tokens overlap
+  // with the query tokens. Falls back to the first three cached tool
+  // names when nothing overlaps (the server scored on name/description,
+  // not tools — still useful to surface the shape of what's available).
+  // Used by the discover "Matches your query" summary only.
+  private matchedToolNames(server: UpstreamServerConfig, queryTokens: Set<string>): string[] {
+    const tools = this.rankableFor(server).tools;
+    if (tools.length === 0) return [];
+    const hits: string[] = [];
+    for (const tool of tools) {
+      const nameTokens = tool.name.toLowerCase().split(/[^a-z0-9]+/);
+      const descTokens = (tool.description ?? "").toLowerCase().split(/[^a-z0-9]+/);
+      if (nameTokens.some((t) => queryTokens.has(t)) || descTokens.some((t) => queryTokens.has(t))) {
+        hits.push(tool.name);
+        if (hits.length >= 5) break;
+      }
+    }
+    if (hits.length > 0) return hits;
+    return tools.slice(0, 3).map((t) => t.name);
+  }
+
   private rankableFor(server: UpstreamServerConfig): RankableServer {
     const connection = this.connections.get(server.namespace);
     const liveTools = connection?.tools.map((t) => ({ name: t.name, description: t.description }));
@@ -766,7 +816,31 @@ export class ConnectServer {
     return this.buildDiscoverOutput(context, result.ok);
   }
 
+  private discoverCacheKey(context: string | undefined, autoWarmed: boolean): string {
+    const activeNamespaces = [...this.connections.entries()]
+      .filter(([, c]) => c.status === "connected")
+      .map(([ns]) => ns)
+      .sort()
+      .join(",");
+    return `${this.configVersion ?? ""}|${context ?? ""}|${autoWarmed ? "1" : "0"}|${activeNamespaces}`;
+  }
+
   private buildDiscoverOutput(
+    context: string | undefined,
+    autoWarmed: boolean,
+  ): { content: Array<{ type: string; text: string }> } {
+    const key = this.discoverCacheKey(context, autoWarmed);
+    const now = Date.now();
+    const cached = this.discoverCache;
+    if (cached && cached.key === key && cached.expires > now) {
+      return cached.result;
+    }
+    const result = this.buildDiscoverOutputImpl(context, autoWarmed);
+    this.discoverCache = { key, result, expires: now + ConnectServer.DISCOVER_CACHE_TTL_MS };
+    return result;
+  }
+
+  private buildDiscoverOutputImpl(
     context: string | undefined,
     autoWarmed: boolean,
   ): { content: Array<{ type: string; text: string }> } {
@@ -810,6 +884,28 @@ export class ConnectServer {
       lines.push(`Auto-activated "${sorted[0].namespace}" — top match for your query.\n`);
     }
 
+    // Compact "Matches your query" summary. Prepended when context is
+    // given AND at least one server scored above zero, so the model
+    // sees the short answer before the long list. Without this block
+    // the relevance signal is easy to skim past — the per-server lines
+    // carry a numeric score but no summary of WHY each matched.
+    if (context) {
+      const matchedServers = sorted.filter((s) => {
+        const score = scores.get(s.namespace);
+        return score !== undefined && score > 0;
+      });
+      if (matchedServers.length > 0) {
+        lines.push("Matches for your query:");
+        const queryTokens = tokenizeForSummary(context);
+        for (const server of matchedServers.slice(0, 5)) {
+          const tools = this.matchedToolNames(server, queryTokens);
+          const toolStr = tools.length > 0 ? ` → ${tools.join(", ")}` : "";
+          lines.push(`  • ${server.namespace}${toolStr}`);
+        }
+        lines.push("");
+      }
+    }
+
     for (const server of sorted) {
       const connection = this.connections.get(server.namespace);
       const status = connection
@@ -822,6 +918,9 @@ export class ConnectServer {
       const relevance = score && score > 0 ? ` (relevance: ${score.toFixed(2)})` : "";
 
       lines.push(`  ${server.namespace} — ${server.name} [${status}] (${server.type})${relevance}`);
+
+      const shadow = formatShadowLine(server);
+      if (shadow) lines.push(`    ${shadow}`);
 
       // Show cached tool names for servers that aren't currently connected
       if (!connection) {

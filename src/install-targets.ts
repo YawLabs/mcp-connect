@@ -283,3 +283,24 @@ export function buildLaunchEntry(opts: BuildLaunchEntryOptions): LaunchEntry {
  *  or `servers` (VS Code). Stable across clients so doctor can detect
  *  collisions deterministically. */
 export const ENTRY_NAME = "mcp.hosting";
+
+/** Pattern added to Claude Code's `permissions.allow` on install so the
+ *  user isn't re-prompted for each mcph MCP tool call. Only matters for
+ *  Claude Code (Claude Desktop / Cursor / VS Code have their own models).
+ *  Keep in sync with the tool-name prefix our proxy exposes. */
+export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp_hosting__*";
+
+/** Resolve the Claude Code settings.json file that holds `permissions.allow`.
+ *  Different from the mcpServers path (`~/.claude.json`): permissions live
+ *  in `settings.json`, not the user config. Returns null for clients that
+ *  don't use this scheme. */
+export function resolveClaudeCodeSettingsPath(
+  scope: InstallScope,
+  opts: { home: string; projectDir?: string; os: InstallOS },
+): string | null {
+  const { home, projectDir } = opts;
+  if (scope === "user") return join(home, ".claude", "settings.json");
+  if (scope === "project" && projectDir) return join(projectDir, ".claude", "settings.json");
+  if (scope === "local" && projectDir) return join(projectDir, ".claude", "settings.local.json");
+  return null;
+}

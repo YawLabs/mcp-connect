@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mergeClientConfig, parseInstallArgs, runInstall } from "../install-cmd.js";
-import { ENTRY_NAME } from "../install-targets.js";
+import { mergeClientConfig, mergePermissionsAllow, parseInstallArgs, runInstall } from "../install-cmd.js";
+import { CLAUDE_CODE_ALLOW_PATTERN, ENTRY_NAME } from "../install-targets.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -175,8 +175,119 @@ describe("mergeClientConfig", () => {
   });
 });
 
+describe("mergePermissionsAllow", () => {
+  it("adds the pattern to an empty settings object", () => {
+    const merged = mergePermissionsAllow({}, [CLAUDE_CODE_ALLOW_PATTERN]);
+    expect(merged).toEqual({ permissions: { allow: [CLAUDE_CODE_ALLOW_PATTERN] } });
+  });
+
+  it("preserves unrelated top-level keys (hooks, model, mcpServers)", () => {
+    const existing = {
+      model: "claude-opus-4-7",
+      hooks: { PreToolUse: [{ matcher: "Bash" }] },
+      mcpServers: { other: { command: "x" } },
+    };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    expect(merged.model).toBe("claude-opus-4-7");
+    expect(merged.hooks).toEqual(existing.hooks);
+    expect(merged.mcpServers).toEqual(existing.mcpServers);
+    expect((merged.permissions as { allow: string[] }).allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+  });
+
+  it("unions with existing allow entries instead of replacing", () => {
+    const existing = { permissions: { allow: ["Bash(git *)", "Read"] } };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    const allow = (merged.permissions as { allow: string[] }).allow;
+    expect(allow).toEqual(["Bash(git *)", "Read", CLAUDE_CODE_ALLOW_PATTERN]);
+  });
+
+  it("does not duplicate a pattern already present", () => {
+    const existing = { permissions: { allow: [CLAUDE_CODE_ALLOW_PATTERN] } };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    const allow = (merged.permissions as { allow: string[] }).allow;
+    expect(allow.filter((x) => x === CLAUDE_CODE_ALLOW_PATTERN)).toHaveLength(1);
+  });
+
+  it("preserves other permissions fields like deny / additionalDirectories", () => {
+    const existing = { permissions: { deny: ["Bash(rm -rf *)"], additionalDirectories: ["/tmp"] } };
+    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
+    const perms = merged.permissions as { allow: string[]; deny: string[]; additionalDirectories: string[] };
+    expect(perms.deny).toEqual(["Bash(rm -rf *)"]);
+    expect(perms.additionalDirectories).toEqual(["/tmp"]);
+    expect(perms.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+  });
+});
+
+describe("runInstall — settings.json merge edge cases (claude-code)", () => {
+  it("preserves existing settings.json content when patching", async () => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(
+      join(settingsDir, "settings.json"),
+      JSON.stringify({
+        model: "claude-opus-4-7",
+        hooks: { PreToolUse: [] },
+        permissions: { allow: ["Bash(git *)"], deny: ["Bash(rm -rf *)"] },
+      }),
+    );
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_aaaa",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+
+    const settings = JSON.parse(readFileSync(join(settingsDir, "settings.json"), "utf8"));
+    expect(settings.model).toBe("claude-opus-4-7");
+    expect(settings.hooks).toEqual({ PreToolUse: [] });
+    expect(settings.permissions.deny).toEqual(["Bash(rm -rf *)"]);
+    expect(settings.permissions.allow).toEqual(["Bash(git *)", CLAUDE_CODE_ALLOW_PATTERN]);
+  });
+
+  it("is a no-op on settings.json when the pattern is already present", async () => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    const initial = JSON.stringify({ permissions: { allow: [CLAUDE_CODE_ALLOW_PATTERN] } }, null, 2);
+    writeFileSync(join(settingsDir, "settings.json"), initial);
+
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_aaaa",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    // settings.json not listed as written because no change was needed.
+    expect(r.written).not.toContain(join(settingsDir, "settings.json"));
+    // Contents untouched.
+    expect(readFileSync(join(settingsDir, "settings.json"), "utf8")).toBe(initial);
+  });
+
+  it("does not touch settings.json for non-claude-code clients", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "cursor",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_aaaa",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
+  });
+});
+
 describe("runInstall — happy path (claude-code, user scope, fresh install)", () => {
-  it("writes both client config and ~/.mcph/config.json", async () => {
+  it("writes client config, ~/.mcph/config.json, and patches settings.json permissions", async () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -187,12 +298,16 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    expect(r.written.length).toBe(2);
+    // Three files touched: ~/.claude.json (mcpServers), ~/.mcph/config.json (token),
+    // and ~/.claude/settings.json (permissions.allow so the client stops prompting).
+    expect(r.written.length).toBe(3);
 
     const clientPath = join(synthHome, ".claude.json");
     const mcphPath = join(synthHome, ".mcph", "config.json");
+    const settingsPath = join(synthHome, ".claude", "settings.json");
     expect(existsSync(clientPath)).toBe(true);
     expect(existsSync(mcphPath)).toBe(true);
+    expect(existsSync(settingsPath)).toBe(true);
 
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
@@ -203,6 +318,9 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
     const mcphCfg = JSON.parse(readFileSync(mcphPath, "utf8"));
     expect(mcphCfg.token).toBe("mcp_pat_fresh_aaaa");
     expect(mcphCfg.version).toBe(1);
+
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    expect(settings.permissions.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
   });
 });
 
@@ -431,15 +549,17 @@ describe("runInstall — --dry-run", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(r.written).toEqual([]);
-    expect(r.wouldWrite.length).toBe(2);
+    // Would-write list covers client config + mcph config + settings.json patch.
+    expect(r.wouldWrite.length).toBe(3);
     expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
     expect(existsSync(join(synthHome, ".mcph", "config.json"))).toBe(false);
+    expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
     expect(cap.stdout()).toMatch(/dry run/i);
   });
 });
 
 describe("runInstall — --no-mcph-config", () => {
-  it("writes only the client config when --no-mcph-config is passed", async () => {
+  it("writes only the client config and the settings.json permissions patch", async () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -451,8 +571,11 @@ describe("runInstall — --no-mcph-config", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    expect(r.written.length).toBe(1);
+    // --no-mcph-config skips ~/.mcph/config.json but still patches settings.json
+    // so the user doesn't get re-prompted for every tool call.
+    expect(r.written.length).toBe(2);
     expect(existsSync(join(synthHome, ".mcph", "config.json"))).toBe(false);
+    expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(true);
   });
 });
 
