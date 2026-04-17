@@ -33,12 +33,26 @@ export interface LoadedGuides {
   project: GuideFile | null;
 }
 
+const GUIDE_READ_TIMEOUT_MS = 1000;
+
 async function readGuide(path: string, scope: GuideScope): Promise<GuideFile | null> {
   let raw: string;
   try {
-    raw = await readFile(path, "utf8");
-  } catch {
-    // Missing file is normal, not a warning.
+    // A stuck NFS mount or a large accidental binary at this path should
+    // never hang the mcph://guide resource — the client is usually the
+    // model, waiting on a prompt. Race the read against a 1s timeout.
+    raw = await Promise.race([
+      readFile(path, "utf8"),
+      new Promise<string>((_, reject) =>
+        setTimeout(() => reject(new Error("guide read timeout")), GUIDE_READ_TIMEOUT_MS),
+      ),
+    ]);
+  } catch (err) {
+    // Missing file is the common case and stays silent. Timeouts warn so
+    // a genuinely hung disk isn't swallowed.
+    if (err instanceof Error && err.message === "guide read timeout") {
+      log("warn", "Guide read timed out", { path });
+    }
     return null;
   }
   const content = raw.trim();

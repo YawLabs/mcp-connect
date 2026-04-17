@@ -1818,9 +1818,10 @@ export class ConnectServer {
         });
       }
 
+      const activateCall = `mcp_connect_activate({ server: "${payload.namespace}" })`;
       const activateHint = configFresh
-        ? `Call mcp_connect_activate with namespace "${payload.namespace}" to load its tools${payload.type === "local" ? " into this session" : ""}.`
-        : `The new server will appear in mcp_connect_discover within ~60s. If the first mcp_connect_activate("${payload.namespace}") reports an unknown namespace, wait a minute and retry.`;
+        ? `Call ${activateCall} to load its tools${payload.type === "local" ? " into this session" : ""}.`
+        : `The new server will appear in mcp_connect_discover within ~60s. If the first ${activateCall} reports an unknown namespace, wait a minute and retry.`;
       return {
         content: [
           {
@@ -1829,8 +1830,28 @@ export class ConnectServer {
           },
         ],
       };
-    } catch (err: any) {
-      return { content: [{ type: "text", text: `Install error: ${err.message}` }], isError: true };
+    } catch (err: unknown) {
+      // Map the raw undici/network error to a user-facing string instead
+      // of leaking `err.message` verbatim to the model. We keep the raw
+      // error in the log for ops debugging but don't surface node error
+      // codes or stack fragments to the LLM/user.
+      const code =
+        typeof err === "object" && err !== null
+          ? (err as { code?: string; cause?: { code?: string } }).code || (err as any).cause?.code
+          : undefined;
+      let text: string;
+      if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT" || code === "UND_ERR_CONNECT_TIMEOUT") {
+        text = "Install timed out talking to mcp.hosting. Retry in a moment.";
+      } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "EAI_AGAIN" || code === "UND_ERR_SOCKET") {
+        text = "Couldn't reach mcp.hosting (network unreachable or DNS failure). Check your connection and retry.";
+      } else {
+        text = "Install failed unexpectedly. Check mcph logs on this machine for the underlying error.";
+      }
+      log("warn", "handleInstall error", {
+        error: err instanceof Error ? err.message : String(err),
+        code,
+      });
+      return { content: [{ type: "text", text }], isError: true };
     }
   }
 
