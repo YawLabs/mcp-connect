@@ -19,9 +19,11 @@ let synthCwd: string;
 
 beforeEach(() => {
   synthHome = mkdtempSync(join(tmpdir(), "mcph-cfg-home-"));
-  // synthCwd lives next to synthHome, not under it — so walk-up from
-  // synthCwd genuinely crosses fs levels without ever hitting synthHome.
-  synthCwd = mkdtempSync(join(tmpdir(), "mcph-cfg-cwd-"));
+  // synthCwd lives INSIDE synthHome so walk-up terminates at the
+  // synthetic home boundary rather than escaping past tmpdir into the
+  // real user dir — where a real ~/.mcph/ on dev machines would
+  // otherwise get claimed as the project config and leak into assertions.
+  synthCwd = mkdtempSync(join(synthHome, "cwd-"));
 });
 
 afterEach(() => {

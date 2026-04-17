@@ -21,6 +21,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
+import { migrateLegacyConfigPaths } from "./migrate.js";
 import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
 
 export const CONFIG_FILENAME = "config.json";
@@ -167,6 +168,12 @@ export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<Reso
 
   const warnings: string[] = [];
   const loadedFiles: LoadedConfigFile[] = [];
+
+  // Fold any pre-0.12 flat config dotfiles into `.mcph/` before the
+  // resolver runs — otherwise a user who upgrades from 0.11.x would
+  // silently lose their token until they moved the file by hand.
+  // Fail-open: migration errors are logged, never thrown.
+  await migrateLegacyConfigPaths({ cwd, home });
 
   const projectConfigDir = await findProjectConfigDir(cwd, home).catch((err) => {
     log("warn", "Failed searching for project .mcph/ dir", {

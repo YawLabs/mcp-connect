@@ -6,6 +6,8 @@ import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { log } from "./logger.js";
 import { ConnectServer } from "./server.js";
 
+declare const __VERSION__: string;
+
 // Subcommand dispatcher. `mcph` with no args (or with flags only) runs as
 // the MCP server that talks to mcp.hosting. Known subcommands branch off
 // before the MCPH_TOKEN check so local-only commands like `compliance`,
@@ -29,9 +31,10 @@ if (subcommand === "compliance") {
   );
   process.exit(0);
 } else if (subcommand === "--version" || subcommand === "-V") {
-  // Version string is replaced at build time by tsup's define; falls back
-  // to "dev" when running from source.
-  process.stdout.write(`mcph ${process.env.npm_package_version ?? "dev"}\n`);
+  // __VERSION__ is substituted at build time by tsup (see tsup.config.ts);
+  // when running unbundled from source the declare leaves it as undefined,
+  // so guard with typeof and fall back to "dev".
+  process.stdout.write(`mcph ${typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev"}\n`);
   process.exit(0);
 } else {
   runServer();

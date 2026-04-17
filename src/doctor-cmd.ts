@@ -40,6 +40,10 @@ export interface DoctorOptions {
   env?: NodeJS.ProcessEnv;
   /** Override for tests; defaults to process.stdout.write. */
   out?: (s: string) => void;
+  /** Disable the npm registry freshness check (tests, offline use). */
+  skipRegistryCheck?: boolean;
+  /** Test hook: return the latest-version string for @yawlabs/mcph. */
+  registryFetch?: () => Promise<string | null>;
 }
 
 export interface ClientProbeResult {
@@ -64,7 +68,10 @@ export interface DoctorResult {
   };
 }
 
-const VERSION = process.env.npm_package_version ?? "dev";
+// __VERSION__ is substituted at build time by tsup; guard for unbundled
+// source (tests) where the declare keeps it undefined.
+declare const __VERSION__: string;
+const VERSION = typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev";
 
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult> {
   const lines: string[] = [];
@@ -131,6 +138,24 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     print("");
   }
 
+  // Freshness check: is this binary behind the npm registry? Skip in
+  // source ("dev") mode and absorb any network error silently — a
+  // stale-version warning that depends on an external service must not
+  // block the diagnostic. Times out after 2s to keep doctor snappy.
+  // Auto-skipped under vitest (check process.env directly since tests
+  // pass a stripped `env: {}`).
+  const skipCheck = opts.skipRegistryCheck === true || Boolean(process.env.VITEST);
+  const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
+  const staleHint = latest && VERSION !== "dev" && compareSemver(VERSION, latest) < 0 ? latest : null;
+  if (staleHint) {
+    print("UPGRADE AVAILABLE");
+    print(`  Running ${VERSION}; npm latest is ${staleHint}.`);
+    print("  If `mcph` is globally installed it shadows `npx` — upgrade with:");
+    print("    npm install -g @yawlabs/mcph@latest");
+    print("  Otherwise restart your MCP client; `npx -y @yawlabs/mcph` will fetch the new version.");
+    print("");
+  }
+
   let exitCode = 0;
   if (config.token === null) {
     exitCode = 1;
@@ -143,7 +168,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     print("  Token present, but warnings above need attention.");
   } else {
     print("DIAGNOSIS");
-    print("  All good. mcph should start cleanly.");
+    print(staleHint ? "  Healthy, but an upgrade is available (see above)." : "  All good. mcph should start cleanly.");
   }
 
   return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
@@ -304,4 +329,54 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
     }
   }
   return result;
+}
+
+// Hit the public npm registry for the latest `@yawlabs/mcph` version.
+// Intentionally thin: on ANY error (offline, timeout, rate-limited,
+// corp proxy) we return null and doctor just skips the upgrade section.
+// This function is NEVER awaited on a hot path — it only runs in doctor,
+// which is user-interactive.
+async function fetchLatestVersion(override?: () => Promise<string | null>): Promise<string | null> {
+  if (override) {
+    try {
+      return await override();
+    } catch {
+      return null;
+    }
+  }
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 2000);
+  try {
+    const res = await fetch("https://registry.npmjs.org/@yawlabs/mcph/latest", {
+      signal: ac.signal,
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { version?: unknown };
+    return typeof body.version === "string" ? body.version : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Tiny semver compare — full semver is overkill; we only need to
+// recognize "a is older than b" for dotted numeric x.y.z tags. Anything
+// unparseable returns 0 (treated as equal) so a weird version string
+// can't accidentally show a false "upgrade available" banner.
+export function compareSemver(a: string, b: string): number {
+  const parse = (s: string): [number, number, number] | null => {
+    const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(s);
+    if (!m) return null;
+    return [Number(m[1]), Number(m[2]), Number(m[3])];
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] < pb[i]) return -1;
+    if (pa[i] > pb[i]) return 1;
+  }
+  return 0;
 }

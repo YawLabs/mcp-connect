@@ -79,10 +79,12 @@ describe("findProjectConfigDir", () => {
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "mcph-paths-home-"));
-    // Root of the synthetic project tree lives next to (not under)
-    // `home` so walk-up from deep in `root` genuinely crosses fs
-    // levels without ever hitting `home`.
-    root = mkdtempSync(join(tmpdir(), "mcph-paths-proj-"));
+    // Root of the synthetic project tree lives INSIDE `home` so the
+    // walk-up terminates at the synthetic `home` boundary rather than
+    // escaping past tmpdir into the real user dir — where a real
+    // ~/.mcph/ on dev machines would otherwise get claimed as the
+    // project config.
+    root = mkdtempSync(join(home, "proj-"));
   });
 
   afterEach(() => {

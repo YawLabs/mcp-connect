@@ -15,7 +15,10 @@ let synthCwd: string;
 
 beforeEach(() => {
   synthHome = mkdtempSync(join(tmpdir(), "mcph-doctor-home-"));
-  synthCwd = mkdtempSync(join(tmpdir(), "mcph-doctor-cwd-"));
+  // synthCwd lives INSIDE synthHome so walk-up terminates at the
+  // synthetic home boundary rather than escaping into the real user
+  // dir, where a real ~/.mcph/config.json would otherwise get claimed.
+  synthCwd = mkdtempSync(join(synthHome, "cwd-"));
 });
 
 afterEach(() => {
