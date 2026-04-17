@@ -209,11 +209,8 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
           if (raw.trim().length > 0) {
             const parsed = parseJsonc(raw);
             if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-              const containerKey = target.jsonShape;
-              const container = (parsed as Record<string, unknown>)[containerKey];
-              if (typeof container === "object" && container !== null && !Array.isArray(container)) {
-                hasMcphEntry = ENTRY_NAME in (container as Record<string, unknown>);
-              }
+              const container = walkContainer(parsed as Record<string, unknown>, resolved.containerPath);
+              if (container) hasMcphEntry = ENTRY_NAME in container;
             } else {
               malformed = true;
             }
@@ -234,6 +231,18 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
     }
   }
   return out;
+}
+
+/** Walk a JSON-key path to the mcpServers/servers container.
+ *  Returns the object at the path, or null if any segment is missing/non-object. */
+function walkContainer(root: Record<string, unknown>, path: string[]): Record<string, unknown> | null {
+  let cur: unknown = root;
+  for (const key of path) {
+    if (typeof cur !== "object" || cur === null || Array.isArray(cur)) return null;
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  if (typeof cur !== "object" || cur === null || Array.isArray(cur)) return null;
+  return cur as Record<string, unknown>;
 }
 
 // Async variant for code paths that prefer non-blocking I/O. Currently
@@ -273,10 +282,8 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
           if (raw.trim().length > 0) {
             const parsed = parseJsonc(raw);
             if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-              const container = (parsed as Record<string, unknown>)[target.jsonShape];
-              if (typeof container === "object" && container !== null && !Array.isArray(container)) {
-                hasMcphEntry = ENTRY_NAME in (container as Record<string, unknown>);
-              }
+              const container = walkContainer(parsed as Record<string, unknown>, resolved.containerPath);
+              if (container) hasMcphEntry = ENTRY_NAME in container;
             } else {
               malformed = true;
             }

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
@@ -109,7 +109,7 @@ describe("parseInstallArgs", () => {
 describe("mergeClientConfig", () => {
   it("preserves other servers in mcpServers", () => {
     const existing = { mcpServers: { other: { command: "x" } } };
-    const merged = mergeClientConfig(existing, "mcpServers", { command: "npx", args: ["-y", "@yawlabs/mcph"] });
+    const merged = mergeClientConfig(existing, ["mcpServers"], { command: "npx", args: ["-y", "@yawlabs/mcph"] });
     expect(merged.mcpServers).toEqual({
       other: { command: "x" },
       [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcph"] },
@@ -118,18 +118,18 @@ describe("mergeClientConfig", () => {
 
   it("preserves sibling top-level keys (e.g., model, hooks)", () => {
     const existing = { model: "claude-opus-4-7", mcpServers: {} };
-    const merged = mergeClientConfig(existing, "mcpServers", { command: "npx", args: ["-y", "@yawlabs/mcph"] });
+    const merged = mergeClientConfig(existing, ["mcpServers"], { command: "npx", args: ["-y", "@yawlabs/mcph"] });
     expect(merged.model).toBe("claude-opus-4-7");
     expect((merged.mcpServers as Record<string, unknown>)[ENTRY_NAME]).toBeDefined();
   });
 
   it("creates the container if missing", () => {
-    const merged = mergeClientConfig({}, "servers", { command: "npx", args: [] });
+    const merged = mergeClientConfig({}, ["servers"], { command: "npx", args: [] });
     expect(merged.servers).toEqual({ [ENTRY_NAME]: { command: "npx", args: [] } });
   });
 
   it("uses the right container key for VS Code (servers, not mcpServers)", () => {
-    const merged = mergeClientConfig({}, "servers", { command: "x", args: [] });
+    const merged = mergeClientConfig({}, ["servers"], { command: "x", args: [] });
     expect(merged.mcpServers).toBeUndefined();
     expect(merged.servers).toBeDefined();
   });
@@ -137,8 +137,41 @@ describe("mergeClientConfig", () => {
   it("does not mutate the input", () => {
     const existing = { mcpServers: { other: { command: "x" } } };
     const snapshot = JSON.stringify(existing);
-    mergeClientConfig(existing, "mcpServers", { command: "y", args: [] });
+    mergeClientConfig(existing, ["mcpServers"], { command: "y", args: [] });
     expect(JSON.stringify(existing)).toBe(snapshot);
+  });
+
+  it("walks a nested containerPath and preserves siblings at every level", () => {
+    // Claude Code local scope: ["projects", "/abs/dir", "mcpServers"].
+    // Must preserve other projects + every top-level key in ~/.claude.json.
+    const existing = {
+      userID: "abc",
+      projects: {
+        "/other/project": { mcpServers: { foo: { command: "f" } }, history: ["x"] },
+        "/abs/dir": { history: ["y"] },
+      },
+    };
+    const merged = mergeClientConfig(existing, ["projects", "/abs/dir", "mcpServers"], {
+      command: "npx",
+      args: ["-y", "@yawlabs/mcph"],
+    });
+    expect(merged.userID).toBe("abc");
+    const projects = merged.projects as Record<string, Record<string, unknown>>;
+    // Other project untouched.
+    expect(projects["/other/project"].mcpServers).toEqual({ foo: { command: "f" } });
+    expect(projects["/other/project"].history).toEqual(["x"]);
+    // Target project: history preserved, mcpServers added.
+    expect(projects["/abs/dir"].history).toEqual(["y"]);
+    expect((projects["/abs/dir"].mcpServers as Record<string, unknown>)[ENTRY_NAME]).toEqual({
+      command: "npx",
+      args: ["-y", "@yawlabs/mcph"],
+    });
+  });
+
+  it("creates intermediate path segments when missing", () => {
+    const merged = mergeClientConfig({}, ["projects", "/new/dir", "mcpServers"], { command: "npx", args: [] });
+    const projects = merged.projects as Record<string, Record<string, unknown>>;
+    expect(projects["/new/dir"].mcpServers).toEqual({ [ENTRY_NAME]: { command: "npx", args: [] } });
   });
 });
 
@@ -156,7 +189,7 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
     expect(r.exitCode).toBe(0);
     expect(r.written.length).toBe(2);
 
-    const clientPath = join(synthHome, ".claude", "settings.json");
+    const clientPath = join(synthHome, ".claude.json");
     const mcphPath = join(synthHome, ".mcph.json");
     expect(existsSync(clientPath)).toBe(true);
     expect(existsSync(mcphPath)).toBe(true);
@@ -185,7 +218,7 @@ describe("runInstall — Windows uses cmd /c", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude", "settings.json"), "utf8"));
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("cmd");
     expect(client.mcpServers[ENTRY_NAME].args).toEqual(["/c", "npx", "-y", "@yawlabs/mcph"]);
   });
@@ -212,9 +245,8 @@ describe("runInstall — VS Code servers shape", () => {
 
 describe("runInstall — preserves existing entries", () => {
   it("does not clobber unrelated mcpServers when adding mcp.hosting", async () => {
-    mkdirSync(join(synthHome, ".claude"));
     writeFileSync(
-      join(synthHome, ".claude", "settings.json"),
+      join(synthHome, ".claude.json"),
       JSON.stringify({ model: "claude-opus-4-7", mcpServers: { spend: { url: "https://x" } } }, null, 2),
     );
     const cap = captureIo();
@@ -227,7 +259,7 @@ describe("runInstall — preserves existing entries", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude", "settings.json"), "utf8"));
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.model).toBe("claude-opus-4-7");
     expect(client.mcpServers.spend).toEqual({ url: "https://x" });
     expect(client.mcpServers[ENTRY_NAME]).toBeDefined();
@@ -236,9 +268,8 @@ describe("runInstall — preserves existing entries", () => {
 
 describe("runInstall — collision handling", () => {
   it("non-TTY without --force/--skip refuses with exit 1 when entry exists", async () => {
-    mkdirSync(join(synthHome, ".claude"));
     writeFileSync(
-      join(synthHome, ".claude", "settings.json"),
+      join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
     );
     const cap = captureIo();
@@ -253,14 +284,13 @@ describe("runInstall — collision handling", () => {
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/already has/);
     // Original entry untouched.
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude", "settings.json"), "utf8"));
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
   });
 
   it("--force overwrites existing entry", async () => {
-    mkdirSync(join(synthHome, ".claude"));
     writeFileSync(
-      join(synthHome, ".claude", "settings.json"),
+      join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
     );
     const cap = captureIo();
@@ -274,14 +304,13 @@ describe("runInstall — collision handling", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude", "settings.json"), "utf8"));
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
   });
 
   it("--skip leaves existing entry untouched", async () => {
-    mkdirSync(join(synthHome, ".claude"));
     writeFileSync(
-      join(synthHome, ".claude", "settings.json"),
+      join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
     );
     const cap = captureIo();
@@ -295,16 +324,15 @@ describe("runInstall — collision handling", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude", "settings.json"), "utf8"));
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
     // ~/.mcph.json should NOT have been written either, since we short-circuited.
     expect(existsSync(join(synthHome, ".mcph.json"))).toBe(false);
   });
 
   it("promptAnswer override exercises the interactive branch deterministically", async () => {
-    mkdirSync(join(synthHome, ".claude"));
     writeFileSync(
-      join(synthHome, ".claude", "settings.json"),
+      join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
     );
     const cap = captureIo();
@@ -318,15 +346,14 @@ describe("runInstall — collision handling", () => {
       io: { ...cap.io, isTTY: true },
     });
     expect(r.exitCode).toBe(0);
-    const client = JSON.parse(readFileSync(join(synthHome, ".claude", "settings.json"), "utf8"));
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
   });
 });
 
 describe("runInstall — malformed existing JSON", () => {
   it("refuses to overwrite a malformed client config", async () => {
-    mkdirSync(join(synthHome, ".claude"));
-    writeFileSync(join(synthHome, ".claude", "settings.json"), "{ this is not json");
+    writeFileSync(join(synthHome, ".claude.json"), "{ this is not json");
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -403,7 +430,7 @@ describe("runInstall — --dry-run", () => {
     expect(r.exitCode).toBe(0);
     expect(r.written).toEqual([]);
     expect(r.wouldWrite.length).toBe(2);
-    expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
     expect(existsSync(join(synthHome, ".mcph.json"))).toBe(false);
     expect(cap.stdout()).toMatch(/dry run/i);
   });

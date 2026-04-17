@@ -4,9 +4,11 @@
 // subsequent `install` invocations on other clients don't re-prompt.
 //
 // Two files are touched per run:
-//   1. The client's config file (e.g., ~/.claude/settings.json) — the
-//      "mcp.hosting" launch entry is merged in, preserving any other
-//      `mcpServers` / `servers` keys the user already has.
+//   1. The client's config file (e.g., ~/.claude.json for Claude Code
+//      user scope) — the "mcp.hosting" launch entry is merged in,
+//      preserving any other `mcpServers` / `servers` keys the user
+//      already has, plus every sibling along the container key path
+//      (Claude Code local scope nests under projects[<absDir>].mcpServers).
 //   2. ~/.mcph.json (user-global) — created if missing, the token is
 //      written here so the launch entry stays env-free. Single source
 //      of truth for token rotation across all clients.
@@ -164,7 +166,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   // Read + merge existing client config.
   const newEntry = buildLaunchEntry({ os });
-  const containerKey = target.jsonShape; // "mcpServers" or "servers"
+  const containerPath = resolved.containerPath;
   let existing: Record<string, unknown> = {};
   let existingHasEntry = false;
   if (existsSync(resolved.absolute)) {
@@ -192,7 +194,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
         return { written: [], wouldWrite: [], messages, exitCode: 1 };
       }
     }
-    const container = existing[containerKey];
+    const container = readNested(existing, containerPath);
     if (typeof container === "object" && container !== null && !Array.isArray(container)) {
       existingHasEntry = ENTRY_NAME in (container as Record<string, unknown>);
     }
@@ -222,7 +224,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     log(`Overwriting existing "${ENTRY_NAME}" entry.`);
   }
 
-  const merged = mergeClientConfig(existing, containerKey, newEntry);
+  const merged = mergeClientConfig(existing, containerPath, newEntry);
   const clientJson = `${JSON.stringify(merged, null, 2)}\n`;
 
   const writeMcphConfig = !opts.skipMcphConfig;
@@ -299,21 +301,47 @@ async function promptCollision(path: string, io: InstallCommandOptions["io"]): P
   }
 }
 
-/** Merge `entry` into `existing[containerKey][ENTRY_NAME]`, preserving
- *  every other key in the file. Returns a new object — does not mutate. */
+/** Walk `containerPath` to find the existing mcpServers/servers container.
+ *  Returns the value at the path, or undefined if any segment is missing
+ *  or non-object. Does not mutate. */
+export function readNested(root: Record<string, unknown>, containerPath: string[]): unknown {
+  let cur: unknown = root;
+  for (const key of containerPath) {
+    if (typeof cur !== "object" || cur === null || Array.isArray(cur)) return undefined;
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return cur;
+}
+
+/** Merge `entry` into the container at `existing[...containerPath][ENTRY_NAME]`,
+ *  preserving every sibling at every level of the path. Returns a new object;
+ *  does not mutate. For Claude Code local scope, containerPath is
+ *  ["projects", <absDir>, "mcpServers"] and this preserves every other
+ *  project's settings + every other top-level key in ~/.claude.json. */
 export function mergeClientConfig(
   existing: Record<string, unknown>,
-  containerKey: "mcpServers" | "servers",
+  containerPath: string[],
   entry: Record<string, unknown> | { command: string; args: string[]; env?: Record<string, string> },
 ): Record<string, unknown> {
-  const out = { ...existing };
-  const prevContainer = existing[containerKey];
-  const container =
-    typeof prevContainer === "object" && prevContainer !== null && !Array.isArray(prevContainer)
-      ? { ...(prevContainer as Record<string, unknown>) }
-      : {};
+  if (containerPath.length === 0) throw new Error("mergeClientConfig: containerPath cannot be empty");
+  const out: Record<string, unknown> = { ...existing };
+  let parent: Record<string, unknown> = out;
+  for (let i = 0; i < containerPath.length - 1; i++) {
+    const key = containerPath[i];
+    const child = parent[key];
+    const cloned: Record<string, unknown> =
+      typeof child === "object" && child !== null && !Array.isArray(child)
+        ? { ...(child as Record<string, unknown>) }
+        : {};
+    parent[key] = cloned;
+    parent = cloned;
+  }
+  const leafKey = containerPath[containerPath.length - 1];
+  const prev = parent[leafKey];
+  const container: Record<string, unknown> =
+    typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
   container[ENTRY_NAME] = entry;
-  out[containerKey] = container;
+  parent[leafKey] = container;
   return out;
 }
 

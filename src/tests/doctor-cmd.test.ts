@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -90,10 +90,9 @@ describe("runDoctor — output content", () => {
 });
 
 describe("runDoctor — client detection", () => {
-  it("reports Claude Code as configured when an mcp.hosting entry exists", async () => {
-    mkdirSync(join(synthHome, ".claude"));
+  it("reports Claude Code as configured when an mcp.hosting entry exists in ~/.claude.json", async () => {
     writeFileSync(
-      join(synthHome, ".claude", "settings.json"),
+      join(synthHome, ".claude.json"),
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx" } } }),
     );
     const cap = captureOut();
@@ -123,8 +122,7 @@ describe("runDoctor — client detection", () => {
   });
 
   it("flags malformed JSON in a client config", async () => {
-    mkdirSync(join(synthHome, ".claude"));
-    writeFileSync(join(synthHome, ".claude", "settings.json"), "{ broken");
+    writeFileSync(join(synthHome, ".claude.json"), "{ broken");
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,
@@ -138,11 +136,7 @@ describe("runDoctor — client detection", () => {
   });
 
   it("suggests a `mcph install` command when a configured-looking file lacks the entry", async () => {
-    mkdirSync(join(synthHome, ".claude"));
-    writeFileSync(
-      join(synthHome, ".claude", "settings.json"),
-      JSON.stringify({ mcpServers: { other: { command: "x" } } }),
-    );
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: { other: { command: "x" } } }));
     const cap = captureOut();
     await runDoctor({
       cwd: synthCwd,

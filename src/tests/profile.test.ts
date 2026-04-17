@@ -250,8 +250,11 @@ describe("loadUserGlobalProfile + loadEffectiveProfile", () => {
   });
 
   it("loadEffectiveProfile returns null when neither profile exists", async () => {
-    // Start from a scratch dir outside $HOME so the walk can't find anything.
-    const workDir = mkdtempSync(join(tmpdir(), "mcph-work-"));
+    // workDir must live inside the synthetic $HOME so findProfilePath's
+    // stop-at-home check terminates the walk before it can wander into
+    // the developer's real $HOME (which may have a .mcph.json that
+    // would silently make this test pass with the wrong profile).
+    const workDir = mkdtempSync(join(root, "mcph-work-"));
     try {
       const profile = await loadEffectiveProfile(workDir);
       expect(profile).toBeNull();
@@ -264,7 +267,8 @@ describe("loadUserGlobalProfile + loadEffectiveProfile", () => {
     const userProfilePath = join(root, ".mcph.json");
     writeFileSync(userProfilePath, JSON.stringify({ servers: ["user-default"] }), "utf8");
 
-    const workDir = mkdtempSync(join(tmpdir(), "mcph-work-"));
+    // See comment in the test above — workDir must live under synthetic $HOME.
+    const workDir = mkdtempSync(join(root, "mcph-work-"));
     try {
       const profile = await loadEffectiveProfile(workDir);
       expect(profile?.path).toBe(userProfilePath);

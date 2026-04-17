@@ -7,10 +7,12 @@
 // install flow if regressed.
 //
 // Bugs we've discovered in the wild and encode as invariants here:
-//   • Claude Code reads `~/.claude/settings.json`, NOT `~/.claude.json`.
-//     The latter is Claude Code's per-session state file (rewritten
-//     constantly); pasting mcpServers there doesn't register globally
-//     and risks clobbering conversation state.
+//   • Claude Code reads MCP servers from `~/.claude.json` (top-level
+//     `mcpServers` for user scope; nested under `projects[<absDir>].
+//     mcpServers` for local scope). The `mcpServers` key in
+//     `~/.claude/settings.json` is silently ignored — settings.json holds
+//     hooks/model/permissions only. (We discovered this the hard way in
+//     v0.11.0–0.11.1: install wrote to settings.json, /mcp showed nothing.)
 //   • VS Code uses `servers` (not `mcpServers`) as the top-level key in
 //     `.vscode/mcp.json`. Pasting a Claude Code shape fails silently.
 //   • Claude Desktop has no Linux build, so install on Linux for that
@@ -33,6 +35,12 @@ export interface ResolvedPath {
   absolute: string;
   /** Human-friendly display path with ~ / env-var form preserved. */
   display: string;
+  /** JSON key path to the mcpServers/servers container that holds the
+   *  ENTRY_NAME entry. Almost always `[jsonShape]`, but Claude Code's
+   *  local scope nests under `["projects", <absProjectDir>, "mcpServers"]`
+   *  inside `~/.claude.json`. install-cmd + doctor walk this array to
+   *  read/merge the entry while preserving every sibling at every level. */
+  containerPath: string[];
 }
 
 export interface InstallScopeSpec {
@@ -181,21 +189,25 @@ function pathFor(
 
   if (client === "claude-code") {
     if (scope === "user") {
-      if (os === "windows") {
-        return { absolute: join(home, ".claude", "settings.json"), display: "%USERPROFILE%\\.claude\\settings.json" };
-      }
-      return { absolute: join(home, ".claude", "settings.json"), display: "~/.claude/settings.json" };
+      // Claude Code reads user-scope MCP from ~/.claude.json (top-level
+      // mcpServers). The settings.json mcpServers field is silently ignored.
+      const display = os === "windows" ? "%USERPROFILE%\\.claude.json" : "~/.claude.json";
+      return { absolute: join(home, ".claude.json"), display, containerPath: ["mcpServers"] };
     }
     if (scope === "project") {
       return {
         absolute: join(projectDir, ".mcp.json"),
         display: joinPath("<project folder>", ".mcp.json"),
+        containerPath: ["mcpServers"],
       };
     }
-    // local
+    // local — Claude Code stores per-project local-scope MCP under
+    // ~/.claude.json projects[<absolute project dir>].mcpServers. The
+    // .claude/settings.local.json file is for permissions/hooks, not MCP.
     return {
-      absolute: join(projectDir, ".claude", "settings.local.json"),
-      display: joinPath("<project folder>", ".claude", "settings.local.json"),
+      absolute: join(home, ".claude.json"),
+      display: os === "windows" ? "%USERPROFILE%\\.claude.json" : "~/.claude.json",
+      containerPath: ["projects", projectDir, "mcpServers"],
     };
   }
 
@@ -204,12 +216,14 @@ function pathFor(
       return {
         absolute: join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"),
         display: "~/Library/Application Support/Claude/claude_desktop_config.json",
+        containerPath: ["mcpServers"],
       };
     }
     if (os === "windows") {
       return {
         absolute: join(appData, "Claude", "claude_desktop_config.json"),
         display: "%APPDATA%\\Claude\\claude_desktop_config.json",
+        containerPath: ["mcpServers"],
       };
     }
     // linux — unreachable because availableOn guards this, but belt+suspenders.
@@ -218,15 +232,14 @@ function pathFor(
 
   if (client === "cursor") {
     if (scope === "user") {
-      if (os === "windows") {
-        return { absolute: join(home, ".cursor", "mcp.json"), display: "%USERPROFILE%\\.cursor\\mcp.json" };
-      }
-      return { absolute: join(home, ".cursor", "mcp.json"), display: "~/.cursor/mcp.json" };
+      const display = os === "windows" ? "%USERPROFILE%\\.cursor\\mcp.json" : "~/.cursor/mcp.json";
+      return { absolute: join(home, ".cursor", "mcp.json"), display, containerPath: ["mcpServers"] };
     }
     // project
     return {
       absolute: join(projectDir, ".cursor", "mcp.json"),
       display: joinPath("<project folder>", ".cursor", "mcp.json"),
+      containerPath: ["mcpServers"],
     };
   }
 
@@ -235,6 +248,7 @@ function pathFor(
     return {
       absolute: join(projectDir, ".vscode", "mcp.json"),
       display: joinPath("<project folder>", ".vscode", "mcp.json"),
+      containerPath: ["servers"],
     };
   }
 

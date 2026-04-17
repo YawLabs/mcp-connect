@@ -38,18 +38,20 @@ describe("INSTALL_TARGETS metadata", () => {
 });
 
 describe("resolveInstallPath — Claude Code", () => {
-  it("user scope on macOS resolves to ~/.claude/settings.json (NOT ~/.claude.json)", () => {
+  it("user scope on macOS resolves to ~/.claude.json (the file Claude Code actually reads)", () => {
     const r = resolveInstallPath({
       clientId: "claude-code",
       scope: "user",
       os: "macos",
       home: "/Users/alice",
     });
-    // Locks the bug we specifically guard against: .claude.json (no slash) is
-    // Claude Code's per-session state file, pasting there doesn't load globally.
-    expect(r.absolute).toMatch(/[\\/]\.claude[\\/]settings\.json$/);
-    expect(r.absolute).not.toMatch(/[\\/]\.claude\.json$/);
-    expect(r.display).toBe("~/.claude/settings.json");
+    // Locks the v0.11.2 fix: prior versions wrote to ~/.claude/settings.json,
+    // which Claude Code silently ignores for MCP servers. ~/.claude.json
+    // (no directory) is the canonical user-scope MCP store.
+    expect(r.absolute).toMatch(/[\\/]\.claude\.json$/);
+    expect(r.absolute).not.toMatch(/[\\/]\.claude[\\/]settings\.json$/);
+    expect(r.display).toBe("~/.claude.json");
+    expect(r.containerPath).toEqual(["mcpServers"]);
   });
 
   it("user scope on Windows uses %USERPROFILE% display path", () => {
@@ -59,7 +61,8 @@ describe("resolveInstallPath — Claude Code", () => {
       os: "windows",
       home: "C:\\Users\\alice",
     });
-    expect(r.display).toBe("%USERPROFILE%\\.claude\\settings.json");
+    expect(r.display).toBe("%USERPROFILE%\\.claude.json");
+    expect(r.containerPath).toEqual(["mcpServers"]);
   });
 
   it("project scope resolves to <project>/.mcp.json", () => {
@@ -71,9 +74,13 @@ describe("resolveInstallPath — Claude Code", () => {
       projectDir: "/home/alice/repo",
     });
     expect(r.absolute).toMatch(/[\\/]\.mcp\.json$/);
+    expect(r.containerPath).toEqual(["mcpServers"]);
   });
 
-  it("local scope resolves to <project>/.claude/settings.local.json", () => {
+  it("local scope writes to ~/.claude.json under projects[<absDir>].mcpServers", () => {
+    // Claude Code stores per-project local-scope MCP nested inside the
+    // global ~/.claude.json — NOT in <project>/.claude/settings.local.json
+    // (that file is for permissions/hooks; mcpServers there is ignored).
     const r = resolveInstallPath({
       clientId: "claude-code",
       scope: "local",
@@ -81,7 +88,8 @@ describe("resolveInstallPath — Claude Code", () => {
       home: "/home/alice",
       projectDir: "/home/alice/repo",
     });
-    expect(r.absolute).toMatch(/[\\/]\.claude[\\/]settings\.local\.json$/);
+    expect(r.absolute).toMatch(/[\\/]\.claude\.json$/);
+    expect(r.containerPath).toEqual(["projects", "/home/alice/repo", "mcpServers"]);
   });
 
   it("project scope without projectDir throws", () => {
