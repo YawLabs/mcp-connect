@@ -2,7 +2,7 @@ export const META_TOOLS = {
   discover: {
     name: "mcp_connect_discover",
     description:
-      "List all available MCP servers. Call this FIRST before activating anything. Only activate servers you need for the CURRENT task — each one adds tools to your context. Shows server names, namespaces, tool counts, and activation status.",
+      "List all available MCP servers. Call this FIRST before activating anything. Only activate servers you need for the CURRENT task — each one adds tools to your context. Shows server names, namespaces, tool counts, and activation status. If a `mcph://guide` resource is listed, read it FIRST: it carries project/user-specific routing rules and credential conventions that override generic defaults.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -114,7 +114,7 @@ export const META_TOOLS = {
   dispatch: {
     name: "mcp_connect_dispatch",
     description:
-      'Activate the best configured MCP server(s) for a natural-language task. Describe what you want to do ("create a github issue for the login bug", "post a summary to slack", "query the prod postgres") and mcph will rank all configured servers with BM25, activate the top match, and expose its tools so you can call them. Prefer this over calling discover+activate separately when you have a concrete task. Default budget is 1 to keep the tool list focused; raise it only if you genuinely need multiple servers for one task.',
+      'Activate the best configured MCP server(s) for a natural-language task. Describe what you want to do ("create a github issue for the login bug", "post a summary to slack", "query the prod postgres") and mcph will rank all configured servers with BM25, activate the top match, and expose its tools so you can call them. Prefer this over calling discover+activate separately when you have a concrete task. Default budget is 1 to keep the tool list focused; raise it only if you genuinely need multiple servers for one task. If `mcph://guide` is listed as a resource, read it first — the project may have explicit routing rules (e.g. "use `gh` not bash for GitHub").',
     inputSchema: {
       type: "object" as const,
       properties: {

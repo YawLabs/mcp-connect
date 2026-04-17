@@ -1,32 +1,30 @@
-// .mcph.json loader for token, apiBase, version, servers, blocked.
+// mcph config loader for token, apiBase, version, servers, blocked.
 //
 // Config lives in three optional files, highest-precedence first:
 //
-//   1. <cwd>/.mcph.local.json — machine-local override; gitignore by convention
-//   2. <cwd>/.mcph.json       — project-shared file (committed); MUST NOT contain a token
-//   3. ~/.mcph.json           — user-global default
+//   1. <project>/.mcph/config.local.json  — machine-local override; gitignore by convention
+//   2. <project>/.mcph/config.json        — project-shared file (committed); MUST NOT contain a token
+//   3. ~/.mcph/config.json                — user-global default
+//
+// The project `.mcph/` directory is discovered by walking up from cwd
+// (see paths.ts findProjectConfigDir), stopping exclusively before $HOME
+// so a `.mcph/` sitting at $HOME is treated as user-global only.
 //
 // Token precedence:    MCPH_TOKEN env  >  local  >  global   (project never holds a token)
 // apiBase precedence:  MCPH_URL env    >  local  >  project  >  global  >  https://mcp.hosting
 //
-// servers/blocked merging matches profile.ts (allow-list: project wins;
-// deny-list: union across all loaded files). Behavior under MCPH_PROFILE
-// is preserved by the back-compat profile.ts shim.
-//
-// Why a separate module from profile.ts: profile.ts ships a stable
-// fail-open API (loadEffectiveProfile etc.) used by server.ts and tested
-// by 30+ existing assertions. Layering the new token/apiBase loader on
-// top of the same file-read code keeps the v1 change focused; a
-// follow-up can collapse the two into one I/O pass once this ships.
+// servers/blocked merging: allow-list picks the most specific scope that
+// sets it (local > project > global); deny-list unions across all scopes.
 
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
+import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
 
-export const CONFIG_FILENAME = ".mcph.json";
-export const LOCAL_CONFIG_FILENAME = ".mcph.local.json";
+export const CONFIG_FILENAME = "config.json";
+export const LOCAL_CONFIG_FILENAME = "config.local.json";
 /** Schema version we currently emit. Older files load fine; newer files
  *  trigger a warning so a user running an old mcph doesn't silently
  *  ignore fields it doesn't understand. */
@@ -52,10 +50,12 @@ export interface ResolvedConfig {
   tokenSource: TokenSource;
   apiBase: string;
   apiBaseSource: ApiBaseSource;
-  /** Allow-list (project wins, else global). Undefined when neither sets it. */
+  /** Allow-list (local > project > global). Undefined when no scope sets it. */
   servers?: string[];
   /** Deny-list (union across all scopes that set it). */
   blocked?: string[];
+  /** Absolute path to the discovered project `.mcph/` dir, or null if none. */
+  projectConfigDir: string | null;
   /** Files actually read + parsed (in load order). */
   loadedFiles: LoadedConfigFile[];
   /** Soft problems that don't fail loading. Surface in `mcph doctor`. */
@@ -63,7 +63,7 @@ export interface ResolvedConfig {
 }
 
 export interface LoadConfigOptions {
-  /** Project root to search for local + project files. Defaults to process.cwd(). */
+  /** Directory to start project-config discovery from. Defaults to process.cwd(). */
   cwd?: string;
   /** Home directory override for tests. Defaults to os.homedir(). */
   home?: string;
@@ -78,7 +78,6 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   try {
     raw = await readFile(path, "utf8");
   } catch {
-    // Missing file is normal, not a warning.
     return null;
   }
   let parsed: unknown;
@@ -115,7 +114,7 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
   if (token) {
     if (scope === "project") {
       warnings.push(
-        `${path}: 'token' should not appear in a project-shared file. Move it to ${LOCAL_CONFIG_FILENAME} (gitignored) or ~/${CONFIG_FILENAME}.`,
+        `${path}: 'token' should not appear in a project-shared file. Move it to ${CONFIG_DIRNAME}/${LOCAL_CONFIG_FILENAME} (gitignored) or ~/${CONFIG_DIRNAME}/${CONFIG_FILENAME}.`,
       );
     }
     await checkPermissions(path, warnings);
@@ -125,8 +124,6 @@ async function readConfigAt(path: string, scope: ConfigScope, warnings: string[]
 }
 
 async function checkPermissions(path: string, warnings: string[]): Promise<void> {
-  // Synthetic POSIX modes on Windows are unreliable (almost always 0o666);
-  // skip the check on Windows so we don't emit false-positive warnings.
   if (process.platform === "win32") return;
   try {
     const st = await stat(path);
@@ -141,12 +138,12 @@ async function checkPermissions(path: string, warnings: string[]): Promise<void>
   }
 }
 
-/** Merge servers (allow-list): project wins if set, else local, else global. */
+/** Merge servers (allow-list): most specific scope wins. */
 function pickServers(files: LoadedConfigFile[]): string[] | undefined {
-  const project = files.find((f) => f.scope === "project")?.servers;
-  if (project !== undefined) return project;
   const local = files.find((f) => f.scope === "local")?.servers;
   if (local !== undefined) return local;
+  const project = files.find((f) => f.scope === "project")?.servers;
+  if (project !== undefined) return project;
   return files.find((f) => f.scope === "global")?.servers;
 }
 
@@ -168,28 +165,34 @@ export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<Reso
   const home = resolve(opts.home ?? homedir());
   const env = opts.env ?? process.env;
 
-  const localPath = join(cwd, LOCAL_CONFIG_FILENAME);
-  const projectPath = join(cwd, CONFIG_FILENAME);
-  const globalPath = join(home, CONFIG_FILENAME);
-
   const warnings: string[] = [];
   const loadedFiles: LoadedConfigFile[] = [];
 
-  const local = await readConfigAt(localPath, "local", warnings);
+  const projectConfigDir = await findProjectConfigDir(cwd, home).catch((err) => {
+    log("warn", "Failed searching for project .mcph/ dir", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  });
+
+  const globalDir = userConfigDir(home);
+  const localPath = projectConfigDir ? join(projectConfigDir, LOCAL_CONFIG_FILENAME) : null;
+  const projectPath = projectConfigDir ? join(projectConfigDir, CONFIG_FILENAME) : null;
+  const globalPath = join(globalDir, CONFIG_FILENAME);
+
+  const local = localPath ? await readConfigAt(localPath, "local", warnings) : null;
   if (local) loadedFiles.push(local);
 
-  // Avoid double-loading when cwd === home (the project file IS the global file).
-  const projectIsGlobal = projectPath === globalPath;
-  const project = projectIsGlobal ? null : await readConfigAt(projectPath, "project", warnings);
+  // Avoid double-loading when the discovered project dir IS the user-global dir.
+  // findProjectConfigDir excludes $HOME, so this only triggers if someone passes
+  // a non-homedir `home` override that happens to equal the walk-up match.
+  const projectIsGlobal = projectConfigDir !== null && projectConfigDir === globalDir;
+  const project = projectIsGlobal || !projectPath ? null : await readConfigAt(projectPath, "project", warnings);
   if (project) loadedFiles.push(project);
 
-  const global = projectIsGlobal
-    ? // When cwd === home, treat the single ~/.mcph.json as global only.
-      await readConfigAt(globalPath, "global", warnings)
-    : await readConfigAt(globalPath, "global", warnings);
+  const global = await readConfigAt(globalPath, "global", warnings);
   if (global) loadedFiles.push(global);
 
-  // Token resolution.
   let token: string | null = null;
   let tokenSource: TokenSource = "missing";
   if (typeof env.MCPH_TOKEN === "string" && env.MCPH_TOKEN.length > 0) {
@@ -203,7 +206,6 @@ export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<Reso
     tokenSource = "global";
   }
 
-  // apiBase resolution.
   let apiBase = DEFAULT_API_BASE;
   let apiBaseSource: ApiBaseSource = "default";
   if (typeof env.MCPH_URL === "string" && env.MCPH_URL.length > 0) {
@@ -227,6 +229,7 @@ export async function loadMcphConfig(opts: LoadConfigOptions = {}): Promise<Reso
     apiBaseSource,
     servers: pickServers(loadedFiles),
     blocked: unionBlocked(loadedFiles),
+    projectConfigDir,
     loadedFiles,
     warnings,
   };
@@ -237,4 +240,70 @@ export function tokenFingerprint(token: string | null): string {
   if (!token) return "(none)";
   if (token.length <= 8) return `***${token.slice(-2)}`;
   return `${token.slice(0, 8)}…${token.slice(-4)}`;
+}
+
+// --- Profile compatibility layer ---------------------------------------
+//
+// server.ts and a few call sites still speak in terms of a "Profile": a
+// { path, servers?, blocked? } record describing which namespaces are
+// allowed in this session. The new ResolvedConfig carries the same
+// allow/deny lists, so we expose a thin shim that converts the relevant
+// slice and preserves the exact shape server.ts already consumes.
+
+export interface Profile {
+  /** Primary identity: project config file if one was loaded, else user-global. */
+  path: string;
+  /** When both project + user-global contributed, the user-global path is surfaced too. */
+  userPath?: string;
+  servers?: string[];
+  blocked?: string[];
+}
+
+/** Derive a Profile from a ResolvedConfig, or null if no allow/deny
+ *  rules are set anywhere. Display-only: it condenses which files
+ *  contributed into `path` (+ `userPath`) for `handleHealth()`. */
+export function toProfile(config: ResolvedConfig): Profile | null {
+  if (config.servers === undefined && config.blocked === undefined) return null;
+  const byScope = new Map<ConfigScope, LoadedConfigFile>();
+  for (const f of config.loadedFiles) byScope.set(f.scope, f);
+
+  const local = byScope.get("local");
+  const project = byScope.get("project");
+  const global = byScope.get("global");
+
+  const primary = local ?? project ?? global;
+  if (!primary) return null;
+
+  const result: Profile = {
+    path: primary.path,
+    servers: config.servers,
+    blocked: config.blocked,
+  };
+  if (primary !== global && global) {
+    result.userPath = global.path;
+  }
+  return result;
+}
+
+/** Load the effective profile for a session. Thin wrapper around
+ *  loadMcphConfig + toProfile — kept as a named function so server.ts
+ *  can import it without reaching into ResolvedConfig internals. */
+export async function loadEffectiveProfile(cwd: string, home?: string): Promise<Profile | null> {
+  const config = await loadMcphConfig({ cwd, home });
+  return toProfile(config);
+}
+
+/** Returns true iff `namespace` is allowed by the resolved allow/deny lists. */
+export function isAllowed(rules: { servers?: string[]; blocked?: string[] } | null, namespace: string): boolean {
+  if (!rules) return true;
+  if (rules.blocked?.includes(namespace)) return false;
+  if (rules.servers && rules.servers.length > 0) {
+    return rules.servers.includes(namespace);
+  }
+  return true;
+}
+
+/** Back-compat alias for isAllowed when the caller is holding a Profile. */
+export function profileAllows(profile: Profile | null, namespace: string): boolean {
+  return isAllowed(profile, namespace);
 }

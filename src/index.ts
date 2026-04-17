@@ -25,7 +25,7 @@ if (subcommand === "compliance") {
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   const installBlock = `    ${INSTALL_USAGE.replace(/^Usage: /, "").replace(/\n/g, "\n    ")}`;
   process.stdout.write(
-    `\n  mcph — MCP server orchestrator for mcp.hosting\n\n  Usage:\n    mcph                              Run as MCP server (requires a token)\n    mcph install <client> [flags]     Auto-edit an MCP client's config to launch mcph\n    mcph doctor                       Print loaded config + detected clients (support diagnostic)\n    mcph compliance <target> [flags]  Run the compliance suite against an MCP server\n    mcph --version                    Print version\n\n  Install:\n${installBlock}\n\n  Compliance flags:\n    --publish   Publish the report to mcp.hosting and print the URL\n\n  Token resolution (highest first):\n    1. MCPH_TOKEN env var\n    2. <cwd>/.mcph.local.json     (machine-local override; gitignore)\n    3. ~/.mcph.json               (user-global default)\n\n  Token rotation: mcph reads its config at startup. Restart the MCP\n  client (or kill mcph; the client will respawn it) after editing.\n\n`,
+    `\n  mcph — MCP server orchestrator for mcp.hosting\n\n  Usage:\n    mcph                              Run as MCP server (requires a token)\n    mcph install <client> [flags]     Auto-edit an MCP client's config to launch mcph\n    mcph doctor                       Print loaded config + detected clients (support diagnostic)\n    mcph compliance <target> [flags]  Run the compliance suite against an MCP server\n    mcph --version                    Print version\n\n  Install:\n${installBlock}\n\n  Compliance flags:\n    --publish   Publish the report to mcp.hosting and print the URL\n\n  Token resolution (highest first):\n    1. MCPH_TOKEN env var\n    2. <project>/.mcph/config.local.json  (machine-local override; gitignore)\n    3. ~/.mcph/config.json                (user-global default)\n\n  Token rotation: mcph reads its config at startup. Restart the MCP\n  client (or kill mcph; the client will respawn it) after editing.\n\n`,
   );
   process.exit(0);
 } else if (subcommand === "--version" || subcommand === "-V") {
@@ -49,7 +49,7 @@ async function runServer(): Promise<void> {
       "\n  mcph: no token resolved.\n\n" +
         "  Quick start (recommended):\n" +
         "    mcph install <claude-code|claude-desktop|cursor|vscode> --token mcp_pat_…\n" +
-        "    Creates ~/.mcph.json so every MCP client picks up the token automatically.\n\n" +
+        "    Creates ~/.mcph/config.json so every MCP client picks up the token automatically.\n\n" +
         "  Or set MCPH_TOKEN in your MCP client config:\n\n" +
         "     {\n" +
         '       "mcpServers": {\n' +

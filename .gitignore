@@ -3,3 +3,6 @@ dist/
 *.tgz
 .env
 .claude/
+# Machine-local mcph overrides (token, per-machine server list). Project
+# .mcph/config.json + .mcph/MCPH.md are meant to be checked in.
+.mcph/config.local.json

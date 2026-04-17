@@ -13,17 +13,19 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { request } from "undici";
 import { initAnalytics, recordConnectEvent, shutdownAnalytics } from "./analytics.js";
+import { type Profile, loadEffectiveProfile, profileAllows } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import { detectMissingCredentials } from "./credentials.js";
+import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
 import { ACTIVATION_FAILURE_TTL_MS, type ActivationFailure, healthFactor } from "./health-score.js";
 import { HISTORY_LIMIT, type ToolCallRecord, adaptiveThreshold, pushToolCall } from "./idle-ttl.js";
 import { LearningStore } from "./learning.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
-import { type Profile, loadEffectiveProfile, profileAllows } from "./profile.js";
 import { type ProgressReporter, createProgressReporter } from "./progress.js";
 import {
+  type BuiltinResource,
   type PromptRoute,
   type ResourceRoute,
   type ToolRoute,
@@ -121,6 +123,20 @@ export class ConnectServer {
   private adaptiveSkipLogged = new Set<string>();
   private toolCache = new Map<string, Array<{ name: string; description?: string }>>();
   private profile: Profile | null = null;
+  // Loaded MCPH.md guides (user-global + project-local). Null until
+  // start() has run the loader; fail-open if either file is missing,
+  // unreadable, or empty.
+  private guides: LoadedGuides = { user: null, project: null };
+  // Tracks whether the client has actually READ `mcph://guide` this
+  // session. meta-tools.ts uses this to fire a one-shot nudge in the
+  // next tool response reminding the client to read the guide — but
+  // only if (a) at least one guide is present and (b) the client
+  // hasn't read it yet. Cleared on startup; no persistence.
+  private guideRead = false;
+  // One-shot latch for the guide nudge. Flips true the first time a
+  // meta-tool response includes the nudge, so we don't spam the same
+  // hint on every subsequent call — the client had its chance.
+  private guideNudgeFired = false;
   // Short-term memory of activation failures; used by dispatch to
   // down-rank recently-flaky servers. Cleared on successful activation.
   private activationFailures = new Map<string, ActivationFailure>();
@@ -182,6 +198,40 @@ export class ConnectServer {
     this.setupHandlers();
   }
 
+  // Builtin resources served directly by mcph (not proxied from an
+  // upstream). Today: just `mcph://guide`. Rebuilt each request so the
+  // list reflects the latest loaded guides — start() populates
+  // `this.guides` once, but tests and future hot-reload code paths may
+  // mutate it, and the cost of rebuilding is negligible.
+  private getBuiltinResources(): BuiltinResource[] {
+    const body = renderGuide(this.guides);
+    if (!body) return [];
+    return [
+      {
+        uri: "mcph://guide",
+        name: "mcph guide",
+        description:
+          "Project + user guidance from MCPH.md. Read this to learn how THIS user/project routes MCP work (which servers to prefer, where credentials live, gotchas).",
+        mimeType: "text/markdown",
+        read: () => {
+          // Flip the session flag — the meta-tools one-shot nudge keys
+          // off this so we only remind the client to read the guide if
+          // they haven't yet. Re-render at read time in case guides
+          // were hot-reloaded (not done today, but free to support).
+          this.guideRead = true;
+          const text = renderGuide(this.guides) ?? "";
+          return { contents: [{ uri: "mcph://guide", text, mimeType: "text/markdown" }] };
+        },
+      },
+    ];
+  }
+
+  private getBuiltinResourceMap(): Map<string, BuiltinResource> {
+    const map = new Map<string, BuiltinResource>();
+    for (const b of this.getBuiltinResources()) map.set(b.uri, b);
+    return map;
+  }
+
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: buildToolList(this.connections),
@@ -193,11 +243,11 @@ export class ConnectServer {
     });
 
     this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: buildResourceList(this.connections),
+      resources: buildResourceList(this.connections, this.getBuiltinResources()),
     }));
 
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      return routeResourceRead(request.params.uri, this.resourceRoutes, this.connections);
+      return routeResourceRead(request.params.uri, this.resourceRoutes, this.connections, this.getBuiltinResourceMap());
     });
 
     this.server.setRequestHandler(ListPromptsRequestSchema, async () => ({
@@ -264,11 +314,11 @@ export class ConnectServer {
   }
 
   async start(): Promise<void> {
-    // Project + user-global profile: walks up from cwd for .mcph.json
-    // (project-local) and also checks ~/.mcph.json (user-global). When
-    // both exist, project wins for the allow-list and blocks union —
-    // see mergeProfiles() in profile.ts. Failure is silent — fail-open
-    // so a bad profile doesn't brick the session.
+    // Load the effective profile (allow/deny lists from .mcph/config.*
+    // files). Walks up from cwd for a project-local .mcph/ dir and also
+    // consults ~/.mcph/config.json (user-global). Local beats project
+    // beats global for the allow-list; denies union. Failure is silent
+    // — fail-open so a bad config doesn't brick the session.
     this.profile = await loadEffectiveProfile(process.cwd()).catch(() => null);
     if (this.profile) {
       log("info", "Loaded profile", {
@@ -276,6 +326,18 @@ export class ConnectServer {
         userPath: this.profile.userPath,
         allow: this.profile.servers,
         block: this.profile.blocked,
+      });
+    }
+
+    // Load MCPH.md guides (user-global + project-local). Fail-open:
+    // loadGuides() swallows I/O errors internally, so the worst case
+    // is `this.guides` stays { user: null, project: null } and the
+    // `mcph://guide` builtin simply isn't listed.
+    this.guides = await loadGuides(process.cwd()).catch(() => ({ user: null, project: null }));
+    if (this.guides.user || this.guides.project) {
+      log("info", "Loaded MCPH.md guide", {
+        user: this.guides.user?.path ?? null,
+        project: this.guides.project?.path ?? null,
       });
     }
 
@@ -322,6 +384,28 @@ export class ConnectServer {
     });
   }
 
+  // One-shot nudge: if an MCPH.md guide was loaded at startup but the
+  // client hasn't read `mcph://guide` yet, append a short reminder to
+  // the next meta-tool response. We only fire once per session — after
+  // that the flag latches and we shut up. This is deliberately gentle
+  // (a hint, not an error) because the guide is advisory; clients that
+  // ignore it still work fine.
+  private attachGuideNudge<T extends { content: Array<{ type: string; text: string }> }>(result: T): T {
+    if (this.guideNudgeFired) return result;
+    if (this.guideRead) return result;
+    if (!this.guides.user && !this.guides.project) return result;
+    this.guideNudgeFired = true;
+    const sources = [this.guides.user?.path, this.guides.project?.path].filter(Boolean).join(", ");
+    const text = `\n\n[mcph] Tip: read the \`mcph://guide\` resource for project-specific routing & credential guidance (from ${sources}). This hint appears once per session.`;
+    const last = result.content[result.content.length - 1];
+    if (last && last.type === "text") {
+      last.text = `${last.text}${text}`;
+    } else {
+      result.content.push({ type: "text", text: text.trimStart() });
+    }
+    return result;
+  }
+
   private async handleToolCall(
     name: string,
     args: Record<string, unknown>,
@@ -333,13 +417,13 @@ export class ConnectServer {
       // When the LLM supplies task context, automatically warm the top
       // confident candidate so a one-shot discover() is enough to start
       // calling tools. Ambiguous queries fall through to the manual list.
-      return this.handleDiscoverWithAutoWarm(args.context as string | undefined, progress);
+      return this.attachGuideNudge(await this.handleDiscoverWithAutoWarm(args.context as string | undefined, progress));
     }
     if (name === META_TOOLS.dispatch.name) {
       const intent = typeof args.intent === "string" ? args.intent : "";
       const budget = typeof args.budget === "number" && Number.isFinite(args.budget) ? args.budget : 1;
       recordConnectEvent({ namespace: null, toolName: null, action: "activate", latencyMs: null, success: true });
-      return this.handleDispatch(intent, budget, progress);
+      return this.attachGuideNudge(await this.handleDispatch(intent, budget, progress));
     }
     if (name === META_TOOLS.activate.name) {
       const namespaces = resolveNamespaces(args);
@@ -353,7 +437,7 @@ export class ConnectServer {
           success: !result.isError,
         });
       }
-      return result;
+      return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.deactivate.name) {
       const namespaces = resolveNamespaces(args);
@@ -367,7 +451,7 @@ export class ConnectServer {
           success: !result.isError,
         });
       }
-      return result;
+      return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.import_config.name) {
       const result = await this.handleImport(args.filepath as string);
@@ -378,15 +462,15 @@ export class ConnectServer {
         latencyMs: null,
         success: !result.isError,
       });
-      return result;
+      return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.health.name) {
       recordConnectEvent({ namespace: null, toolName: null, action: "health", latencyMs: null, success: true });
-      return this.handleHealth();
+      return this.attachGuideNudge(this.handleHealth());
     }
     if (name === META_TOOLS.suggest.name) {
       recordConnectEvent({ namespace: null, toolName: null, action: "suggest", latencyMs: null, success: true });
-      return this.handleSuggest();
+      return this.attachGuideNudge(this.handleSuggest());
     }
 
     // Snapshot routes at method entry. rebuildRoutes() may fire during

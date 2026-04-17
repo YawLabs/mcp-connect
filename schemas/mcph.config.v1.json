@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/YawLabs/mcph/main/schemas/mcph.config.v1.json",
-  "title": "mcph CLI configuration (.mcph.json)",
-  "description": "Configuration file for the @yawlabs/mcph CLI, which manages MCP servers via the mcp.hosting registry. Resolved in precedence order (most-specific to least-specific): <cwd>/.mcph.local.json  >  <cwd>/.mcph.json  >  ~/.mcph.json. Environment variables MCPH_TOKEN and MCPH_URL override file values. JSONC (comments) is permitted.",
+  "title": "mcph CLI configuration (.mcph/config.json)",
+  "description": "Configuration file for the @yawlabs/mcph CLI, which manages MCP servers via the mcp.hosting registry. Resolved in precedence order (most-specific to least-specific): <project>/.mcph/config.local.json  >  <project>/.mcph/config.json  >  ~/.mcph/config.json. The project `.mcph/` directory is found by walking up from the current directory, stopping just before $HOME. Environment variables MCPH_TOKEN and MCPH_URL override file values. JSONC (comments) is permitted.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -19,7 +19,7 @@
     "token": {
       "type": "string",
       "pattern": "^mcp_pat_[A-Za-z0-9_-]+$",
-      "description": "Personal access token for mcp.hosting. SECURITY: must NOT appear in a committed project-scope .mcph.json. Only valid in ~/.mcph.json (user-global) or .mcph.local.json (machine-local, gitignored). The MCPH_TOKEN environment variable overrides this value."
+      "description": "Personal access token for mcp.hosting. SECURITY: must NOT appear in a committed project-scope .mcph/config.json. Only valid in ~/.mcph/config.json (user-global) or .mcph/config.local.json (machine-local, gitignored). The MCPH_TOKEN environment variable overrides this value."
     },
     "apiBase": {
       "type": "string",
@@ -31,7 +31,7 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
       "uniqueItems": true,
-      "description": "Allow-list of server namespaces to activate. If set in any scope, only these servers are active. Precedence: project scope wins over local-project, which wins over global."
+      "description": "Allow-list of server namespaces to activate. If set in any scope, only these servers are active. Precedence: local scope wins over project, which wins over global (most-specific overrides)."
     },
     "blocked": {
       "type": "array",

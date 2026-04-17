@@ -258,7 +258,7 @@ function pathFor(
 export interface BuildLaunchEntryOptions {
   os: InstallOS;
   /** Optional token to embed in env. Omit to keep env empty (preferred:
-   *  token lives in ~/.mcph.json, not in the client config). */
+   *  token lives in ~/.mcph/config.json, not in the client config). */
   token?: string;
   /** Optional override for the `args` binary (defaults to @yawlabs/mcph). */
   pkg?: string;

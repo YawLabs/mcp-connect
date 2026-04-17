@@ -17,6 +17,24 @@ export interface PromptRoute {
   originalName: string;
 }
 
+export type ResourceContents = {
+  contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }>;
+};
+
+// A resource mcph itself provides — not proxied from an upstream server.
+// Today the only one is `mcph://guide` (rendered MCPH.md), but the shape
+// is general so future hosts like `mcph://config` or `mcph://health`
+// can slot in the same way. Keeping the read side as a closure means
+// callers (e.g. server.ts) can capture session state without mcph
+// having to thread request context into proxy.ts.
+export interface BuiltinResource {
+  uri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+  read: () => Promise<ResourceContents> | ResourceContents;
+}
+
 export function buildToolList(activeConnections: Map<string, UpstreamConnection>): Array<{
   name: string;
   description?: string;
@@ -70,10 +88,18 @@ export function buildToolRoutes(activeConnections: Map<string, UpstreamConnectio
   return routes;
 }
 
+// Builtins come FIRST in the list — they come from mcph itself and are
+// always present regardless of which servers are activated, so clients
+// that scan the list top-down (Claude Code does) see the guide before
+// the upstream noise.
 export function buildResourceList(
   activeConnections: Map<string, UpstreamConnection>,
+  builtins: BuiltinResource[] = [],
 ): Array<{ uri: string; name?: string; description?: string; mimeType?: string }> {
   const resources: Array<{ uri: string; name?: string; description?: string; mimeType?: string }> = [];
+  for (const b of builtins) {
+    resources.push({ uri: b.uri, name: b.name, description: b.description, mimeType: b.mimeType });
+  }
   for (const conn of activeConnections.values()) {
     for (const r of conn.resources) {
       resources.push({
@@ -133,7 +159,23 @@ export async function routeResourceRead(
   uri: string,
   resourceRoutes: Map<string, ResourceRoute>,
   activeConnections: Map<string, UpstreamConnection>,
-): Promise<{ contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }> }> {
+  builtins?: Map<string, BuiltinResource>,
+): Promise<ResourceContents> {
+  // Builtin resources are served directly by mcph and never route to an
+  // upstream — check them first. A builtin's URI intentionally SHADOWS
+  // an upstream URI with the same string, since the builtin is the
+  // canonical answer for mcph-namespaced content (e.g. `mcph://guide`).
+  const builtin = builtins?.get(uri);
+  if (builtin) {
+    try {
+      return await builtin.read();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log("error", "Builtin resource read failed", { uri, error: message });
+      return { contents: [{ uri, text: `Error: ${message}` }] };
+    }
+  }
+
   const route = resourceRoutes.get(uri);
   if (!route) {
     return { contents: [{ uri, text: `Unknown resource: ${uri}` }] };
@@ -146,7 +188,7 @@ export async function routeResourceRead(
 
   try {
     const result = await connection.client.readResource({ uri: route.originalUri });
-    return result as { contents: Array<{ uri: string; text?: string; blob?: string; mimeType?: string }> };
+    return result as ResourceContents;
   } catch (err: any) {
     log("error", "Resource read failed", { uri, namespace: route.namespace, error: err.message });
     return { contents: [{ uri, text: `Error: ${err.message}` }] };

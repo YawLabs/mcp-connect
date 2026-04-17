@@ -1,6 +1,11 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+function writeMcphConfig(root: string, filename: string, obj: unknown): void {
+  mkdirSync(join(root, ".mcph"), { recursive: true });
+  writeFileSync(join(root, ".mcph", filename), JSON.stringify(obj));
+}
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runDoctor } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
@@ -48,7 +53,7 @@ describe("runDoctor — exit codes", () => {
   });
 
   it("exits 2 when token is present but warnings exist (newer schema)", async () => {
-    writeFileSync(join(synthHome, ".mcph.json"), JSON.stringify({ version: 999, token: "mcp_pat_aaaa" }));
+    writeMcphConfig(synthHome, "config.json", { version: 999, token: "mcp_pat_aaaa" });
     const cap = captureOut();
     const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(r.exitCode).toBe(2);
@@ -68,10 +73,7 @@ describe("runDoctor — output content", () => {
   });
 
   it("reports the source for token and apiBase", async () => {
-    writeFileSync(
-      join(synthHome, ".mcph.json"),
-      JSON.stringify({ token: "mcp_pat_aaaa", apiBase: "https://corp.example" }),
-    );
+    writeMcphConfig(synthHome, "config.json", { token: "mcp_pat_aaaa", apiBase: "https://corp.example" });
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     expect(cap.text()).toMatch(/source: global/);
@@ -79,8 +81,8 @@ describe("runDoctor — output content", () => {
   });
 
   it("lists each loaded config file with scope", async () => {
-    writeFileSync(join(synthHome, ".mcph.json"), JSON.stringify({ token: "mcp_pat_aaaa" }));
-    writeFileSync(join(synthCwd, ".mcph.json"), JSON.stringify({ apiBase: "https://example" }));
+    writeMcphConfig(synthHome, "config.json", { token: "mcp_pat_aaaa" });
+    writeMcphConfig(synthCwd, "config.json", { apiBase: "https://example" });
     const cap = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
     const txt = cap.text();
@@ -151,7 +153,7 @@ describe("runDoctor — client detection", () => {
 
 describe("runDoctor — surfaces config-loader warnings", () => {
   it("relays the project-token warning into doctor output", async () => {
-    writeFileSync(join(synthCwd, ".mcph.json"), JSON.stringify({ token: "mcp_pat_committed_aaaa" }));
+    writeMcphConfig(synthCwd, "config.json", { token: "mcp_pat_committed_aaaa" });
     const cap = captureOut();
     const r = await runDoctor({
       cwd: synthCwd,

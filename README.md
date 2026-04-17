@@ -49,7 +49,7 @@ npx -y @yawlabs/mcph install <claude-code|claude-desktop|cursor|vscode> --token 
 This:
 
 1. Edits the chosen client's config file (correct path for your OS, correct JSON shape) to launch mcph.
-2. Writes your token to `~/.mcph.json` so every other client you install picks it up automatically — no need to copy the token into each client's `env` block.
+2. Writes your token to `~/.mcph/config.json` so every other client you install picks it up automatically — no need to copy the token into each client's `env` block.
 3. On Windows, wraps `npx` in `cmd /c` (without this, MCP clients hit `ENOENT` on the `npx.cmd` shim).
 
 Run it once per client. To rotate the token later, run `install` again with `--token` — both files get rewritten.
@@ -59,7 +59,7 @@ Helpful flags:
 - `--scope user|project|local` — which file to write (Claude Code + Cursor support project/local; VS Code is workspace-only; Claude Desktop is user-only).
 - `--dry-run` — print the diff and exit without writing.
 - `--force` / `--skip` — overwrite or leave an existing `mcp.hosting` entry. Without either, mcph prompts (TTY) or refuses (non-TTY).
-- `--no-mcph-config` — write only the client config; leave `~/.mcph.json` untouched.
+- `--no-mcph-config` — write only the client config; leave `~/.mcph/config.json` untouched.
 
 Or [edit the JSON by hand](#manual-install) if you'd rather.
 
@@ -110,7 +110,7 @@ If you'd rather edit the config files yourself, the JSON shapes are:
 
 **Windows** — `command: "cmd", args: ["/c", "npx", "-y", "@yawlabs/mcph"]` (the `cmd /c` wrapper is required because `npx.cmd` is a shim).
 
-Then put your token in `~/.mcph.json` so mcph picks it up at startup:
+Then put your token in `~/.mcph/config.json` so mcph picks it up at startup:
 
 ```json
 {
@@ -184,15 +184,17 @@ Deactivated "gh". Tools removed.
 
 Servers also auto-deactivate after ~10 tool calls to other servers, so context stays clean even if you forget. The threshold is adaptive per-namespace: a server that's been called in bursts recently gets more patience (up to +20) before it's deactivated, so heavily-used servers don't get torn down mid-task. Long-idle servers still deactivate at the baseline.
 
-## `.mcph.json` config file
+## `.mcph/` config directory
 
-mcph reads its own config from `.mcph.json` files at three optional locations (highest precedence first):
+mcph stores its config under a `.mcph/` directory — mirroring the `.git/`, `.vscode/`, `.claude/` convention so everything related to mcph (config, project guide, future additions) lives under one predictable folder you can grep, gitignore, or blow away atomically. mcph reads `config.json` from three optional locations (highest precedence first):
 
 | Scope | Path | Holds |
 |-------|------|-------|
-| **local** | `<project>/.mcph.local.json` | Machine-local override; `gitignore` it. Token allowed. |
-| **project** | `<project>/.mcph.json` | Shared with the team via git. Token NOT allowed (warned). |
-| **global** | `~/.mcph.json` | Personal default for every project. Token allowed. |
+| **local** | `<project>/.mcph/config.local.json` | Machine-local override; `gitignore` it. Token allowed. |
+| **project** | `<project>/.mcph/config.json` | Shared with the team via git. Token NOT allowed (warned). |
+| **global** | `~/.mcph/config.json` | Personal default for every project. Token allowed. |
+
+The project `.mcph/` is found by walking UP from the current directory until a `.mcph/` is found, stopping just before `$HOME` (exclusive) so a `.mcph/` sitting at `$HOME` is treated as user-global only and never double-loaded as project.
 
 Full schema:
 
@@ -219,20 +221,31 @@ Full schema:
 }
 ```
 
-**Comments are allowed** (line `//` and block `/* … */`) — handy for documenting a shared `.mcph.json` checked into git.
+**Comments are allowed** (line `//` and block `/* … */`) — handy for documenting a shared `config.json` checked into git.
 
 **Resolution:**
 
 - **Token** — `MCPH_TOKEN` env > local > global. (`token` in the project file is ignored and warned: it'd get committed to git.)
 - **apiBase** — `MCPH_URL` env > local > project > global > `https://mcp.hosting`.
-- **servers** allow-list — project wins if set, else local, else global.
+- **servers** allow-list — local wins if set, else project, else global (most-specific scope overrides).
 - **blocked** deny-list — UNION across every scope that sets it (fail-safe on deny).
 - Malformed files log a warning and fall through — fail-open so a typo doesn't brick the session.
-- On POSIX, mcph warns if the file contains a token and is readable by group/other; run `chmod 600 ~/.mcph.json` to silence it.
+- On POSIX, mcph warns if the file contains a token and is readable by group/other; run `chmod 600 ~/.mcph/config.json` to silence it.
 
-**Token rotation**: mcph reads its config at startup. After editing `~/.mcph.json`, restart the MCP client (or kill mcph; the client respawns it).
+**Token rotation**: mcph reads its config at startup. After editing `~/.mcph/config.json`, restart the MCP client (or kill mcph; the client respawns it).
 
-`MCPH_PROFILE=/path/to/profile.json` overrides project-walk-up discovery and skips user-global entirely (same behavior as before). `mcp_connect_health` shows which file(s) are currently applied.
+`mcp_connect_health` shows which file(s) are currently applied.
+
+## Project guide — `MCPH.md`
+
+Drop a `MCPH.md` next to `config.json` inside either `.mcph/` and mcph surfaces its contents to your client via an `mcph://guide` MCP resource. The meta-tool descriptions (`discover`, `dispatch`) tell the model to read this resource first, so project-specific routing conventions ("use the `gh` server for GitHub, not bash") and credential guidance ("keys go in the dashboard, not `.mcp.json`") stick without the user restating them every session.
+
+| Scope | Path | Purpose |
+|-------|------|---------|
+| **user** | `~/.mcph/MCPH.md` | Personal defaults that apply everywhere (your preferred tools, credential conventions). |
+| **project** | `<project>/.mcph/MCPH.md` | Project-specific guidance shared via git (which servers are load-bearing, project idioms). |
+
+When both exist, the project guide is appended after the user guide with a `---` separator so project-specific rules get the final word in the reader's attention. A missing or empty file is silently skipped — if neither file exists, the `mcph://guide` resource isn't listed at all.
 
 ## Elicitation for missing credentials
 
@@ -254,14 +267,13 @@ mcph polls [mcp.hosting](https://mcp.hosting) every 60 seconds for config change
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MCPH_TOKEN` | Yes (or in `~/.mcph.json`) | Personal access token from mcp.hosting. Env wins over `~/.mcph.json`. |
-| `MCPH_URL` | No | API URL (default: `https://mcp.hosting`). Env wins over `apiBase` in `.mcph.json`. |
+| `MCPH_TOKEN` | Yes (or in `~/.mcph/config.json`) | Personal access token from mcp.hosting. Env wins over `~/.mcph/config.json`. |
+| `MCPH_URL` | No | API URL (default: `https://mcp.hosting`). Env wins over `apiBase` in `config.json`. |
 | `LOG_LEVEL` | No | Log verbosity: `debug`, `info`, `warn`, `error` (default: `info`) |
 | `MCPH_POLL_INTERVAL` | No | Config-poll interval in seconds. `0` disables polling (config fetched once at startup). Default: `60` |
 | `MCPH_AUTO_ACTIVATE` | No | When `discover` is called with a context string and one server clearly wins, auto-activate it. Set to `0` to disable. Default: enabled |
 | `MCP_CONNECT_TIMEOUT` | No | Connection timeout in ms for upstream servers (default: `15000`) |
 | `MCP_CONNECT_IDLE_THRESHOLD` | No | Baseline for idle auto-deactivate (default: `10`). The per-namespace adaptive cap is `[5, 50]` — bursty namespaces extend past the baseline, long-idle ones deactivate at it. |
-| `MCPH_PROFILE` | No | Absolute path to an explicit `.mcph.json` profile. Overrides both project-walk-up discovery and `~/.mcph.json`. |
 
 ## Runtime detection
 

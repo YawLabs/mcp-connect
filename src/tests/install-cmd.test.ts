@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
@@ -176,7 +176,7 @@ describe("mergeClientConfig", () => {
 });
 
 describe("runInstall — happy path (claude-code, user scope, fresh install)", () => {
-  it("writes both client config and ~/.mcph.json", async () => {
+  it("writes both client config and ~/.mcph/config.json", async () => {
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -190,14 +190,14 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
     expect(r.written.length).toBe(2);
 
     const clientPath = join(synthHome, ".claude.json");
-    const mcphPath = join(synthHome, ".mcph.json");
+    const mcphPath = join(synthHome, ".mcph", "config.json");
     expect(existsSync(clientPath)).toBe(true);
     expect(existsSync(mcphPath)).toBe(true);
 
     const client = JSON.parse(readFileSync(clientPath, "utf8"));
     expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
     expect(client.mcpServers[ENTRY_NAME].args).toEqual(["-y", "@yawlabs/mcph"]);
-    // Token is NOT embedded in client config — lives in ~/.mcph.json instead.
+    // Token is NOT embedded in client config — lives in ~/.mcph/config.json instead.
     expect(client.mcpServers[ENTRY_NAME].env).toBeUndefined();
 
     const mcphCfg = JSON.parse(readFileSync(mcphPath, "utf8"));
@@ -326,8 +326,8 @@ describe("runInstall — collision handling", () => {
     expect(r.exitCode).toBe(0);
     const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
     expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
-    // ~/.mcph.json should NOT have been written either, since we short-circuited.
-    expect(existsSync(join(synthHome, ".mcph.json"))).toBe(false);
+    // ~/.mcph/config.json should NOT have been written either, since we short-circuited.
+    expect(existsSync(join(synthHome, ".mcph", "config.json"))).toBe(false);
   });
 
   it("promptAnswer override exercises the interactive branch deterministically", async () => {
@@ -369,8 +369,9 @@ describe("runInstall — malformed existing JSON", () => {
 });
 
 describe("runInstall — token resolution", () => {
-  it("uses existing ~/.mcph.json token when --token is omitted", async () => {
-    writeFileSync(join(synthHome, ".mcph.json"), JSON.stringify({ token: "mcp_pat_existing_aaaa" }));
+  it("uses existing ~/.mcph/config.json token when --token is omitted", async () => {
+    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    writeFileSync(join(synthHome, ".mcph", "config.json"), JSON.stringify({ token: "mcp_pat_existing_aaaa" }));
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -380,8 +381,8 @@ describe("runInstall — token resolution", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    // The token in ~/.mcph.json should remain (not erased).
-    const cfg = JSON.parse(readFileSync(join(synthHome, ".mcph.json"), "utf8"));
+    // The token in ~/.mcph/config.json should remain (not erased).
+    const cfg = JSON.parse(readFileSync(join(synthHome, ".mcph", "config.json"), "utf8"));
     expect(cfg.token).toBe("mcp_pat_existing_aaaa");
   });
 
@@ -398,8 +399,9 @@ describe("runInstall — token resolution", () => {
     expect(cap.stderr()).toMatch(/no token available/i);
   });
 
-  it("--token overrides existing ~/.mcph.json token", async () => {
-    writeFileSync(join(synthHome, ".mcph.json"), JSON.stringify({ token: "mcp_pat_old_aaaa" }));
+  it("--token overrides existing ~/.mcph/config.json token", async () => {
+    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    writeFileSync(join(synthHome, ".mcph", "config.json"), JSON.stringify({ token: "mcp_pat_old_aaaa" }));
     const cap = captureIo();
     const r = await runInstall({
       clientId: "claude-code",
@@ -410,7 +412,7 @@ describe("runInstall — token resolution", () => {
       io: cap.io,
     });
     expect(r.exitCode).toBe(0);
-    const cfg = JSON.parse(readFileSync(join(synthHome, ".mcph.json"), "utf8"));
+    const cfg = JSON.parse(readFileSync(join(synthHome, ".mcph", "config.json"), "utf8"));
     expect(cfg.token).toBe("mcp_pat_new_bbbb");
   });
 });
@@ -431,7 +433,7 @@ describe("runInstall — --dry-run", () => {
     expect(r.written).toEqual([]);
     expect(r.wouldWrite.length).toBe(2);
     expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
-    expect(existsSync(join(synthHome, ".mcph.json"))).toBe(false);
+    expect(existsSync(join(synthHome, ".mcph", "config.json"))).toBe(false);
     expect(cap.stdout()).toMatch(/dry run/i);
   });
 });
@@ -450,7 +452,7 @@ describe("runInstall — --no-mcph-config", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(r.written.length).toBe(1);
-    expect(existsSync(join(synthHome, ".mcph.json"))).toBe(false);
+    expect(existsSync(join(synthHome, ".mcph", "config.json"))).toBe(false);
   });
 });
 

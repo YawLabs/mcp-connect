@@ -136,7 +136,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     exitCode = 1;
     print("DIAGNOSIS");
     print("  No token resolved — mcph cannot start.");
-    print("  Run `mcph install <client> --token mcp_pat_…` to seed ~/.mcph.json.");
+    print("  Run `mcph install <client> --token mcp_pat_…` to seed ~/.mcph/config.json.");
   } else if (config.warnings.length > 0) {
     exitCode = 2;
     print("DIAGNOSIS");

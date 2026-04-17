@@ -1,6 +1,9 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { cacheDir } from "../paths.js";
+import { CONFIG_DIRNAME, GUIDE_FILENAME, cacheDir, findProjectConfigDir, guidePath, userConfigDir } from "../paths.js";
 
 describe("cacheDir", () => {
   const ORIG_PLATFORM = process.platform;
@@ -46,5 +49,86 @@ describe("cacheDir", () => {
     Object.defineProperty(process, "platform", { value: "linux" });
     vi.stubEnv("XDG_CACHE_HOME", "");
     expect(cacheDir()).toMatch(/\.cache[\\/]mcph$/);
+  });
+});
+
+describe("userConfigDir", () => {
+  it("returns <home>/.mcph", () => {
+    expect(userConfigDir("/home/alice")).toMatch(/^[/\\]home[/\\]alice[/\\]\.mcph$/);
+  });
+
+  it("uses os.homedir() when no arg passed", () => {
+    // Just assert the tail — the prefix is whatever the host reports.
+    expect(userConfigDir().endsWith(CONFIG_DIRNAME)).toBe(true);
+  });
+});
+
+describe("guidePath", () => {
+  it("returns <dir>/MCPH.md", () => {
+    expect(guidePath("/tmp/.mcph")).toMatch(/[/\\]\.mcph[/\\]MCPH\.md$/);
+  });
+
+  it("uses the GUIDE_FILENAME constant", () => {
+    expect(guidePath("/x")).toMatch(new RegExp(`${GUIDE_FILENAME.replace(".", "\\.")}$`));
+  });
+});
+
+describe("findProjectConfigDir", () => {
+  let home: string;
+  let root: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "mcph-paths-home-"));
+    // Root of the synthetic project tree lives next to (not under)
+    // `home` so walk-up from deep in `root` genuinely crosses fs
+    // levels without ever hitting `home`.
+    root = mkdtempSync(join(tmpdir(), "mcph-paths-proj-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("returns null when no .mcph/ exists anywhere up to home", async () => {
+    const sub = join(root, "a", "b", "c");
+    mkdirSync(sub, { recursive: true });
+    expect(await findProjectConfigDir(sub, home)).toBeNull();
+  });
+
+  it("finds a .mcph/ at the starting directory", async () => {
+    const cfgDir = join(root, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    expect(await findProjectConfigDir(root, home)).toBe(cfgDir);
+  });
+
+  it("walks up when started in a deep subdirectory", async () => {
+    const cfgDir = join(root, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    const deep = join(root, "pkg", "src", "nested");
+    mkdirSync(deep, { recursive: true });
+    expect(await findProjectConfigDir(deep, home)).toBe(cfgDir);
+  });
+
+  it("stops BEFORE $HOME — a .mcph/ in home is NOT returned as a project dir", async () => {
+    // .mcph/ lives at $HOME. That's the user-global scope, handled
+    // separately by userConfigDir(). findProjectConfigDir must not
+    // claim it, or the config loader would double-load the same file
+    // as both project and user-global.
+    mkdirSync(join(home, CONFIG_DIRNAME));
+    const sub = join(home, "projects", "p1");
+    mkdirSync(sub, { recursive: true });
+    expect(await findProjectConfigDir(sub, home)).toBeNull();
+  });
+
+  it("prefers the nearest .mcph/ when multiple exist on the path", async () => {
+    mkdirSync(join(root, CONFIG_DIRNAME));
+    const innerProject = join(root, "apps", "web");
+    mkdirSync(innerProject, { recursive: true });
+    const innerCfg = join(innerProject, CONFIG_DIRNAME);
+    mkdirSync(innerCfg);
+    const startFrom = join(innerProject, "src");
+    mkdirSync(startFrom);
+    expect(await findProjectConfigDir(startFrom, home)).toBe(innerCfg);
   });
 });

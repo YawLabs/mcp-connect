@@ -952,6 +952,113 @@ describe("handleToolCall route snapshot", () => {
   });
 });
 
+describe("guide resource + session tracking", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://mcp.hosting", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("lists no builtins when no guide is loaded", () => {
+    const priv = getPrivate(server);
+    priv.guides = { user: null, project: null };
+    expect(priv.getBuiltinResources()).toEqual([]);
+  });
+
+  it("surfaces mcph://guide when either guide is present", () => {
+    const priv = getPrivate(server);
+    priv.guides = {
+      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      project: null,
+    };
+    const builtins = priv.getBuiltinResources();
+    expect(builtins.length).toBe(1);
+    expect(builtins[0].uri).toBe("mcph://guide");
+    expect(builtins[0].mimeType).toBe("text/markdown");
+    expect(builtins[0].name).toBe("mcph guide");
+  });
+
+  it("builtin read() returns the rendered body and flips guideRead", () => {
+    const priv = getPrivate(server);
+    priv.guides = {
+      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u-body" },
+      project: { scope: "project", path: "/p/.mcph/MCPH.md", content: "p-body" },
+    };
+    expect(priv.guideRead).toBe(false);
+    const builtin = priv.getBuiltinResources()[0];
+    const result = builtin.read();
+    expect(priv.guideRead).toBe(true);
+    const text = result.contents[0].text;
+    expect(text).toContain("u-body");
+    expect(text).toContain("p-body");
+    // Project goes last so its guidance has the final word (see renderGuide).
+    expect(text.indexOf("p-body")).toBeGreaterThan(text.indexOf("u-body"));
+  });
+
+  it("builtin map exposes the same guide entry by URI", () => {
+    const priv = getPrivate(server);
+    priv.guides = {
+      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      project: null,
+    };
+    const map = priv.getBuiltinResourceMap();
+    expect(map.size).toBe(1);
+    expect(map.get("mcph://guide")?.uri).toBe("mcph://guide");
+  });
+
+  it("attaches a one-shot guide nudge to meta-tool responses when guide is loaded but unread", () => {
+    const priv = getPrivate(server);
+    priv.guides = {
+      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      project: null,
+    };
+    const res1 = priv.attachGuideNudge({ content: [{ type: "text", text: "discover-body" }] });
+    expect(res1.content[0].text).toContain("discover-body");
+    expect(res1.content[0].text).toContain("mcph://guide");
+    expect(res1.content[0].text).toContain("/h/.mcph/MCPH.md");
+    // One-shot: a second call does NOT add the nudge again.
+    const res2 = priv.attachGuideNudge({ content: [{ type: "text", text: "second-body" }] });
+    expect(res2.content[0].text).toBe("second-body");
+  });
+
+  it("does NOT nudge when no guide is loaded", () => {
+    const priv = getPrivate(server);
+    priv.guides = { user: null, project: null };
+    const res = priv.attachGuideNudge({ content: [{ type: "text", text: "plain" }] });
+    expect(res.content[0].text).toBe("plain");
+  });
+
+  it("does NOT nudge once the guide has been read", () => {
+    const priv = getPrivate(server);
+    priv.guides = {
+      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      project: null,
+    };
+    priv.guideRead = true;
+    const res = priv.attachGuideNudge({ content: [{ type: "text", text: "body" }] });
+    expect(res.content[0].text).toBe("body");
+  });
+
+  it("reading the guide via the builtin flips guideRead and suppresses the nudge", () => {
+    const priv = getPrivate(server);
+    priv.guides = {
+      user: { scope: "user", path: "/h/.mcph/MCPH.md", content: "u" },
+      project: null,
+    };
+    expect(priv.guideRead).toBe(false);
+    priv.getBuiltinResources()[0].read();
+    expect(priv.guideRead).toBe(true);
+    const res = priv.attachGuideNudge({ content: [{ type: "text", text: "body" }] });
+    // guideRead gates the nudge, so even with a guide loaded we shouldn't nudge.
+    expect(res.content[0].text).toBe("body");
+  });
+});
+
 describe("handleImport path validation", () => {
   let server: ConnectServer;
 

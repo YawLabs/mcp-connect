@@ -1,6 +1,6 @@
 // `mcph install <client> [flags]` — auto-edits the chosen MCP client's
 // config file so the user doesn't have to hand-write JSON or hunt for
-// per-OS file paths. Also ensures ~/.mcph.json carries the token so
+// per-OS file paths. Also ensures ~/.mcph/config.json carries the token so
 // subsequent `install` invocations on other clients don't re-prompt.
 //
 // Two files are touched per run:
@@ -9,7 +9,7 @@
 //      preserving any other `mcpServers` / `servers` keys the user
 //      already has, plus every sibling along the container key path
 //      (Claude Code local scope nests under projects[<absDir>].mcpServers).
-//   2. ~/.mcph.json (user-global) — created if missing, the token is
+//   2. ~/.mcph/config.json (user-global) — created if missing, the token is
 //      written here so the launch entry stays env-free. Single source
 //      of truth for token rotation across all clients.
 //
@@ -39,13 +39,14 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
+import { CONFIG_DIRNAME } from "./paths.js";
 
 export interface InstallCommandOptions {
   clientId: InstallClientId;
   scope?: InstallScope;
   os?: InstallOS;
   projectDir?: string;
-  /** Token to write to ~/.mcph.json. If absent, uses existing token there. */
+  /** Token to write to ~/.mcph/config.json. If absent, uses existing token there. */
   token?: string;
   /** Overwrite an existing mcp.hosting entry without prompting. */
   force?: boolean;
@@ -53,7 +54,7 @@ export interface InstallCommandOptions {
   skip?: boolean;
   /** Print the changes that would be made and exit without writing. */
   dryRun?: boolean;
-  /** When true, do not write/update ~/.mcph.json — only the client config. */
+  /** When true, do not write/update ~/.mcph/config.json — only the client config. */
   skipMcphConfig?: boolean;
   /** Override for tests; defaults to homedir(). */
   home?: string;
@@ -149,7 +150,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   log(`File:   ${resolved.absolute}`);
 
   // Resolve the token. Source precedence (highest first):
-  //   --token flag > existing ~/.mcph.json token > error.
+  //   --token flag > existing ~/.mcph/config.json token > error.
   let token: string | null = opts.token ?? null;
   if (!token) {
     const cfg = await loadMcphConfig({ home: opts.home, cwd: process.cwd(), env: {} });
@@ -158,7 +159,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   if (!token) {
     err(
       "\nmcph install: no token available.\n" +
-        "  Pass one with --token mcp_pat_…, or run `mcph install` with --token once to seed ~/.mcph.json,\n" +
+        "  Pass one with --token mcp_pat_…, or run `mcph install` with --token once to seed ~/.mcph/config.json,\n" +
         "  or create the token at https://mcp.hosting → Settings → API Tokens.",
     );
     return { written: [], wouldWrite: [], messages, exitCode: 1 };
@@ -229,7 +230,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   const writeMcphConfig = !opts.skipMcphConfig;
   const home = opts.home ?? homedir();
-  const mcphConfigPath = join(home, CONFIG_FILENAME);
+  const mcphConfigPath = join(home, CONFIG_DIRNAME, CONFIG_FILENAME);
   const mcphConfigJson = await composeMcphConfig(mcphConfigPath, token);
 
   if (opts.dryRun) {
@@ -255,7 +256,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   log(`Wrote ${resolved.absolute}`);
   const written = [resolved.absolute];
 
-  // Write ~/.mcph.json with the token.
+  // Write ~/.mcph/config.json with the token.
   if (writeMcphConfig) {
     try {
       await mkdir(dirname(mcphConfigPath), { recursive: true });
@@ -345,7 +346,7 @@ export function mergeClientConfig(
   return out;
 }
 
-/** Compose the ~/.mcph.json contents — preserves any existing fields,
+/** Compose the ~/.mcph/config.json contents — preserves any existing fields,
  *  upserts the token, ensures `version` is set. */
 async function composeMcphConfig(path: string, token: string): Promise<string> {
   let existing: Record<string, unknown> = {};
