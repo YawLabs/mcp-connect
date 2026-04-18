@@ -594,6 +594,63 @@ describe("ConnectServer", () => {
     });
   });
 
+  describe("discover recurring-packs block", () => {
+    it("surfaces an actionable pack with a ready-to-run activate call", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ id: "2", namespace: "linear", name: "Linear" }),
+      ]);
+      // Two bursts of (gh, linear) → one detected pack.
+      const t0 = 1_000_000;
+      priv.packDetector.recordCall("gh", "create_issue", t0);
+      priv.packDetector.recordCall("linear", "list_issues", t0 + 1000);
+      priv.packDetector.recordCall("gh", "create_issue", t0 + 300_000);
+      priv.packDetector.recordCall("linear", "list_issues", t0 + 301_000);
+
+      const result = await priv.handleToolCall("mcp_connect_discover", {});
+      const text = result.content[0].text;
+      expect(text).toContain("Recurring packs");
+      expect(text).toContain("seen 2x");
+      // Both namespaces appear, ready-to-run namespaces=["..","..."] verbatim.
+      expect(text).toMatch(/namespaces=\[.*"gh".*"linear".*\]|namespaces=\[.*"linear".*"gh".*\]/);
+    });
+
+    it("omits the block when every pack is already fully loaded", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ id: "2", namespace: "linear", name: "Linear" }),
+      ]);
+      const t0 = 1_000_000;
+      priv.packDetector.recordCall("gh", "create_issue", t0);
+      priv.packDetector.recordCall("linear", "list_issues", t0 + 1000);
+      priv.packDetector.recordCall("gh", "create_issue", t0 + 300_000);
+      priv.packDetector.recordCall("linear", "list_issues", t0 + 301_000);
+      // Already connected — no action for the LLM to take.
+      priv.connections.set("gh", { ...makeConnection("gh"), status: "connected" });
+      priv.connections.set("linear", { ...makeConnection("linear"), status: "connected" });
+
+      const result = await priv.handleToolCall("mcp_connect_discover", {});
+      expect(result.content[0].text).not.toContain("Recurring packs");
+    });
+
+    it("omits the block when any pack namespace isn't installed", async () => {
+      const priv = getPrivate(server);
+      // `linear` is NOT in the installed set, so the {gh, linear} pack
+      // can't be activated as a whole — don't advertise it.
+      priv.config = makeConfig([makeServerConfig({ id: "1", namespace: "gh", name: "GitHub" })]);
+      const t0 = 1_000_000;
+      priv.packDetector.recordCall("gh", "t", t0);
+      priv.packDetector.recordCall("linear", "t", t0 + 1000);
+      priv.packDetector.recordCall("gh", "t", t0 + 300_000);
+      priv.packDetector.recordCall("linear", "t", t0 + 301_000);
+
+      const result = await priv.handleToolCall("mcp_connect_discover", {});
+      expect(result.content[0].text).not.toContain("Recurring packs");
+    });
+  });
+
   describe("concurrent server cap", () => {
     it("refuses a new activation when already at cap", async () => {
       const priv = getPrivate(server);

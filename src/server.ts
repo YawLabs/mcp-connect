@@ -1119,7 +1119,35 @@ export class ConnectServer {
     // the PackDetector's current history — same signal `suggest` surfaces,
     // but delivered inline so the LLM doesn't need a second meta-tool
     // roundtrip to see "often used with X."
-    const coUsageMap = buildCoUsageMap(this.packDetector.detectChains());
+    const chains = this.packDetector.detectChains();
+    const coUsageMap = buildCoUsageMap(chains);
+
+    // Inline "Suggested packs" block. Surfaces recurring co-activation
+    // history from chains at the top of the output so the LLM can take
+    // action in this call rather than needing a separate mcp_connect_suggest
+    // round-trip. Filter: every namespace in the pack must be installed
+    // (so `activate` can actually load them) AND at least one must not
+    // be connected yet (otherwise the pack is already loaded — no action
+    // to take). Ranked by frequency desc, tie-break by recency.
+    const installedNamespaces = new Set(activeServers.map((s) => s.namespace));
+    const connectedNamespaces = new Set(
+      [...this.connections.entries()].filter(([, c]) => c.status === "connected").map(([ns]) => ns),
+    );
+    const actionablePacks = chains
+      .filter((pack) => pack.namespaces.every((ns) => installedNamespaces.has(ns)))
+      .filter((pack) => pack.namespaces.some((ns) => !connectedNamespaces.has(ns)))
+      .sort((a, b) => {
+        if (b.frequency !== a.frequency) return b.frequency - a.frequency;
+        return b.lastSeenAt - a.lastSeenAt;
+      });
+    if (actionablePacks.length > 0) {
+      lines.push("Recurring packs (activate together — seen before):");
+      for (const pack of actionablePacks.slice(0, 3)) {
+        const nsJson = JSON.stringify(pack.namespaces);
+        lines.push(`  {${pack.namespaces.join(", ")}} — seen ${pack.frequency}x; activate with namespaces=${nsJson}`);
+      }
+      lines.push("");
+    }
 
     let totalContextTokens = 0;
     for (const server of sorted) {
