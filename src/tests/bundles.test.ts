@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { CURATED_BUNDLES, type CuratedBundle, bundleActivateHint, matchBundles } from "../bundles.js";
+import {
+  CURATED_BUNDLES,
+  type CuratedBundle,
+  bundleActivateHint,
+  matchBundles,
+  topPartialBundles,
+} from "../bundles.js";
 
 describe("CURATED_BUNDLES data", () => {
   it("every bundle has a non-empty id, name, description, and namespaces array", () => {
@@ -94,5 +100,54 @@ describe("matchBundles", () => {
   it("accepts a Set as input (Iterable contract)", () => {
     const result = matchBundles(new Set(["github", "linear"]));
     expect(result.ready.some((b) => b.id === "pr-review")).toBe(true);
+  });
+});
+
+describe("topPartialBundles", () => {
+  it("returns empty when nothing is installed", () => {
+    expect(topPartialBundles([], 3)).toEqual([]);
+  });
+
+  it("returns empty when limit is 0 or negative", () => {
+    expect(topPartialBundles(["github", "linear"], 0)).toEqual([]);
+    expect(topPartialBundles(["github", "linear"], -1)).toEqual([]);
+  });
+
+  it("ranks a 1-missing bundle ahead of a 2-missing bundle (fewest-missing wins)", () => {
+    // Install github + slack. Relevant partials (by seeded bundles):
+    //   devops-incident: have=[github,slack], missing=[pagerduty] — 1 missing
+    //   product-release: have=[github,slack], missing=[linear]    — 1 missing
+    //   growth-stack:    have=[slack],        missing=[hubspot,ga] — 2 missing
+    //   support-ops:     have=[slack],        missing=[zendesk,hubspot] — 2 missing
+    //   pr-review:       have=[github],       missing=[linear]    — 1 missing
+    // Top 3 must all be 1-missing entries.
+    const top = topPartialBundles(["github", "slack"], 3);
+    expect(top.length).toBe(3);
+    for (const t of top) {
+      expect(t.missing.length).toBe(1);
+    }
+  });
+
+  it("tie-breaks fewest-missing by most-momentum (have.length desc)", () => {
+    // All three tied at missing=1, so have-length descending wins:
+    //   devops-incident have=2, product-release have=2, pr-review have=1.
+    // pr-review (have=1) must land AFTER the two have=2 bundles.
+    const top = topPartialBundles(["github", "slack"], 3);
+    const prReviewIndex = top.findIndex((t) => t.bundle.id === "pr-review");
+    const devopsIndex = top.findIndex((t) => t.bundle.id === "devops-incident");
+    const releaseIndex = top.findIndex((t) => t.bundle.id === "product-release");
+    expect(prReviewIndex).toBeGreaterThan(devopsIndex);
+    expect(prReviewIndex).toBeGreaterThan(releaseIndex);
+  });
+
+  it("caps the result at the requested limit", () => {
+    const top = topPartialBundles(["github", "slack", "hubspot"], 2);
+    expect(top.length).toBeLessThanOrEqual(2);
+  });
+
+  it("never includes a fully-ready bundle (those land in matchBundles.ready)", () => {
+    // github+linear fully satisfies pr-review → it must not appear here.
+    const top = topPartialBundles(["github", "linear"], 10);
+    expect(top.find((t) => t.bundle.id === "pr-review")).toBeUndefined();
   });
 });

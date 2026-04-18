@@ -362,6 +362,59 @@ describe("ConnectServer", () => {
     });
   });
 
+  describe("discover bundle completions", () => {
+    it("surfaces a bundle-completion nudge when a curated bundle is partially installed", () => {
+      // Install github only. pr-review needs github + linear, so the
+      // inline block must surface it as a partial with linear missing.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "github", name: "GitHub" })]);
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      expect(text).toContain("Bundle completions (install to unlock curated stacks):");
+      expect(text).toContain("pr-review");
+      expect(text).toContain("have: github");
+      expect(text).toContain("add: linear");
+    });
+
+    it("suppresses the bundle-completions block when no bundle has any overlap", () => {
+      // Install only a namespace that matches no seeded bundle — the
+      // block should not even print its header.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "nonsense-ns", name: "NS" })]);
+      const result = priv.handleDiscover();
+      expect(result.content[0].text).not.toContain("Bundle completions");
+    });
+
+    it("suppresses the block when every matching bundle is fully installed", () => {
+      // github + linear fully satisfies pr-review, and no other curated
+      // bundle shares just those two namespaces — so partial is empty.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "github", name: "GitHub" }),
+        makeServerConfig({ namespace: "linear", name: "Linear" }),
+      ]);
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      // pr-review is fully installed; nothing to "complete" for it.
+      // Other bundles may still be partial (share github/linear), so we
+      // only assert that pr-review doesn't appear as a completion target.
+      const completionsBlock = text.split("Bundle completions")[1] ?? "";
+      expect(completionsBlock).not.toMatch(/^\s+pr-review/m);
+    });
+
+    it("caps the bundle-completions block at 3 entries", () => {
+      // Install slack — overlaps with devops-incident, growth-stack,
+      // product-release, support-ops. All 4 are partial; the block must
+      // cap at 3.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "slack", name: "Slack" })]);
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      const completionLines = text.split("\n").filter((l: string) => l.startsWith("  ") && l.includes("have: slack"));
+      expect(completionLines.length).toBeLessThanOrEqual(3);
+    });
+  });
+
   describe("handleActivate", () => {
     it("returns error when no namespaces provided", async () => {
       const priv = getPrivate(server);

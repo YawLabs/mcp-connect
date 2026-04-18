@@ -13,7 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { request } from "undici";
 import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
-import { CURATED_BUNDLES, bundleActivateHint, matchBundles } from "./bundles.js";
+import { CURATED_BUNDLES, bundleActivateHint, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine } from "./cli-shadows.js";
 import { type ComplianceGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
 import { type Profile, loadEffectiveProfile, profileAllows } from "./config-loader.js";
@@ -1398,6 +1398,21 @@ export class ConnectServer {
         const o = top[i];
         const suffix = i === 0 ? " (use mcp_connect_dispatch to disambiguate)" : "";
         lines.push(`  ${o.bareName} — available in: ${o.namespaces.join(", ")}${suffix}`);
+      }
+    }
+
+    // Bundle completions — inline install nudge for curated stacks where
+    // the user already has ≥1 member installed. Top 3 by fewest-missing-
+    // first (cheapest to complete), ties broken by most-momentum then id.
+    // Suppressed when every bundle is either fully installed or entirely
+    // absent. Same data source as mcp_connect_bundles action="match" but
+    // surfaced here so the model can act without the extra round-trip.
+    const allInstalled = this.config.servers.map((s) => s.namespace);
+    const bundleGaps = topPartialBundles(allInstalled, 3);
+    if (bundleGaps.length > 0) {
+      lines.push("\nBundle completions (install to unlock curated stacks):");
+      for (const { bundle, have, missing } of bundleGaps) {
+        lines.push(`  ${bundle.id} — have: ${have.join(", ")}; add: ${missing.join(", ")}`);
       }
     }
 

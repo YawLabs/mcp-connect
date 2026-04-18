@@ -107,3 +107,24 @@ export function matchBundles(installedNamespaces: Iterable<string>): BundleMatch
 export function bundleActivateHint(bundle: CuratedBundle): string {
   return `mcp_connect_activate({ namespaces: ${JSON.stringify(bundle.namespaces)} })`;
 }
+
+/**
+ * Rank partial-match bundles for an inline "complete this stack" nudge.
+ * Primary sort: fewest missing namespaces first (the cheapest install to
+ * unlock a curated bundle). Tie-break: more already-installed namespaces
+ * first (most momentum), then bundle id alphabetical for stability.
+ *
+ * Returns at most `limit` bundles. Empty array if nothing matches.
+ */
+export function topPartialBundles(installedNamespaces: Iterable<string>, limit: number): BundleMatchResult["partial"] {
+  if (limit <= 0) return [];
+  const { partial } = matchBundles(installedNamespaces);
+  return partial
+    .slice()
+    .sort((a, b) => {
+      if (a.missing.length !== b.missing.length) return a.missing.length - b.missing.length;
+      if (a.have.length !== b.have.length) return b.have.length - a.have.length;
+      return a.bundle.id.localeCompare(b.bundle.id);
+    })
+    .slice(0, limit);
+}
