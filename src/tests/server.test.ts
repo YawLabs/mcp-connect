@@ -1313,3 +1313,108 @@ describe("handleInstall", () => {
     expect(result.content[0].text).toContain('mcp_connect_activate({ server: "gh" })');
   }, 10_000);
 });
+
+describe("prewarmDormantServers", () => {
+  let server: ConnectServer;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server = new ConnectServer("https://mcp.hosting", "test-token");
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+  });
+
+  it("activates dormant servers, persists toolCache, and disconnects", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "gh-id", namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ id: "slack-id", namespace: "slack", name: "Slack" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]),
+    );
+
+    await priv.prewarmDormantServers();
+
+    // Both servers were connected once and disconnected once.
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(2);
+    // No live connections held after prewarm.
+    expect(priv.connections.size).toBe(0);
+    // toolCache populated for both so getDeferredServers() can surface them.
+    expect(priv.toolCache.get("gh")).toEqual([{ name: "gh_tool", description: undefined }]);
+    expect(priv.toolCache.get("slack")).toEqual([{ name: "slack_tool", description: undefined }]);
+  });
+
+  it("skips servers that already have a persisted toolCache", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({
+          id: "gh-id",
+          namespace: "gh",
+          name: "GitHub",
+          toolCache: [{ name: "list_issues", description: "List issues" }],
+        }),
+        makeServerConfig({ id: "slack-id", namespace: "slack", name: "Slack" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) =>
+      makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]),
+    );
+
+    await priv.prewarmDormantServers();
+
+    // Only slack (no toolCache) got activated; gh was skipped.
+    expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(connectToUpstream).mock.calls[0][0].namespace).toBe("slack");
+  });
+
+  it("is a no-op when every server already has a toolCache", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({
+          id: "gh-id",
+          namespace: "gh",
+          name: "GitHub",
+          toolCache: [{ name: "list_issues" }],
+        }),
+      ],
+    };
+
+    await priv.prewarmDormantServers();
+
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+    expect(vi.mocked(disconnectFromUpstream)).not.toHaveBeenCalled();
+  });
+
+  it("survives individual activation failures without aborting the batch", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ id: "broken-id", namespace: "broken", name: "Broken" }),
+        makeServerConfig({ id: "ok-id", namespace: "ok", name: "Ok" }),
+      ],
+    };
+    vi.mocked(connectToUpstream).mockImplementation(async (cfg: UpstreamServerConfig) => {
+      if (cfg.namespace === "broken") throw new Error("spawn ENOENT");
+      return makeConnection(cfg.namespace, [`${cfg.namespace}_tool`]);
+    });
+
+    await priv.prewarmDormantServers();
+
+    // "ok" still populated its cache even though "broken" threw.
+    expect(priv.toolCache.get("ok")).toEqual([{ name: "ok_tool", description: undefined }]);
+    expect(priv.toolCache.get("broken")).toBeUndefined();
+    expect(priv.connections.size).toBe(0);
+  });
+});

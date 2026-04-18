@@ -426,10 +426,68 @@ export class ConnectServer {
 
     this.startPolling();
 
+    // Dormant servers (isActive but no persisted toolCache yet) are
+    // invisible in tools/list because getDeferredServers() filters on
+    // toolCache presence. That breaks the "I toggled it on in the
+    // dashboard and it disappeared" user experience. Pre-warm each one
+    // in the background: activate → reportTools persists the tool set
+    // → disconnect so we're not holding 9 upstream processes idle.
+    // Fire-and-forget so this doesn't gate transport readiness.
+    this.prewarmDormantServers().catch((err: Error) => log("warn", "Pre-warm failed", { error: err?.message }));
+
     log("info", "mcph started", {
       apiUrl: this.apiUrl,
       servers: this.config?.servers.length ?? 0,
     });
+  }
+
+  // Populate toolCache for any isActive-but-never-activated server so
+  // Claude's tools/list shows the full toggled set on first run.
+  // Subsequent sessions read the persisted toolCache from config and
+  // skip this path entirely, so it's a one-time cost per server.
+  private async prewarmDormantServers(): Promise<void> {
+    const dormant = this.getProfiledActiveServers().filter((s) => !s.toolCache || s.toolCache.length === 0);
+    if (dormant.length === 0) return;
+
+    log("info", "Pre-warming dormant servers", {
+      count: dormant.length,
+      namespaces: dormant.map((s) => s.namespace),
+    });
+
+    const CONCURRENCY = 3;
+    let anyPopulated = false;
+    for (let i = 0; i < dormant.length; i += CONCURRENCY) {
+      const batch = dormant.slice(i, i + CONCURRENCY);
+      await Promise.all(
+        batch.map(async (server) => {
+          try {
+            const result = await this.activateOne(server.namespace);
+            if (!result.ok) return;
+            // Immediately disconnect — toolCache is already in
+            // this.toolCache and reportTools persisted it upstream,
+            // so getDeferredServers() surfaces the server without
+            // us holding the upstream process alive.
+            const conn = this.connections.get(server.namespace);
+            if (conn) {
+              await disconnectFromUpstream(conn).catch(() => {});
+              this.connections.delete(server.namespace);
+              this.idleCallCounts.delete(server.namespace);
+            }
+            anyPopulated = true;
+          } catch (err) {
+            log("warn", "Pre-warm of server failed", {
+              namespace: server.namespace,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }),
+      );
+    }
+
+    if (anyPopulated) {
+      this.rebuildRoutes();
+      await this.notifyAllListsChanged();
+    }
   }
 
   // One-shot nudge: if an MCPH.md guide was loaded at startup but the
