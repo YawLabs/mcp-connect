@@ -21,6 +21,7 @@ import { ConfigError, fetchConfig } from "./config.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
 import { type ExecStepInput, RefError, resolveArgs, stepBindingKey, validateExecRequest } from "./exec-engine.js";
+import { closestNames } from "./fuzzy.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
 import {
   ACTIVATION_FAILURE_TTL_MS,
@@ -1505,10 +1506,29 @@ export class ConnectServer {
       };
     }
 
-    const serverConfig = this.config?.servers.find((s) => s.namespace === namespace && s.isActive);
-    if (!serverConfig) {
-      return { ok: false, isChanged: false, message: `"${namespace}" not found or disabled.` };
+    const anyMatch = this.config?.servers.find((s) => s.namespace === namespace);
+    if (!anyMatch) {
+      // Split "not found" from "disabled" so the caller knows whether to
+      // (a) fix a typo / install the server or (b) flip the toggle at
+      // mcp.hosting. Fuzzy suggestions only when the input is a clear
+      // near-miss — noise-free by construction (closestNames returns []
+      // otherwise).
+      const allNamespaces = this.config?.servers.map((s) => s.namespace) ?? [];
+      const suggestions = closestNames(namespace, allNamespaces, 3);
+      const hint =
+        suggestions.length > 0
+          ? ` Did you mean: ${suggestions.join(", ")}?`
+          : " Use mcp_connect_discover to see installed servers.";
+      return { ok: false, isChanged: false, message: `"${namespace}" is not installed.${hint}` };
     }
+    if (!anyMatch.isActive) {
+      return {
+        ok: false,
+        isChanged: false,
+        message: `"${namespace}" is installed but disabled. Enable it at https://mcp.hosting to activate.`,
+      };
+    }
+    const serverConfig = anyMatch;
 
     if (!profileAllows(this.profile, namespace)) {
       return {

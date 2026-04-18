@@ -428,7 +428,37 @@ describe("ConnectServer", () => {
       priv.config = makeConfig([]);
       const result = await priv.handleActivate(["unknown"]);
       expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("not found or disabled");
+      expect(result.content[0].text).toContain("not installed");
+      // No lookalikes in an empty config — fall back to discover nudge.
+      expect(result.content[0].text).toContain("mcp_connect_discover");
+    });
+
+    it("surfaces a 'Did you mean?' when the namespace is a near-miss of an installed one", async () => {
+      // User typed "githu" when "github" is installed — one-edit typo.
+      // closestNames is intentionally quiet on wild misses, so this also
+      // proves we emit the suggestion only when signal is high.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "github", name: "GitHub" }),
+        makeServerConfig({ namespace: "linear", name: "Linear" }),
+      ]);
+      const result = await priv.handleActivate(["githu"]);
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      expect(text).toContain('"githu" is not installed');
+      expect(text).toContain("Did you mean: github");
+    });
+
+    it("distinguishes an installed-but-disabled server from an unknown one", async () => {
+      // Disabled-in-dashboard case gets its own message so the model
+      // doesn't tell the user to install something they already have.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false })]);
+      const result = await priv.handleActivate(["gh"]);
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      expect(text).toContain("installed but disabled");
+      expect(text).toContain("https://mcp.hosting");
     });
 
     it("skips already-active servers", async () => {
