@@ -34,6 +34,8 @@ import {
   resolveInstallPath,
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
+import { userConfigDir } from "./paths.js";
+import { STATE_FILENAME, loadState } from "./persistence.js";
 
 export interface DoctorOptions {
   cwd?: string;
@@ -115,6 +117,11 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   print(`  source: ${config.apiBaseSource}`);
   print("");
 
+  // Persisted cross-session state — ~/.mcph/state.json. Shows whether
+  // persistence is disabled by env, and otherwise reports the file path
+  // + how fresh the snapshot is + how much signal it carries.
+  await renderStateSection({ home, env, print });
+
   // Probe every supported client/scope combo on the current OS.
   const clients = probeClients({ home, os, cwd });
   print("INSTALLED CLIENTS (probed config files)");
@@ -192,6 +199,51 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   }
 
   return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
+}
+
+// Prints the STATE section. Broken out so the control flow in
+// runDoctor stays linear — this is already the third file-reading
+// section (config, client probes, history scan).
+async function renderStateSection(opts: {
+  home: string;
+  env: NodeJS.ProcessEnv;
+  print: (s?: string) => void;
+}): Promise<void> {
+  const { home, env, print } = opts;
+  const raw = env.MCPH_DISABLE_PERSISTENCE;
+  const disabled = raw !== undefined && raw !== "" && (raw === "1" || raw.toLowerCase() === "true");
+  print("STATE");
+  if (disabled) {
+    print("  status: disabled via MCPH_DISABLE_PERSISTENCE");
+    print("");
+    return;
+  }
+  const filePath = join(userConfigDir(home), STATE_FILENAME);
+  print(`  path:   ${filePath}`);
+  const persisted = await loadState(filePath);
+  if (persisted.savedAt === 0) {
+    print("  (no persisted state yet — will be created on the first tool call)");
+  } else {
+    print(`  last saved:           ${formatRelativeAge(Date.now() - persisted.savedAt)} ago`);
+    print(`  learning entries:     ${Object.keys(persisted.learning).length}`);
+    print(`  pack history entries: ${persisted.packHistory.length}`);
+  }
+  print("");
+}
+
+// Compact relative age for STATE output. We'd rather show "3m" than a
+// raw millisecond count; finer granularity isn't useful when the file
+// is only written after a 1s debounce.
+export function formatRelativeAge(ms: number): string {
+  const clamped = Math.max(0, ms);
+  const s = Math.floor(clamped / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
 }
 
 function schemaSuffix(f: LoadedConfigFile): string {

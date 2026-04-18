@@ -7,8 +7,9 @@ function writeMcphConfig(root: string, filename: string, obj: unknown): void {
   writeFileSync(join(root, ".mcph", filename), JSON.stringify(obj));
 }
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
+import { formatRelativeAge, runDoctor, scanShellHistoryForShadows } from "../doctor-cmd.js";
 import { ENTRY_NAME } from "../install-targets.js";
+import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 
 let synthHome: string;
 let synthCwd: string;
@@ -235,5 +236,99 @@ describe("runDoctor — surfaces config-loader warnings", () => {
     // Token resolved (env), but the warning about committed-file token still surfaces.
     expect(cap.text()).toMatch(/should not appear in a project-shared file/);
     expect(r.exitCode).toBe(2);
+  });
+});
+
+describe("runDoctor — STATE section", () => {
+  it("shows 'no persisted state yet' when state.json doesn't exist", async () => {
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+    });
+    const txt = cap.text();
+    expect(txt).toMatch(/STATE\n/);
+    expect(txt).toMatch(/no persisted state yet/);
+  });
+
+  it("reports counts and last-saved age when state.json exists", async () => {
+    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".mcph", STATE_FILENAME),
+      JSON.stringify({
+        version: STATE_SCHEMA_VERSION,
+        savedAt: Date.now() - 5 * 60 * 1000, // 5 minutes ago
+        learning: {
+          gh: { dispatched: 4, succeeded: 3, lastUsedAt: Date.now() },
+          linear: { dispatched: 2, succeeded: 2, lastUsedAt: Date.now() },
+        },
+        packHistory: [
+          { namespace: "gh", toolName: "listPrs", at: Date.now() - 1000 },
+          { namespace: "gh", toolName: "addComment", at: Date.now() - 500 },
+        ],
+      }),
+    );
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+    });
+    const txt = cap.text();
+    expect(txt).toMatch(/STATE/);
+    expect(txt).toMatch(/learning entries: +2/);
+    expect(txt).toMatch(/pack history entries: +2/);
+    expect(txt).toMatch(/last saved: +5m ago/);
+  });
+
+  it("shows 'disabled via MCPH_DISABLE_PERSISTENCE' and skips the file read", async () => {
+    // Seed a state file so we can verify doctor doesn't read its contents.
+    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".mcph", STATE_FILENAME),
+      JSON.stringify({ version: STATE_SCHEMA_VERSION, savedAt: 1, learning: {}, packHistory: [] }),
+    );
+    const cap = captureOut();
+    await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa", MCPH_DISABLE_PERSISTENCE: "1" },
+      os: "linux",
+      out: cap.out,
+      skipRegistryCheck: true,
+    });
+    const txt = cap.text();
+    expect(txt).toMatch(/disabled via MCPH_DISABLE_PERSISTENCE/);
+    expect(txt).not.toMatch(/learning entries/);
+    expect(txt).not.toMatch(/last saved/);
+  });
+});
+
+describe("formatRelativeAge", () => {
+  it("renders seconds under a minute", () => {
+    expect(formatRelativeAge(0)).toBe("0s");
+    expect(formatRelativeAge(45_000)).toBe("45s");
+  });
+  it("renders minutes under an hour", () => {
+    expect(formatRelativeAge(60_000)).toBe("1m");
+    expect(formatRelativeAge(45 * 60_000)).toBe("45m");
+  });
+  it("renders hours under a day", () => {
+    expect(formatRelativeAge(60 * 60_000)).toBe("1h");
+    expect(formatRelativeAge(23 * 60 * 60_000)).toBe("23h");
+  });
+  it("renders days for anything older", () => {
+    expect(formatRelativeAge(24 * 60 * 60_000)).toBe("1d");
+    expect(formatRelativeAge(5 * 24 * 60 * 60_000)).toBe("5d");
+  });
+  it("clamps negative input to 0s", () => {
+    expect(formatRelativeAge(-1000)).toBe("0s");
   });
 });

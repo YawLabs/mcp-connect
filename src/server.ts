@@ -89,6 +89,18 @@ function resolvePollIntervalMs(): number {
   return seconds * 1000;
 }
 
+// Opt-out for cross-session persistence. Set MCPH_DISABLE_PERSISTENCE=1
+// (or "true") to keep learning + pack-history scoped to the current
+// process — nothing is loaded at start, nothing is written on shutdown.
+// Intended for users running mcph in ephemeral/shared environments
+// (CI runners, containers, on-call relief boxes) where a stale state
+// file would lie about recent usage patterns.
+export function isPersistenceDisabled(): boolean {
+  const raw = process.env.MCPH_DISABLE_PERSISTENCE;
+  if (raw === undefined || raw === "") return false;
+  return raw === "1" || raw.toLowerCase() === "true";
+}
+
 function resolveNamespaces(args: Record<string, unknown>): string[] {
   if (Array.isArray(args.servers) && args.servers.length > 0) {
     return args.servers as string[];
@@ -393,16 +405,24 @@ export class ConnectServer {
     // before anything else so subsequent record* writes land on top of
     // the restored signal rather than replacing it. loadState() never
     // throws — missing/corrupt files yield an empty snapshot.
-    const persisted = await loadState();
-    if (Object.keys(persisted.learning).length > 0 || persisted.packHistory.length > 0) {
-      this.learning.loadSnapshot(persisted.learning);
-      this.packDetector.loadSnapshot(persisted.packHistory);
-      log("info", "Restored mcph state", {
-        learningEntries: Object.keys(persisted.learning).length,
-        packHistoryEntries: persisted.packHistory.length,
-      });
+    //
+    // MCPH_DISABLE_PERSISTENCE=1 keeps `persistenceReady` false, which
+    // silently no-ops both the debounced scheduleStateSave() and the
+    // shutdown flush — the whole pathway disappears in one toggle.
+    if (isPersistenceDisabled()) {
+      log("info", "Cross-session persistence disabled via MCPH_DISABLE_PERSISTENCE");
+    } else {
+      const persisted = await loadState();
+      if (Object.keys(persisted.learning).length > 0 || persisted.packHistory.length > 0) {
+        this.learning.loadSnapshot(persisted.learning);
+        this.packDetector.loadSnapshot(persisted.packHistory);
+        log("info", "Restored mcph state", {
+          learningEntries: Object.keys(persisted.learning).length,
+          packHistoryEntries: persisted.packHistory.length,
+        });
+      }
+      this.persistenceReady = true;
     }
-    this.persistenceReady = true;
 
     // Load the effective profile (allow/deny lists from .mcph/config.*
     // files). Walks up from cwd for a project-local .mcph/ dir and also
