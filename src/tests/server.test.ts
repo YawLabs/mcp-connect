@@ -228,6 +228,52 @@ describe("ConnectServer", () => {
       const result = priv.handleDiscover();
       expect(result.content[0].text).toContain("ERROR (disconnected, will auto-reconnect on use)");
     });
+
+    it("surfaces the marketplace URL hint when the user has a sparse config", () => {
+      // Threshold is 5 installed servers; 2 is well below. Hint should
+      // point to the publicly-browsable catalog at /explore — there is
+      // no JSON API for the catalog, so this is an URL pointer, not a
+      // programmatic surface.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ namespace: "slack", name: "Slack" }),
+      ]);
+
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      expect(text).toContain("https://mcp.hosting/explore");
+      expect(text).toContain("within 60s");
+    });
+
+    it("omits the marketplace hint once the user has plenty of servers", () => {
+      // Five or more installed servers is a power-user config — the hint
+      // would just be noise. Verify the URL pointer is absent.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ namespace: "slack", name: "Slack" }),
+        makeServerConfig({ namespace: "pg", name: "Postgres" }),
+        makeServerConfig({ namespace: "s3", name: "S3" }),
+        makeServerConfig({ namespace: "redis", name: "Redis" }),
+      ]);
+
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      expect(text).not.toContain("https://mcp.hosting/explore");
+    });
+
+    it("includes the marketplace pointer in the empty-state message", () => {
+      // A fresh user with zero servers sees the empty-state branch —
+      // that message also needs the catalog link so they can get started.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([]);
+
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      expect(text).toContain("No servers installed");
+      expect(text).toContain("https://mcp.hosting/explore");
+    });
   });
 
   describe("handleActivate", () => {

@@ -980,6 +980,12 @@ export class ConnectServer {
   private static readonly AUTO_ACTIVATE_MIN_SCORE = 1.0;
   private static readonly AUTO_ACTIVATE_MARGIN = 1.3;
 
+  // Below this installed-server count, discover() appends a one-line
+  // marketplace pointer so sparse-config users see where to add more.
+  // At or above the threshold we stay silent — power users already know
+  // the score, and the line would just be chat noise.
+  private static readonly MARKETPLACE_HINT_THRESHOLD = 5;
+
   private handleDiscover(context?: string): { content: Array<{ type: string; text: string }> } {
     return this.buildDiscoverOutput(context, /* alreadyWarmed */ false);
   }
@@ -1058,7 +1064,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: "No servers installed. Add servers at mcp.hosting to get started.",
+            text: "No servers installed. Browse the mcph catalog at https://mcp.hosting/explore — add any server from there to your mcph account and it will appear here within 60s.",
           },
         ],
       };
@@ -1222,6 +1228,18 @@ export class ConnectServer {
         ? "Use mcp_connect_dispatch(intent) to load the best server in one step, or mcp_connect_activate to pick explicitly."
         : "Use mcp_connect_activate to load a server's tools by namespace.",
     );
+
+    // Marketplace hint — steer sparse-config users to the catalog without
+    // nagging power users. Threshold counts installed servers (active +
+    // inactive) in the user's config; anyone under the cutoff gets a
+    // one-line pointer at https://mcp.hosting/explore. No backend API is
+    // hit — the catalog is a human-browsable SPA, so this is a URL hint,
+    // not a full meta-tool.
+    if (this.config.servers.length < ConnectServer.MARKETPLACE_HINT_THRESHOLD) {
+      lines.push(
+        "Browse the mcph catalog at https://mcp.hosting/explore — add any server from there to your mcph account and it will appear here within 60s.",
+      );
+    }
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
