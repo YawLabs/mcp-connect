@@ -52,6 +52,28 @@ describe("parseServersArgs", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("Usage: mcph servers");
   });
+
+  it("accepts a positional namespace filter", () => {
+    const r = parseServersArgs(["github"]);
+    expect(r).toEqual({ ok: true, options: { json: false, filter: "github" } });
+  });
+
+  it("accepts filter combined with --json in any order", () => {
+    expect(parseServersArgs(["git", "--json"])).toEqual({
+      ok: true,
+      options: { json: true, filter: "git" },
+    });
+    expect(parseServersArgs(["--json", "git"])).toEqual({
+      ok: true,
+      options: { json: true, filter: "git" },
+    });
+  });
+
+  it("rejects a second positional arg", () => {
+    const r = parseServersArgs(["git", "hub"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('extra argument "hub"');
+  });
 });
 
 describe("runServersCommand", () => {
@@ -246,5 +268,70 @@ describe("runServersCommand", () => {
     });
     // grade column shows "-" when complianceGrade is undefined
     expect(io.out.join("\n")).toMatch(/-\s+\?$/m);
+  });
+
+  it("filters by substring on namespace (case-insensitive)", async () => {
+    const cfg: ConnectConfig = {
+      configVersion: "v1",
+      servers: [
+        makeServer({ namespace: "github", name: "GitHub" }),
+        makeServer({ namespace: "gitlab", name: "GitLab" }),
+        makeServer({ namespace: "slack", name: "Slack" }),
+      ],
+    };
+    const io = captureIO();
+    const r = await runServersCommand({
+      home,
+      env: {},
+      filter: "GIT",
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => cfg,
+    });
+    expect(r.exitCode).toBe(0);
+    const combined = io.out.join("\n");
+    expect(combined).toContain("github");
+    expect(combined).toContain("gitlab");
+    expect(combined).not.toContain("slack");
+    // Summary reflects filter result, not the full server list.
+    expect(combined).toContain("2 servers");
+  });
+
+  it("filter also applies to --json output", async () => {
+    const cfg: ConnectConfig = {
+      configVersion: "v1",
+      servers: [makeServer({ namespace: "github" }), makeServer({ namespace: "slack" })],
+    };
+    const io = captureIO();
+    await runServersCommand({
+      home,
+      env: {},
+      filter: "git",
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => cfg,
+    });
+    const parsed = JSON.parse(io.out.join("\n"));
+    expect(parsed.servers).toHaveLength(1);
+    expect(parsed.servers[0].namespace).toBe("github");
+  });
+
+  it("prints a no-match message when filter matches nothing", async () => {
+    const cfg: ConnectConfig = {
+      configVersion: "v1",
+      servers: [makeServer({ namespace: "github" })],
+    };
+    const io = captureIO();
+    const r = await runServersCommand({
+      home,
+      env: {},
+      filter: "stripe",
+      out: io.push,
+      err: io.pushErr,
+      fetcher: async () => cfg,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.out.join("\n")).toContain('No servers match "stripe"');
   });
 });

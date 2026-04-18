@@ -70,10 +70,40 @@ Or [edit the JSON by hand](#manual-install) if you'd rather.
 ### Diagnose problems — `mcph doctor`
 
 ```bash
-npx -y @yawlabs/mcph doctor
+npx -y @yawlabs/mcph doctor          # human-readable report
+npx -y @yawlabs/mcph doctor --json   # machine-readable snapshot for pipelines
 ```
 
-Prints the loaded config files, your token's source + fingerprint (last 4 chars), the API base URL, and which MCP clients on this machine have an `mcp.hosting` entry. Exits `0` healthy / `1` no token / `2` warnings (e.g. world-readable token file). Paste the full output into a support ticket and we can usually pinpoint the issue from that alone.
+Prints the loaded config files, your token's source + fingerprint (last 4 chars), the API base URL, installed clients, env overrides, persisted learning state, flaky-namespace reliability rollup, shell-history "shadow" hits (CLIs you run that an MCP server could replace), and an upgrade check against the npm registry. Exits `0` healthy / `1` no token / `2` warnings (e.g. world-readable token file). Paste the text output into a support ticket; the `--json` blob is the same data as a structured snapshot, so dashboards and CI scripts can `jq` instead of parsing the text layout.
+
+### Other CLI subcommands
+
+```bash
+mcph servers [<namespace-filter>] [--json]    # list servers; optional substring filter on namespace
+mcph bundles [list|match] [--json]    # browse curated multi-server bundles (PR review, DevOps incident, etc.)
+mcph reset-learning                   # clear cross-session learning history (~/.mcph/state.json)
+mcph completion <bash|zsh|fish|powershell>   # print shell completion script
+mcph compliance <target> [--publish]  # run the compliance suite against an MCP server
+mcph --version                        # print version
+```
+
+Every CLI that reads state has a `--json` mode for pipeline use. `mcph servers` hits the backend; `mcph bundles list` and `mcph completion` are fully static (no network, no token). `mcph bundles match` partitions the curated set against your enabled servers so you see the same ready-to-activate vs. partially-installed view the LLM-facing `mcp_connect_bundles` meta-tool produces.
+
+To wire up shell completion:
+
+```bash
+# bash
+mcph completion bash > ~/.local/share/bash-completion/completions/mcph
+
+# zsh (must be on $fpath, then rebuild compinit)
+mcph completion zsh > "${fpath[1]}/_mcph"
+
+# fish
+mcph completion fish > ~/.config/fish/completions/mcph.fish
+
+# powershell
+mcph completion powershell >> $PROFILE
+```
 
 ### Getting your token
 

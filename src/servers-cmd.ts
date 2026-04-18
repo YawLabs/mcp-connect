@@ -26,6 +26,12 @@ export interface ServersCommandOptions {
   cwd?: string;
   /** Emit JSON instead of a human-readable table. */
   json?: boolean;
+  /**
+   * Case-insensitive substring filter on namespace. When set, only servers
+   * whose namespace contains this string are rendered. `mcph servers git`
+   * matches both `github` and `gitlab`. Missing ⇒ no filter (show all).
+   */
+  filter?: string;
   /** Override for tests; defaults to process.stdout.write. */
   out?: (s: string) => void;
   /** Override for tests; defaults to process.stderr.write. */
@@ -42,6 +48,7 @@ export interface ServersCommandResult {
 
 export interface ParsedServersArgs {
   json: boolean;
+  filter?: string;
 }
 
 // Split out so index.ts can validate `mcph servers <typo>` early and
@@ -50,23 +57,30 @@ export function parseServersArgs(
   argv: string[],
 ): { ok: true; options: ParsedServersArgs } | { ok: false; error: string } {
   let json = false;
+  let filter: string | undefined;
   for (const a of argv) {
     if (a === "--json") {
       json = true;
     } else if (a === "--help" || a === "-h") {
       return { ok: false, error: SERVERS_USAGE };
-    } else {
+    } else if (a.startsWith("-")) {
       return { ok: false, error: `mcph servers: unknown argument "${a}"\n\n${SERVERS_USAGE}` };
+    } else if (filter === undefined) {
+      filter = a;
+    } else {
+      return { ok: false, error: `mcph servers: unexpected extra argument "${a}"\n\n${SERVERS_USAGE}` };
     }
   }
-  return { ok: true, options: { json } };
+  return { ok: true, options: { json, ...(filter !== undefined ? { filter } : {}) } };
 }
 
-export const SERVERS_USAGE = `Usage: mcph servers [--json]
+export const SERVERS_USAGE = `Usage: mcph servers [<namespace-filter>] [--json]
 
   List the servers configured in your mcp.hosting dashboard.
 
-  --json   Emit machine-readable JSON instead of a table.`;
+  <namespace-filter>   Case-insensitive substring filter on namespace (e.g.,
+                       \`mcph servers git\` matches github + gitlab).
+  --json               Emit machine-readable JSON instead of a table.`;
 
 export async function runServersCommand(opts: ServersCommandOptions = {}): Promise<ServersCommandResult> {
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
@@ -115,12 +129,29 @@ export async function runServersCommand(opts: ServersCommandOptions = {}): Promi
     return { exitCode: 2, lines };
   }
 
+  // Apply the namespace filter (case-insensitive substring match on
+  // namespace) to both JSON and table output so the two surfaces agree.
+  // Filter applied AFTER the fetch so a filter that matches nothing
+  // prints an explanatory "no matches" message instead of looking like
+  // the account has no servers.
+  const filtered = opts.filter
+    ? {
+        ...backend,
+        servers: backend.servers.filter((s) => s.namespace.toLowerCase().includes(opts.filter!.toLowerCase())),
+      }
+    : backend;
+
   if (opts.json) {
-    print(JSON.stringify(backend, null, 2));
+    print(JSON.stringify(filtered, null, 2));
     return { exitCode: 0, lines };
   }
 
-  renderTable(backend, print);
+  if (opts.filter && filtered.servers.length === 0) {
+    print(`No servers match "${opts.filter}". Run \`mcph servers\` to see the full list.`);
+    return { exitCode: 0, lines };
+  }
+
+  renderTable(filtered, print);
   return { exitCode: 0, lines };
 }
 
