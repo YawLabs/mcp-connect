@@ -2317,9 +2317,13 @@ export class ConnectServer {
       const secondsAgo = Math.max(0, Math.round((Date.now() - pack.lastSeenAt) / 1000));
       lines.push(`  {${nsList}} — seen ${pack.frequency} times (last ${secondsAgo}s ago)`);
     }
-    lines.push(
-      "\nTo load a pack in one step next time, call mcp_connect_dispatch with an intent that spans these servers.",
-    );
+    // Nudge toward the concrete action. `mcp_connect_activate` is the
+    // loading meta-tool — `dispatch` is for invoking tools on servers
+    // that are already active, so pointing at dispatch here used to
+    // send the model the wrong direction.
+    const top = ranked[0];
+    const nsJson = JSON.stringify(top.namespaces);
+    lines.push(`\nTo load the top pack in one step, call \`mcp_connect_activate\` with namespaces=${nsJson}.`);
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }

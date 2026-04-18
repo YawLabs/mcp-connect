@@ -965,6 +965,13 @@ describe("ConnectServer", () => {
       expect(text).toContain("gh");
       expect(text).toContain("linear");
       expect(text).toContain("seen 2 times");
+      // Must nudge toward `activate` (the loading meta-tool) and embed
+      // the concrete namespaces from the top pack so the caller can run
+      // it verbatim. `dispatch` is for invoking tools on already-active
+      // servers — suggesting it here mis-directs the model.
+      expect(text).toContain("mcp_connect_activate");
+      expect(text).not.toContain("mcp_connect_dispatch");
+      expect(text).toMatch(/namespaces=\[.*"gh".*"linear".*\]|namespaces=\[.*"linear".*"gh".*\]/);
     });
   });
 
