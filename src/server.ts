@@ -161,6 +161,12 @@ export class ConnectServer {
   // action" log once per namespace, not every single idle tick.
   private adaptiveSkipLogged = new Set<string>();
   private toolCache = new Map<string, Array<{ name: string; description?: string }>>();
+  // Per-namespace tool filters set by mcp_connect_activate({ tools: [...] }).
+  // When a namespace has an entry, only those BARE tool names surface in
+  // tools/list; routing tables stay complete so mcp_connect_dispatch can
+  // still reach unlisted tools. Cleared on activate-without-tools of the
+  // same namespace, on deactivate, and on config reconcile.
+  private toolFilters = new Map<string, Set<string>>();
   private profile: Profile | null = null;
   // Loaded MCPH.md guides (user-global + project-local). Null until
   // start() has run the loader; fail-open if either file is missing,
@@ -304,7 +310,7 @@ export class ConnectServer {
 
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: buildToolList(this.connections, this.getDeferredServers()),
+      tools: buildToolList(this.connections, this.getDeferredServers(), this.toolFilters),
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -597,7 +603,16 @@ export class ConnectServer {
     }
     if (name === META_TOOLS.activate.name) {
       const namespaces = resolveNamespaces(args);
-      const result = await this.handleActivate(namespaces, progress);
+      // `tools` is only meaningful when activating a single server —
+      // a flat list of bare names has no unambiguous mapping to a
+      // multi-server call. For any other shape the filter is reset
+      // (see handleActivate), matching the "activate without tools
+      // clears the filter" rule.
+      const toolsFilter =
+        namespaces.length === 1 && Array.isArray(args.tools) && args.tools.every((t) => typeof t === "string")
+          ? (args.tools as string[])
+          : undefined;
+      const result = await this.handleActivate(namespaces, progress, toolsFilter);
       for (const ns of namespaces) {
         recordConnectEvent({
           namespace: ns,
@@ -1152,10 +1167,17 @@ export class ConnectServer {
     let totalContextTokens = 0;
     for (const server of sorted) {
       const connection = this.connections.get(server.namespace);
+      // Apply per-tool filter to the advertised count so discover matches
+      // what tools/list actually surfaces. Raw upstream tool count is
+      // still shown as the denominator so the model sees what's hidden.
+      const filter = this.toolFilters.get(server.namespace);
+      const total = connection?.tools.length ?? 0;
+      const exposed = connection ? (filter ? connection.tools.filter((t) => filter.has(t.name)).length : total) : 0;
+      const filterSuffix = connection && filter ? ` (filtered: ${exposed} of ${total})` : "";
       const status = connection
         ? connection.status === "error"
           ? "ERROR (disconnected, will auto-reconnect on use)"
-          : `loaded (${connection.tools.length} tools)`
+          : `loaded (${exposed} tools)${filterSuffix}`
         : "ready";
 
       const score = scores.get(server.namespace);
@@ -1164,12 +1186,17 @@ export class ConnectServer {
       // Token-cost estimate — live for connected servers, tool-cache-
       // padded for dormant ones. Guides the LLM's activate/skip choice
       // when context budget is tight. Suppressed when we have nothing
-      // to measure (no cache, no connection yet).
+      // to measure (no cache, no connection yet). When a filter is
+      // active the cost reflects the EXPOSED tools only — hidden tools
+      // don't surface in tools/list and therefore don't spend context.
       let costLabel = "";
       if (connection && connection.tools.length > 0) {
-        const sample = estimateFromConnectedTools(connection.tools);
-        totalContextTokens += sample.tokens;
-        costLabel = ` — ${formatCostLabel(sample)}`;
+        const visible = filter ? connection.tools.filter((t) => filter.has(t.name)) : connection.tools;
+        if (visible.length > 0) {
+          const sample = estimateFromConnectedTools(visible);
+          totalContextTokens += sample.tokens;
+          costLabel = ` — ${formatCostLabel(sample)}`;
+        }
       } else {
         const cached = this.toolCache.get(server.namespace) ?? server.toolCache;
         if (cached && cached.length > 0) {
@@ -1214,7 +1241,13 @@ export class ConnectServer {
     }
 
     const activeCount = this.connections.size;
-    const totalTools = Array.from(this.connections.values()).reduce((sum, c) => sum + c.tools.length, 0);
+    // Count EXPOSED tools (post-filter) so the summary matches what
+    // tools/list actually hands the client — hidden tools don't spend
+    // context even though the upstream exposes them.
+    const totalTools = Array.from(this.connections.values()).reduce((sum, c) => {
+      const f = this.toolFilters.get(c.config.namespace);
+      return sum + (f ? c.tools.filter((t) => f.has(t.name)).length : c.tools.length);
+    }, 0);
     const tokenSummary = totalContextTokens > 0 ? ` (~${totalContextTokens.toLocaleString()} tokens)` : "";
     lines.push(`\n${activeCount} loaded in this session, ${totalTools} tools in context${tokenSummary}.`);
     lines.push(
@@ -1474,6 +1507,7 @@ export class ConnectServer {
   private async handleActivate(
     namespaces: string[],
     progress?: ProgressReporter,
+    toolsFilter?: string[],
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     if (namespaces.length === 0) {
       return {
@@ -1482,6 +1516,41 @@ export class ConnectServer {
         ],
         isError: true,
       };
+    }
+
+    // Apply per-tool filter rules BEFORE activation so the first
+    // list-changed notification reflects the intended filtered surface.
+    //   - tools provided + exactly 1 namespace → replace filter for it.
+    //   - tools not provided (or multi-server activate) → clear the
+    //     filter for each touched namespace so re-activating without
+    //     `tools` always exposes the full set.
+    let filtersChanged = false;
+    if (toolsFilter && namespaces.length === 1) {
+      const ns = namespaces[0];
+      // Dedup + drop empty strings. If the resulting set is empty we
+      // clear the filter rather than hide EVERYTHING — an empty array
+      // is almost certainly the model meaning "no filter".
+      const names = new Set(toolsFilter.map((t) => t.trim()).filter((t) => t.length > 0));
+      const prev = this.toolFilters.get(ns);
+      if (names.size === 0) {
+        if (prev) {
+          this.toolFilters.delete(ns);
+          filtersChanged = true;
+        }
+      } else {
+        // Compare sets by size + membership to decide whether the
+        // tools/list surface actually moved. Prevents a spurious
+        // list_changed notification when the same filter is re-sent.
+        const same = prev && prev.size === names.size && [...names].every((n) => prev.has(n));
+        if (!same) {
+          this.toolFilters.set(ns, names);
+          filtersChanged = true;
+        }
+      }
+    } else {
+      for (const ns of namespaces) {
+        if (this.toolFilters.delete(ns)) filtersChanged = true;
+      }
     }
 
     const results: string[] = [];
@@ -1509,6 +1578,11 @@ export class ConnectServer {
 
     if (anyChanged) {
       this.rebuildRoutes();
+      await this.notifyAllListsChanged();
+    } else if (filtersChanged) {
+      // Filter changed on an already-connected server — routes are
+      // unchanged (dispatch still reaches hidden tools) but the
+      // tools/list surface moved, so notify the client to re-list.
       await this.notifyAllListsChanged();
     }
 
@@ -1674,6 +1748,7 @@ export class ConnectServer {
       this.connections.delete(namespace);
       this.idleCallCounts.delete(namespace);
       this.adaptiveSkipLogged.delete(namespace);
+      this.toolFilters.delete(namespace);
       anyChanged = true;
       results.push(`Unloaded "${namespace}". Tools removed from context.`);
     }
@@ -1741,6 +1816,7 @@ export class ConnectServer {
         this.connections.delete(ns);
         this.idleCallCounts.delete(ns);
         this.adaptiveSkipLogged.delete(ns);
+        this.toolFilters.delete(ns);
       }
     }
 
@@ -1818,6 +1894,7 @@ export class ConnectServer {
         this.connections.delete(namespace);
         this.idleCallCounts.delete(namespace);
         this.adaptiveSkipLogged.delete(namespace);
+        this.toolFilters.delete(namespace);
         changed = true;
         continue;
       }
@@ -1835,6 +1912,7 @@ export class ConnectServer {
         this.connections.delete(namespace);
         this.idleCallCounts.delete(namespace);
         this.adaptiveSkipLogged.delete(namespace);
+        this.toolFilters.delete(namespace);
         changed = true;
       }
     }

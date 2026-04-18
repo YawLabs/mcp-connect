@@ -25,7 +25,7 @@
 - [x] **Resource proxying** — Proxy MCP resources from upstream servers, not just tools
 - [x] **Prompt proxying** — Proxy MCP prompts from upstream servers
 - [x] **Cross-session persistence** — Learning + pack history restored across mcph restarts from `~/.mcph/state.json`; opt-out via `MCPH_DISABLE_PERSISTENCE`
-- [ ] **Per-tool load** — Load specific tools from a server instead of all tools (category-based subsets)
+- [x] **Per-tool load** — Load specific tools from a server instead of all tools (category-based subsets). `mcp_connect_activate({ server, tools: [...] })` hides every unlisted tool from `tools/list`; hidden tools stay reachable via `mcp_connect_dispatch` (routes are unfiltered). Re-activate without `tools` to clear the filter; discover surfaces a `(filtered: K of N)` indicator.
 - [x] **Signature-on-demand meta-tool** — A `mcp_connect_read_tool` that returns a single tool's schema + docs without loading its server. For servers with many tools where the model only needs 1–2, loads 1–2 schemas instead of the whole catalog. One step beyond per-tool load: no load event at all. (Pattern borrowed from Bifrost Code Mode's `list → read → execute` surface.)
 - [ ] **Orchestration sandbox** — A `mcp_connect_exec` meta-tool that runs a short sandboxed script (Starlark or a narrow JS subset) making multiple upstream tool calls in one round-trip. Saves both prompt-token replay and response round-trips when the model wants to do `a = call_x(); b = call_y(a); return b`. Sandboxed: no imports, no network, no fs — only tool calls + basic control flow.
 - [ ] **Marketplace integration** — Browse and one-click add servers from the mcp.hosting marketplace directly through discover()

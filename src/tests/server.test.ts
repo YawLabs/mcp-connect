@@ -37,6 +37,7 @@ vi.mock("../analytics.js", () => ({
   shutdownAnalytics: vi.fn().mockResolvedValue(undefined),
 }));
 
+import { buildToolList } from "../proxy.js";
 import { ConnectServer } from "../server.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { connectToUpstream, disconnectFromUpstream } from "../upstream.js";
@@ -313,6 +314,123 @@ describe("ConnectServer", () => {
       const result = await priv.handleActivate(["gh", "slack"]);
       expect(result.isError).toBeUndefined();
       expect(priv.connections.size).toBe(2);
+    });
+  });
+
+  describe("per-tool load", () => {
+    // `tools/list` is constructed by buildToolList(this.connections, …,
+    // this.toolFilters). These tests drive handleToolCall so the full
+    // activate → filter-apply → routes rebuild → list path is exercised
+    // end-to-end, matching what a real MCP client would see.
+    function listedUpstreamToolNames(priv: any): string[] {
+      return buildToolList(priv.connections, priv.getDeferredServers(), priv.toolFilters)
+        .map((t: { name: string }) => t.name)
+        .filter((n: string) => !n.startsWith("mcp_connect_"));
+    }
+
+    it("activate without tools exposes every upstream tool (baseline)", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar", "baz"]));
+
+      const result = await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+      expect(result.isError).toBeUndefined();
+      expect(priv.toolFilters.has("gh")).toBe(false);
+      expect(listedUpstreamToolNames(priv).sort()).toEqual(["gh_bar", "gh_baz", "gh_foo"]);
+    });
+
+    it("activate with tools: ['foo'] only surfaces that one tool (others hidden)", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar", "baz"]));
+
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo"] });
+
+      // Filter is persisted on the server for subsequent tools/list calls.
+      expect(priv.toolFilters.get("gh")).toEqual(new Set(["foo"]));
+      expect(listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
+    });
+
+    it("re-activating the same namespace without tools clears the filter", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      // Both calls go through handleToolCall → activateOne; the second
+      // hits the "already connected" early return but still has to
+      // clear the filter so the list re-expands.
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar"]));
+
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo"] });
+      expect(listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
+
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh" });
+      expect(priv.toolFilters.has("gh")).toBe(false);
+      expect(listedUpstreamToolNames(priv).sort()).toEqual(["gh_bar", "gh_foo"]);
+    });
+
+    it("dispatch path still routes filtered-out tools (raw upstream reachable)", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      const conn = makeConnection("gh", ["foo", "bar"]);
+      // The filtered-out tool `bar` must still reach the upstream.
+      conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "bar called" }] });
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(conn);
+
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo"] });
+
+      // `gh_bar` is absent from tools/list …
+      expect(listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
+      // … but the route map still carries it (dispatch path unchanged).
+      expect(priv.toolRoutes.has("gh_bar")).toBe(true);
+
+      // And handleToolCall on the hidden tool dispatches to the upstream.
+      const callResult = await priv.handleToolCall("gh_bar", {});
+      expect(callResult.isError).toBeUndefined();
+      expect(callResult.content[0].text).toBe("bar called");
+      expect(conn.client.callTool).toHaveBeenCalledWith({ name: "bar", arguments: {} });
+    });
+
+    it("discover() surfaces a 'filtered: K of N' indicator for filtered servers", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar", "baz"]));
+
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo"] });
+
+      const text = priv.handleDiscover().content[0].text;
+      // Count reflects the filtered (exposed) tool set …
+      expect(text).toContain("loaded (1 tools)");
+      // … and the indicator shows how many are hidden behind the filter.
+      expect(text).toContain("filtered: 1 of 3");
+      // Session summary counts only exposed tools, not the full upstream.
+      expect(text).toContain("1 loaded in this session, 1 tools in context");
+    });
+
+    it("multi-server activate ignores tools and clears any existing filter", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh" }),
+        makeServerConfig({ namespace: "slack", name: "Slack" }),
+      ]);
+      // Pre-seed a filter on gh from an earlier single-server activate.
+      priv.connections.set("gh", makeConnection("gh", ["foo", "bar"]));
+      priv.toolFilters.set("gh", new Set(["foo"]));
+      // Re-activate multi-server → filter must clear.
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("slack", ["send"]));
+
+      await priv.handleToolCall("mcp_connect_activate", { servers: ["gh", "slack"], tools: ["foo"] });
+
+      expect(priv.toolFilters.has("gh")).toBe(false);
+      expect(priv.toolFilters.has("slack")).toBe(false);
+      expect(listedUpstreamToolNames(priv).sort()).toEqual(["gh_bar", "gh_foo", "slack_send"]);
+    });
+
+    it("deactivating a server also drops its filter", async () => {
+      const priv = getPrivate(server);
+      priv.connections.set("gh", makeConnection("gh", ["foo", "bar"]));
+      priv.toolFilters.set("gh", new Set(["foo"]));
+
+      await priv.handleDeactivate(["gh"]);
+      expect(priv.toolFilters.has("gh")).toBe(false);
     });
   });
 

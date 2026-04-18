@@ -24,7 +24,7 @@ export const META_TOOLS = {
   activate: {
     name: "mcp_connect_activate",
     description:
-      'Load one or more installed MCP servers\' tools into the current session by namespace. Each server adds its tools to your context, so load only what the current task needs. When you move on, unload servers you\'re done with via `mcp_connect_deactivate` before loading new ones. Tools are prefixed by namespace (e.g., "gh_create_issue"). Pass "server" for one or "servers" for multiple.',
+      'Load one or more installed MCP servers\' tools into the current session by namespace. Each server adds its tools to your context, so load only what the current task needs. When you move on, unload servers you\'re done with via `mcp_connect_deactivate` before loading new ones. Tools are prefixed by namespace (e.g., "gh_create_issue"). Pass "server" for one or "servers" for multiple. Optionally pass `tools: [...]` to expose only those tools by name — the rest stay proxyable via mcp_connect_dispatch.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -36,6 +36,12 @@ export const META_TOOLS = {
           type: "array",
           items: { type: "string" },
           description: 'Multiple server namespaces to activate at once (e.g., ["gh", "slack"])',
+        },
+        tools: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional per-server tool filter (bare tool names, not namespace-prefixed). When set, only the listed tools surface in tools/list — others stay reachable via mcp_connect_dispatch. Omit (or re-activate without it) to expose the full tool set. Only applied when activating a single server.",
         },
       },
     },

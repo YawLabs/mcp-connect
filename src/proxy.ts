@@ -61,6 +61,12 @@ export interface BuiltinResource {
 export function buildToolList(
   activeConnections: Map<string, UpstreamConnection>,
   inactiveWithCache: UpstreamServerConfig[] = [],
+  // Optional per-namespace filter: when a namespace has an entry, only
+  // tools whose BARE name is in the set are advertised via tools/list.
+  // Routes (buildToolRoutes) stay complete regardless, so the filter
+  // only affects surfacing — mcp_connect_dispatch can still reach
+  // hidden tools by name.
+  toolFilters?: Map<string, Set<string>>,
 ): Array<{
   name: string;
   description?: string;
@@ -88,7 +94,9 @@ export function buildToolList(
 
   // Active upstream tools
   for (const conn of activeConnections.values()) {
+    const filter = toolFilters?.get(conn.config.namespace);
     for (const tool of conn.tools) {
+      if (filter && !filter.has(tool.name)) continue;
       tools.push({
         name: tool.namespacedName,
         description: tool.description,
