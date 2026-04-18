@@ -22,6 +22,13 @@ import type { DetectedPack } from "./pack-detect.js";
 const MAX_PEERS = 3;
 const MIN_SUCCESS_TO_SHOW = 1;
 
+// Thresholds for the dormant-reliability hint. Match the cross-session
+// reliability block in handleHealth so a server either shows up in both
+// places or neither — otherwise the two views disagree about what's
+// flaky and the LLM ends up with a confused picture.
+const RELIABILITY_MIN_OBSERVATIONS = 3;
+const RELIABILITY_THRESHOLD = 0.8;
+
 // Flatten detected packs into a per-namespace peer list. Each pack is
 // a set of 2-3 namespaces that co-occurred in ≥2 bursts; the map
 // entry for namespace N lists every OTHER namespace that appeared in
@@ -72,4 +79,17 @@ export function formatUsageHint(usage: NamespaceUsage | undefined, coUsedWith: s
   }
   if (parts.length === 0) return null;
   return `usage: ${parts.join("; ")}`;
+}
+
+// Dormant-reliability warning rendered inline under the server card in
+// discover(). Returns null unless the persisted learning for this
+// namespace shows ≥3 dispatches AND <80% success. Caller is responsible
+// for suppressing this when the server is currently loaded (the live
+// health warning takes precedence there — see formatHealthWarning).
+export function formatReliabilityWarning(usage: NamespaceUsage | undefined): string | null {
+  if (!usage || usage.dispatched < RELIABILITY_MIN_OBSERVATIONS) return null;
+  const rate = usage.succeeded / usage.dispatched;
+  if (rate >= RELIABILITY_THRESHOLD) return null;
+  const pct = Math.round(rate * 100);
+  return `reliability: ${pct}% success across ${usage.dispatched} past calls`;
 }

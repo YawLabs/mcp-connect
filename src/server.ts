@@ -63,7 +63,7 @@ import { initTestRunner, startTestRunner, stopTestRunner } from "./test-runner.j
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
 import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./upstream.js";
-import { buildCoUsageMap, formatUsageHint } from "./usage-hints.js";
+import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint } from "./usage-hints.js";
 import { ensureUv } from "./uv-bootstrap.js";
 
 declare const __VERSION__: string;
@@ -1368,6 +1368,15 @@ export class ConnectServer {
       // over per-call error rate (see formatHealthWarning).
       const warning = formatHealthWarning(connection?.health, this.activationFailures.get(server.namespace));
       if (warning) lines.push(`    ${warning}`);
+
+      // Dormant-reliability warning — pulls from persisted learning when
+      // this server isn't currently loaded, so the LLM sees flaky history
+      // before it tries to activate. Suppressed for loaded servers (the
+      // live health warning above already covers them with fresher data).
+      if (!connection) {
+        const reliability = formatReliabilityWarning(this.learning.get(server.namespace));
+        if (reliability) lines.push(`    ${reliability}`);
+      }
 
       // Inline usage hint — cumulative success count + who tends to
       // get loaded alongside this server. Counts come from state.json

@@ -1109,6 +1109,29 @@ describe("ConnectServer", () => {
       const result = await priv.handleToolCall("mcp_connect_discover", {});
       expect(result.content[0].text).not.toContain("usage:");
     });
+
+    it("surfaces a reliability warning for a flaky dormant server", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.learning.loadSnapshot({
+        gh: { dispatched: 10, succeeded: 3, lastUsedAt: Date.now() },
+      });
+
+      const result = await priv.handleToolCall("mcp_connect_discover", {});
+      expect(result.content[0].text).toContain("reliability: 30% success across 10 past calls");
+    });
+
+    it("suppresses the reliability warning for currently-loaded servers", async () => {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      priv.learning.loadSnapshot({
+        gh: { dispatched: 10, succeeded: 3, lastUsedAt: Date.now() },
+      });
+      priv.connections.set("gh", makeConnection("gh"));
+
+      const result = await priv.handleToolCall("mcp_connect_discover", {});
+      expect(result.content[0].text).not.toContain("reliability:");
+    });
   });
 
   describe("discover recurring-packs block", () => {

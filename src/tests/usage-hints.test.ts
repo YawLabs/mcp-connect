@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { NamespaceUsage } from "../learning.js";
 import type { DetectedPack } from "../pack-detect.js";
-import { buildCoUsageMap, formatUsageHint } from "../usage-hints.js";
+import { buildCoUsageMap, formatReliabilityWarning, formatUsageHint } from "../usage-hints.js";
 
 function usage(succeeded: number, dispatched?: number): NamespaceUsage {
   return { succeeded, dispatched: dispatched ?? succeeded, lastUsedAt: 1 };
@@ -66,5 +66,32 @@ describe("formatUsageHint", () => {
   it("does not show +N more when exactly at the cap", () => {
     const hint = formatUsageHint(undefined, ["a", "b", "c"]);
     expect(hint).toBe('usage: often loaded with "a", "b", "c"');
+  });
+});
+
+describe("formatReliabilityWarning", () => {
+  it("returns null when no usage data exists", () => {
+    expect(formatReliabilityWarning(undefined)).toBeNull();
+  });
+
+  it("returns null when dispatched count is below the minimum", () => {
+    expect(formatReliabilityWarning(usage(0, 2))).toBeNull();
+  });
+
+  it("returns null when success rate is at or above 80%", () => {
+    expect(formatReliabilityWarning(usage(4, 5))).toBeNull();
+    expect(formatReliabilityWarning(usage(5, 5))).toBeNull();
+  });
+
+  it("warns when success rate is below 80% with enough observations", () => {
+    expect(formatReliabilityWarning(usage(5, 10))).toBe("reliability: 50% success across 10 past calls");
+  });
+
+  it("warns on 0% success rate", () => {
+    expect(formatReliabilityWarning(usage(0, 4))).toBe("reliability: 0% success across 4 past calls");
+  });
+
+  it("rounds the success rate to a whole percent", () => {
+    expect(formatReliabilityWarning(usage(1, 3))).toBe("reliability: 33% success across 3 past calls");
   });
 });
