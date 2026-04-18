@@ -1,15 +1,15 @@
-// Lightweight session-scoped usage signal. Tracks how often each
-// namespace was picked by dispatch AND the tool call that followed
-// actually succeeded, then exposes a bounded boost factor so future
-// dispatches nudge toward servers that have been genuinely useful
-// in this session.
+// Lightweight usage signal. Tracks how often each namespace was picked
+// by dispatch AND the tool call that followed actually succeeded, then
+// exposes a bounded boost factor so future dispatches nudge toward
+// servers that have been genuinely useful.
 //
 // Deliberately conservative:
 //   - Never more than +10% score boost — relevance is the primary
 //     signal. Learning is a tiebreak, not a takeover.
 //   - Requires ≥3 successful observations before any boost at all.
-//   - In-memory only; no persistence across restarts. Cross-session
-//     learning needs backend coordination (tracked separately).
+//   - Snapshots persist to ~/.mcph/state.json across restarts
+//     (see persistence.ts); ConnectServer handles the load/save
+//     lifecycle via exportSnapshot/loadSnapshot.
 
 export const LEARNING_MIN_OBSERVATIONS = 3;
 export const LEARNING_MAX_BOOST = 1.1;
@@ -61,5 +61,26 @@ export class LearningStore {
   // the process lifetime and dies with it.
   reset(): void {
     this.usage.clear();
+  }
+
+  // Return a plain-object snapshot suitable for JSON persistence. Copy
+  // semantics — callers may serialize without guarding against later
+  // in-memory mutations.
+  exportSnapshot(): Record<string, NamespaceUsage> {
+    const out: Record<string, NamespaceUsage> = {};
+    for (const [ns, usage] of this.usage) {
+      out[ns] = { dispatched: usage.dispatched, succeeded: usage.succeeded, lastUsedAt: usage.lastUsedAt };
+    }
+    return out;
+  }
+
+  // Replace in-memory state with the given snapshot. Used on startup
+  // to restore persisted signal; silently overwrites anything already
+  // in the store, so callers should only invoke this before recording.
+  loadSnapshot(snapshot: Record<string, NamespaceUsage>): void {
+    this.usage.clear();
+    for (const [ns, usage] of Object.entries(snapshot)) {
+      this.usage.set(ns, { dispatched: usage.dispatched, succeeded: usage.succeeded, lastUsedAt: usage.lastUsedAt });
+    }
   }
 }

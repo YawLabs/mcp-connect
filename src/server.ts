@@ -30,6 +30,7 @@ import { LearningStore } from "./learning.js";
 import { log } from "./logger.js";
 import { META_TOOLS, META_TOOL_NAMES, buildInstallPayload } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
+import { loadState, saveState } from "./persistence.js";
 import { type ProgressReporter, createProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
@@ -222,6 +223,15 @@ export class ConnectServer {
   // poisoning other instances or re-importing the module.
   private serverCap = resolveServerCap();
 
+  // Cross-session persistence state (learning + pack history).
+  // `persistenceReady` gates the save path so unit tests — which
+  // never call start() — don't write to ~/.mcph/state.json. The
+  // debounced timer collapses bursts of record*/recordCall into a
+  // single write; flushed synchronously on shutdown.
+  private persistenceReady = false;
+  private stateSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly STATE_SAVE_DEBOUNCE_MS = 1000;
+
   constructor(
     private apiUrl: string,
     private token: string,
@@ -379,6 +389,21 @@ export class ConnectServer {
   }
 
   async start(): Promise<void> {
+    // Hydrate learning + pack-history state from ~/.mcph/state.json
+    // before anything else so subsequent record* writes land on top of
+    // the restored signal rather than replacing it. loadState() never
+    // throws — missing/corrupt files yield an empty snapshot.
+    const persisted = await loadState();
+    if (Object.keys(persisted.learning).length > 0 || persisted.packHistory.length > 0) {
+      this.learning.loadSnapshot(persisted.learning);
+      this.packDetector.loadSnapshot(persisted.packHistory);
+      log("info", "Restored mcph state", {
+        learningEntries: Object.keys(persisted.learning).length,
+        packHistoryEntries: persisted.packHistory.length,
+      });
+    }
+    this.persistenceReady = true;
+
     // Load the effective profile (allow/deny lists from .mcph/config.*
     // files). Walks up from cwd for a project-local .mcph/ dir and also
     // consults ~/.mcph/config.json (user-global). Local beats project
@@ -815,6 +840,7 @@ export class ConnectServer {
       // above so they never reach this point.
       if (!result.isError) {
         this.packDetector.recordCall(route.namespace, route.originalName, Date.now());
+        this.scheduleStateSave();
       }
       await this.trackUsageAndAutoDeactivate(route.namespace);
     }
@@ -1556,6 +1582,7 @@ export class ConnectServer {
       // here — we're grading the routing decision, not the tool call.
       this.learning.recordDispatch(winner.namespace);
       if (r.ok) this.learning.recordSuccess(winner.namespace);
+      this.scheduleStateSave();
     }
     // No trailing "Dispatch complete" progress — see handleActivate for
     // the client-side race this avoids.
@@ -2285,6 +2312,16 @@ export class ConnectServer {
       this.pollTimer = null;
     }
 
+    // Flush any pending state save before we stop accepting writes.
+    // Cancels the debounce timer so no stale snapshot writes after.
+    if (this.stateSaveTimer) {
+      clearTimeout(this.stateSaveTimer);
+      this.stateSaveTimer = null;
+    }
+    if (this.persistenceReady) {
+      await this.flushStateSave();
+    }
+
     stopTestRunner();
     await shutdownAnalytics();
 
@@ -2296,5 +2333,27 @@ export class ConnectServer {
     await this.server.close();
 
     log("info", "mcph shutdown complete");
+  }
+
+  // Debounced save trigger. Called after every learning/pack-detector
+  // write — the timer collapses bursts into one write so a busy session
+  // isn't writing the state file 10×/sec. Silently no-ops until start()
+  // has hydrated state, which keeps unit tests that skip start() from
+  // touching the user's ~/.mcph/state.json.
+  private scheduleStateSave(): void {
+    if (!this.persistenceReady) return;
+    if (this.stateSaveTimer) clearTimeout(this.stateSaveTimer);
+    this.stateSaveTimer = setTimeout(() => {
+      this.stateSaveTimer = null;
+      this.flushStateSave().catch(() => {});
+    }, ConnectServer.STATE_SAVE_DEBOUNCE_MS);
+    if (this.stateSaveTimer.unref) this.stateSaveTimer.unref();
+  }
+
+  private async flushStateSave(): Promise<void> {
+    await saveState({
+      learning: this.learning.exportSnapshot(),
+      packHistory: this.packDetector.exportSnapshot(),
+    });
   }
 }

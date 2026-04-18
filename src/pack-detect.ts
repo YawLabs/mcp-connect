@@ -1,10 +1,10 @@
-// Session-scoped chain detection. Watches tool-call sequences across
-// namespaces and surfaces recurring multi-server patterns as suggested
-// "packs" the LLM/user could dispatch in one step via mcp_connect_dispatch.
+// Chain detection. Watches tool-call sequences across namespaces and
+// surfaces recurring multi-server patterns as suggested "packs" the
+// LLM/user could dispatch in one step via mcp_connect_dispatch.
 //
 // Scope is intentionally small:
-//   - In-memory only; cleared on process exit. Cross-session packs need
-//     backend coordination and aren't free, so they're tracked separately.
+//   - Snapshots persist across restarts via exportSnapshot/loadSnapshot
+//     (see persistence.ts); ConnectServer owns the load/save timing.
 //   - Observation only. Detection never activates a server — we surface
 //     the suggestion and let the caller decide.
 //   - Short time window. A "chain" is a burst of calls across ≥2 distinct
@@ -144,5 +144,28 @@ export class PackDetector {
 
   reset(): void {
     this.history = [];
+  }
+
+  // Return a defensive copy of history for persistence. Each entry is a
+  // fresh object, safe to JSON.stringify without worrying about later
+  // mutations to the detector's internal array.
+  exportSnapshot(): PackCall[] {
+    return this.history.map((c) => ({ namespace: c.namespace, toolName: c.toolName, at: c.at }));
+  }
+
+  // Replace in-memory history with the given snapshot. Respects the
+  // configured maxHistory cap — if the snapshot exceeds it, the oldest
+  // entries are dropped, matching the cap behavior of recordCall.
+  loadSnapshot(snapshot: ReadonlyArray<PackCall>): void {
+    const clean: PackCall[] = [];
+    for (const c of snapshot) {
+      if (!c || !c.namespace || !c.toolName) continue;
+      clean.push({ namespace: c.namespace, toolName: c.toolName, at: c.at });
+    }
+    if (clean.length > this.maxHistory) {
+      this.history = clean.slice(clean.length - this.maxHistory);
+    } else {
+      this.history = clean;
+    }
   }
 }
