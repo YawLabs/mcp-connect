@@ -20,6 +20,7 @@ import { type Profile, loadEffectiveProfile, profileAllows } from "./config-load
 import { ConfigError, fetchConfig } from "./config.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
+import { formatRelativeAge } from "./doctor-cmd.js";
 import { type ExecStepInput, RefError, resolveArgs, stepBindingKey, validateExecRequest } from "./exec-engine.js";
 import { closestNames } from "./fuzzy.js";
 import { type LoadedGuides, loadGuides, renderGuide } from "./guide.js";
@@ -2600,26 +2601,57 @@ export class ConnectServer {
 
     if (this.connections.size === 0) {
       lines.push("No servers loaded in this session yet.");
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } else {
+      lines.push("Session health:\n");
+
+      for (const [namespace, conn] of this.connections) {
+        const h = conn.health;
+        const avgLatency = h.totalCalls > 0 ? Math.round(h.totalLatencyMs / h.totalCalls) : 0;
+        const errorRate = h.totalCalls > 0 ? Math.round((h.errorCount / h.totalCalls) * 100) : 0;
+        const idleCount = this.idleCallCounts.get(namespace) ?? 0;
+        const idleLimit = adaptiveThreshold(namespace, this.recentToolCalls, ConnectServer.IDLE_CALL_THRESHOLD);
+        const toolNames = conn.tools.map((t) => t.name).join(", ");
+
+        lines.push(`  ${namespace} [${conn.status}] (${conn.config.type})`);
+        lines.push(`    tools: ${conn.tools.length} — ${toolNames}`);
+        lines.push(`    calls: ${h.totalCalls}, errors: ${h.errorCount} (${errorRate}%)`);
+        lines.push(`    avg latency: ${avgLatency}ms`);
+        lines.push(`    idle: ${idleCount}/${idleLimit} until auto-unload`);
+        if (h.lastErrorMessage) {
+          lines.push(`    last error: ${h.lastErrorMessage} at ${h.lastErrorAt}`);
+        }
+      }
     }
 
-    lines.push("Session health:\n");
-
-    for (const [namespace, conn] of this.connections) {
-      const h = conn.health;
-      const avgLatency = h.totalCalls > 0 ? Math.round(h.totalLatencyMs / h.totalCalls) : 0;
-      const errorRate = h.totalCalls > 0 ? Math.round((h.errorCount / h.totalCalls) * 100) : 0;
-      const idleCount = this.idleCallCounts.get(namespace) ?? 0;
-      const idleLimit = adaptiveThreshold(namespace, this.recentToolCalls, ConnectServer.IDLE_CALL_THRESHOLD);
-      const toolNames = conn.tools.map((t) => t.name).join(", ");
-
-      lines.push(`  ${namespace} [${conn.status}] (${conn.config.type})`);
-      lines.push(`    tools: ${conn.tools.length} — ${toolNames}`);
-      lines.push(`    calls: ${h.totalCalls}, errors: ${h.errorCount} (${errorRate}%)`);
-      lines.push(`    avg latency: ${avgLatency}ms`);
-      lines.push(`    idle: ${idleCount}/${idleLimit} until auto-unload`);
-      if (h.lastErrorMessage) {
-        lines.push(`    last error: ${h.lastErrorMessage} at ${h.lastErrorAt}`);
+    // Cross-session reliability — flaky dormant servers pulled from
+    // persisted learning. The in-session block above already covers
+    // loaded namespaces with rich per-call telemetry; this surfaces
+    // history for servers we AREN'T currently talking to so the LLM /
+    // operator knows which ones have been unreliable before reloading
+    // them. Bar is deliberately high (≥3 calls, <80% success) so we
+    // don't shout about a one-off failure.
+    const now = Date.now();
+    const flaky = this.learning
+      .entries()
+      .filter(({ namespace, usage }) => {
+        if (this.connections.has(namespace)) return false;
+        if (usage.dispatched < 3) return false;
+        return usage.succeeded / usage.dispatched < 0.8;
+      })
+      .sort((a, b) => {
+        const aRate = a.usage.succeeded / a.usage.dispatched;
+        const bRate = b.usage.succeeded / b.usage.dispatched;
+        if (aRate !== bRate) return aRate - bRate;
+        if (a.usage.dispatched !== b.usage.dispatched) return b.usage.dispatched - a.usage.dispatched;
+        return a.namespace.localeCompare(b.namespace);
+      })
+      .slice(0, 5);
+    if (flaky.length > 0) {
+      lines.push("\nCross-session reliability (dormant, <80% success):");
+      for (const { namespace, usage } of flaky) {
+        const rate = Math.round((usage.succeeded / usage.dispatched) * 100);
+        const age = formatRelativeAge(now - usage.lastUsedAt);
+        lines.push(`  ${namespace} — ${usage.dispatched} calls, ${rate}% success, last used ${age} ago`);
       }
     }
 

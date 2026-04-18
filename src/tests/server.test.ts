@@ -984,6 +984,92 @@ describe("ConnectServer", () => {
       const result = priv.handleHealth();
       expect(result.content[0].text).toContain("last error: timeout at 2026-01-01T00:00:00Z");
     });
+
+    describe("cross-session reliability block", () => {
+      it("surfaces a flaky dormant namespace from persisted learning", () => {
+        const priv = getPrivate(server);
+        priv.learning.loadSnapshot({
+          flaky: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() - 60_000 },
+        });
+
+        const result = priv.handleHealth();
+        const text = result.content[0].text;
+        expect(text).toContain("Cross-session reliability (dormant, <80% success):");
+        expect(text).toContain("flaky — 10 calls, 50% success, last used");
+      });
+
+      it("skips namespaces currently loaded (in-session block covers them)", () => {
+        const priv = getPrivate(server);
+        const conn = makeConnection("gh");
+        conn.health = { totalCalls: 10, errorCount: 5, totalLatencyMs: 100 };
+        priv.connections.set("gh", conn);
+        priv.learning.loadSnapshot({
+          gh: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
+        });
+
+        const result = priv.handleHealth();
+        expect(result.content[0].text).not.toContain("Cross-session reliability");
+      });
+
+      it("skips namespaces with fewer than 3 dispatches", () => {
+        const priv = getPrivate(server);
+        priv.learning.loadSnapshot({
+          rare: { dispatched: 2, succeeded: 0, lastUsedAt: Date.now() },
+        });
+
+        const result = priv.handleHealth();
+        expect(result.content[0].text).not.toContain("Cross-session reliability");
+      });
+
+      it("skips namespaces at or above 80% success", () => {
+        const priv = getPrivate(server);
+        priv.learning.loadSnapshot({
+          solid: { dispatched: 10, succeeded: 9, lastUsedAt: Date.now() },
+          perfect: { dispatched: 5, succeeded: 5, lastUsedAt: Date.now() },
+        });
+
+        const result = priv.handleHealth();
+        expect(result.content[0].text).not.toContain("Cross-session reliability");
+      });
+
+      it("sorts worst success rate first, then highest dispatched, then alpha", () => {
+        const priv = getPrivate(server);
+        priv.learning.loadSnapshot({
+          zeta: { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() },
+          alpha: { dispatched: 20, succeeded: 10, lastUsedAt: Date.now() },
+          worst: { dispatched: 5, succeeded: 1, lastUsedAt: Date.now() },
+        });
+
+        const result = priv.handleHealth();
+        const text = result.content[0].text;
+        const worstIdx = text.indexOf("worst ");
+        const alphaIdx = text.indexOf("alpha ");
+        const zetaIdx = text.indexOf("zeta ");
+        expect(worstIdx).toBeGreaterThan(-1);
+        expect(worstIdx).toBeLessThan(alphaIdx);
+        expect(alphaIdx).toBeLessThan(zetaIdx);
+      });
+
+      it("caps the list at 5 entries", () => {
+        const priv = getPrivate(server);
+        const snapshot: Record<string, { dispatched: number; succeeded: number; lastUsedAt: number }> = {};
+        for (let i = 0; i < 8; i++) {
+          snapshot[`ns${i}`] = { dispatched: 10, succeeded: 5, lastUsedAt: Date.now() };
+        }
+        priv.learning.loadSnapshot(snapshot);
+
+        const result = priv.handleHealth();
+        const text = result.content[0].text;
+        const matches = text.match(/^ {2}ns\d+ — /gm) ?? [];
+        expect(matches).toHaveLength(5);
+      });
+
+      it("stays silent when no dormant namespace qualifies", () => {
+        const priv = getPrivate(server);
+        const result = priv.handleHealth();
+        expect(result.content[0].text).not.toContain("Cross-session reliability");
+      });
+    });
   });
 
   describe("discover usage hints", () => {

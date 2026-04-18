@@ -74,6 +74,20 @@ export class LearningStore {
     return out;
   }
 
+  // Iterate the current store as { namespace, usage } pairs. Used by
+  // observability paths (e.g., mcp_connect_health's cross-session
+  // reliability block) that need to walk every recorded namespace.
+  entries(): Array<{ namespace: string; usage: NamespaceUsage }> {
+    const out: Array<{ namespace: string; usage: NamespaceUsage }> = [];
+    for (const [ns, u] of this.usage) {
+      out.push({
+        namespace: ns,
+        usage: { dispatched: u.dispatched, succeeded: u.succeeded, lastUsedAt: u.lastUsedAt },
+      });
+    }
+    return out;
+  }
+
   // Replace in-memory state with the given snapshot. Used on startup
   // to restore persisted signal; silently overwrites anything already
   // in the store, so callers should only invoke this before recording.
