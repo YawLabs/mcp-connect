@@ -52,6 +52,7 @@ import { type RankableServer, rankServers, scoreRelevance } from "./relevance.js
 import { initRerank, rerank } from "./rerank.js";
 import { initRuntimeDetect, reportRuntimes } from "./runtime-detect.js";
 import { buildCandidates, shouldTiebreak, tiebreakViaSampling } from "./sampling-rank.js";
+import { type LoadedSlot, evaluateServerCap, resolveServerCap } from "./server-cap.js";
 import { initTestRunner, startTestRunner, stopTestRunner } from "./test-runner.js";
 import { initToolReport, reportTools } from "./tool-report.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "./types.js";
@@ -212,6 +213,13 @@ export class ConnectServer {
     const n = Number.parseInt(env, 10);
     return Number.isFinite(n) && n >= 1 ? n : 10;
   })();
+
+  // Concurrent-load ceiling. See server-cap.ts — checked in
+  // runActivateOne before a new upstream is spawned so we refuse at
+  // the door instead of over-inflating the LLM's context. Instance
+  // field (not static) so tests can override per-instance without
+  // poisoning other instances or re-importing the module.
+  private serverCap = resolveServerCap();
 
   constructor(
     private apiUrl: string,
@@ -1189,6 +1197,22 @@ export class ConnectServer {
         isChanged: false,
         message: `"${namespace}" is not allowed by the project profile at ${this.profile?.path}.`,
       };
+    }
+
+    // Concurrent-load cap. Connected servers count; error-state
+    // connections don't, because they aren't contributing tools to
+    // the LLM's context. We compute the slot list fresh here — it's
+    // cheap (Map iteration) and guaranteed to reflect state after
+    // any auto-unloads that fired between the check and this call.
+    const loadedSlots: LoadedSlot[] = [];
+    for (const [ns, conn] of this.connections) {
+      if (conn.status === "connected") {
+        loadedSlots.push({ namespace: ns, idleCount: this.idleCallCounts.get(ns) ?? 0 });
+      }
+    }
+    const capDecision = evaluateServerCap(namespace, loadedSlots, this.serverCap);
+    if (!capDecision.allow) {
+      return { ok: false, isChanged: false, message: capDecision.message ?? "Concurrent server cap reached." };
     }
 
     // Merge any session-elicited env over the server's configured env.

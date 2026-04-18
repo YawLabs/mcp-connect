@@ -555,6 +555,78 @@ describe("ConnectServer", () => {
     });
   });
 
+  describe("concurrent server cap", () => {
+    it("refuses a new activation when already at cap", async () => {
+      const priv = getPrivate(server);
+      priv.serverCap = 2;
+      priv.config = makeConfig([
+        makeServerConfig({ id: "1", namespace: "a" }),
+        makeServerConfig({ id: "2", namespace: "b" }),
+        makeServerConfig({ id: "3", namespace: "c" }),
+      ]);
+      priv.connections.set("a", makeConnection("a"));
+      priv.connections.set("b", makeConnection("b"));
+
+      const result = await priv.handleActivate(["c"]);
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Cannot load "c"');
+      expect(result.content[0].text).toContain("2-server concurrent cap");
+      // The blocked server must not have spawned an upstream.
+      expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
+      expect(priv.connections.has("c")).toBe(false);
+    });
+
+    it("allows reactivating an already-loaded namespace even at cap", async () => {
+      const priv = getPrivate(server);
+      priv.serverCap = 2;
+      priv.config = makeConfig([
+        makeServerConfig({ id: "1", namespace: "a" }),
+        makeServerConfig({ id: "2", namespace: "b" }),
+      ]);
+      priv.connections.set("a", makeConnection("a"));
+      priv.connections.set("b", makeConnection("b"));
+
+      const result = await priv.handleActivate(["a"]);
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain('"a" is already loaded');
+    });
+
+    it("ignores error-state connections when counting slots", async () => {
+      const priv = getPrivate(server);
+      priv.serverCap = 2;
+      priv.config = makeConfig([
+        makeServerConfig({ id: "1", namespace: "a" }),
+        makeServerConfig({ id: "2", namespace: "b" }),
+        makeServerConfig({ id: "3", namespace: "c" }),
+      ]);
+      priv.connections.set("a", makeConnection("a"));
+      // "b" is in error-state — it's not contributing tools, so it must
+      // NOT count toward the cap. Otherwise a one-time connection
+      // failure permanently burns a slot.
+      priv.connections.set("b", makeConnection("b", [], "error"));
+      const connC = makeConnection("c", ["t"]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(connC);
+
+      const result = await priv.handleActivate(["c"]);
+      expect(result.isError).toBeUndefined();
+      expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+    });
+
+    it("permits unlimited loads when cap is 0", async () => {
+      const priv = getPrivate(server);
+      priv.serverCap = 0;
+      priv.config = makeConfig([makeServerConfig({ id: "99", namespace: "big" })]);
+      // Pre-load 20 servers. Cap of 0 should not care.
+      for (let i = 0; i < 20; i++) {
+        priv.connections.set(`pre${i}`, makeConnection(`pre${i}`));
+      }
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("big", ["t"]));
+
+      const result = await priv.handleActivate(["big"]);
+      expect(result.isError).toBeUndefined();
+    });
+  });
+
   describe("handleReadTool", () => {
     it("rejects a missing server arg", async () => {
       const priv = getPrivate(server);
