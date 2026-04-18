@@ -5,13 +5,24 @@ import { runDoctor } from "./doctor-cmd.js";
 import { closestNames } from "./fuzzy.js";
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { log } from "./logger.js";
+import { runResetLearning } from "./reset-learning-cmd.js";
 import { ConnectServer } from "./server.js";
 
 // Known subcommands for fuzzy-match feedback on typos. Anything not in
 // this list and not a flag (leading `-`) falls through to "unknown
 // subcommand" before runServer, so `mcph instal` fails loud instead of
 // starting as an MCP server and opaquely erroring on the missing token.
-const KNOWN_SUBCOMMANDS = ["compliance", "install", "doctor", "help", "--help", "-h", "--version", "-V"] as const;
+const KNOWN_SUBCOMMANDS = [
+  "compliance",
+  "install",
+  "doctor",
+  "reset-learning",
+  "help",
+  "--help",
+  "-h",
+  "--version",
+  "-V",
+] as const;
 
 declare const __VERSION__: string;
 
@@ -31,10 +42,12 @@ if (subcommand === "compliance") {
   runInstall(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "doctor") {
   runDoctor().then((r) => process.exit(r.exitCode));
+} else if (subcommand === "reset-learning") {
+  runResetLearning().then((r) => process.exit(r.exitCode));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   const installBlock = `    ${INSTALL_USAGE.replace(/^Usage: /, "").replace(/\n/g, "\n    ")}`;
   process.stdout.write(
-    `\n  mcph — MCP server orchestrator for mcp.hosting\n\n  Usage:\n    mcph                              Run as MCP server (requires a token)\n    mcph install <client> [flags]     Auto-edit an MCP client's config to launch mcph\n    mcph doctor                       Print loaded config + detected clients (support diagnostic)\n    mcph compliance <target> [flags]  Run the compliance suite against an MCP server\n    mcph --version                    Print version\n\n  Install:\n${installBlock}\n\n  Compliance flags:\n    --publish   Publish the report to mcp.hosting and print the URL\n\n  Token resolution (highest first):\n    1. MCPH_TOKEN env var\n    2. <project>/.mcph/config.local.json  (machine-local override; gitignore)\n    3. ~/.mcph/config.json                (user-global default)\n\n  Token rotation: mcph reads its config at startup. Restart the MCP\n  client (or kill mcph; the client will respawn it) after editing.\n\n`,
+    `\n  mcph — MCP server orchestrator for mcp.hosting\n\n  Usage:\n    mcph                              Run as MCP server (requires a token)\n    mcph install <client> [flags]     Auto-edit an MCP client's config to launch mcph\n    mcph doctor                       Print loaded config + detected clients (support diagnostic)\n    mcph compliance <target> [flags]  Run the compliance suite against an MCP server\n    mcph reset-learning               Clear cross-session learning history (~/.mcph/state.json)\n    mcph --version                    Print version\n\n  Install:\n${installBlock}\n\n  Compliance flags:\n    --publish   Publish the report to mcp.hosting and print the URL\n\n  Token resolution (highest first):\n    1. MCPH_TOKEN env var\n    2. <project>/.mcph/config.local.json  (machine-local override; gitignore)\n    3. ~/.mcph/config.json                (user-global default)\n\n  Token rotation: mcph reads its config at startup. Restart the MCP\n  client (or kill mcph; the client will respawn it) after editing.\n\n`,
   );
   process.exit(0);
 } else if (subcommand === "--version" || subcommand === "-V") {
