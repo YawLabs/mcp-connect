@@ -2,9 +2,16 @@ import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadMcphConfig, tokenFingerprint } from "./config-loader.js";
 import { ConfigError } from "./config.js";
 import { runDoctor } from "./doctor-cmd.js";
+import { closestNames } from "./fuzzy.js";
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { log } from "./logger.js";
 import { ConnectServer } from "./server.js";
+
+// Known subcommands for fuzzy-match feedback on typos. Anything not in
+// this list and not a flag (leading `-`) falls through to "unknown
+// subcommand" before runServer, so `mcph instal` fails loud instead of
+// starting as an MCP server and opaquely erroring on the missing token.
+const KNOWN_SUBCOMMANDS = ["compliance", "install", "doctor", "help", "--help", "-h", "--version", "-V"] as const;
 
 declare const __VERSION__: string;
 
@@ -36,6 +43,20 @@ if (subcommand === "compliance") {
   // so guard with typeof and fall back to "dev".
   process.stdout.write(`mcph ${typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev"}\n`);
   process.exit(0);
+} else if (subcommand && !subcommand.startsWith("-")) {
+  // Bare positional first arg that isn't a known subcommand — almost
+  // always a typo. Surface a "did you mean?" instead of falling through
+  // to runServer, which would then fail opaquely on the missing token.
+  // Flags (anything with a leading `-`) still fall through so server
+  // startup can parse them (or ignore unknown ones) as it did before.
+  const visible = KNOWN_SUBCOMMANDS.filter((s) => !s.startsWith("-") && s !== "help");
+  const suggestions = closestNames(subcommand, visible, 3);
+  const hint =
+    suggestions.length > 0
+      ? ` Did you mean: ${suggestions.join(", ")}?`
+      : " Run `mcph --help` for the list of subcommands.";
+  process.stderr.write(`mcph: unknown subcommand "${subcommand}".${hint}\n`);
+  process.exit(2);
 } else {
   runServer();
 }
