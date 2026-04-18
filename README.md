@@ -65,6 +65,15 @@ Helpful flags:
 - `--force` / `--skip` — overwrite or leave an existing `mcp.hosting` entry. Without either, mcph prompts (TTY) or refuses (non-TTY).
 - `--no-mcph-config` — write only the client config; leave `~/.mcph/config.json` untouched.
 
+Or install into every detected client at once:
+
+```bash
+mcph install --list                       # read-only: detect clients + show install state per scope
+mcph install --all --token mcp_pat_…     # one-shot: install into every user-scope client on this machine
+```
+
+`--list` never writes (no token needed). `--all` installs into every client whose user-scope target is resolvable on this OS — Claude Desktop is skipped on Linux, VS Code is skipped unless `--project-dir` is given (it's workspace-only). Aggregate exit code is non-zero if any sub-install fails.
+
 Or [edit the JSON by hand](#manual-install) if you'd rather.
 
 ### Diagnose problems — `mcph doctor`

@@ -612,4 +612,192 @@ describe("runInstall — mutually exclusive flags", () => {
     expect(r.exitCode).toBe(2);
     expect(cap.stderr()).toMatch(/mutually exclusive/);
   });
+
+  it("--list + --all refused with exit 2", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      listOnly: true,
+      all: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.stderr()).toMatch(/mutually exclusive/);
+  });
+});
+
+describe("parseInstallArgs — --list / --all", () => {
+  it("accepts --list with no positional", () => {
+    const r = parseInstallArgs(["--list"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options.listOnly).toBe(true);
+      expect(r.options.clientId).toBeUndefined();
+    }
+  });
+
+  it("accepts --all with no positional", () => {
+    const r = parseInstallArgs(["--all"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options.all).toBe(true);
+      expect(r.options.clientId).toBeUndefined();
+    }
+  });
+
+  it("rejects --list combined with a client positional", () => {
+    const r = parseInstallArgs(["claude-code", "--list"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("--list does not take a client argument");
+  });
+
+  it("rejects --all combined with a client positional", () => {
+    const r = parseInstallArgs(["cursor", "--all"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("--all does not take a client argument");
+  });
+
+  it("accepts --all combined with --token", () => {
+    const r = parseInstallArgs(["--all", "--token", "mcp_pat_xyz"]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.options.all).toBe(true);
+      expect(r.options.token).toBe("mcp_pat_xyz");
+    }
+  });
+});
+
+describe("runInstall --list (read-only)", () => {
+  it("enumerates all clients on linux and shows `not installed` by default", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      listOnly: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toContain("CLIENT");
+    expect(out).toContain("SCOPE");
+    expect(out).toContain("STATUS");
+    // Claude Desktop is unavailable on linux.
+    expect(out).toMatch(/Claude Desktop\s+user\s+\(n\/a\)\s+unavailable/);
+    // Nothing seeded, so every other client reads "not installed".
+    expect(out).toContain("not installed");
+    expect(out).not.toContain("installed "); // "installed" word only appears in status heading/rows
+    expect(out).toContain("0/");
+  });
+
+  it("detects an installed mcp.hosting entry in ~/.claude.json", async () => {
+    // Seed Claude Code user-scope config with the entry.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx", args: ["-y", "@yawlabs/mcph"] } } }),
+      "utf8",
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      listOnly: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toMatch(/Claude Code\s+user\s+~[\\/].claude\.json\s+installed/);
+    // At least one scope is configured; headline reflects that.
+    expect(out).toMatch(/^\d+\/\d+ client scopes have mcp\.hosting configured on linux\./m);
+  });
+
+  it("reports `malformed` for unparseable client config", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), "{not valid json", "utf8");
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      listOnly: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stdout()).toMatch(/Claude Code\s+user\s+~[\\/].claude\.json\s+malformed/);
+  });
+
+  it("does not require a token", async () => {
+    // No token anywhere. --list should still work.
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      listOnly: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.stderr()).toBe("");
+  });
+});
+
+describe("runInstall --all", () => {
+  it("installs into every user-scope client on linux and writes ~/.mcph/config.json once", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      token: "mcp_pat_all",
+      all: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    // Claude Code user → ~/.claude.json exists.
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
+    // Cursor user → ~/.cursor/mcp.json exists.
+    expect(existsSync(join(synthHome, ".cursor", "mcp.json"))).toBe(true);
+    // Claude Desktop is unavailable on linux, so skipped — no claude_desktop_config.
+    // VS Code requires project-dir (user-scope unsupported); it's reported as skipped.
+    const out = cap.stdout();
+    expect(out).toContain("skip vscode");
+    expect(out).toMatch(/✓ \d+\/\d+ clients installed successfully\./);
+    // Token written to global mcph config exactly once.
+    const mcphCfg = JSON.parse(readFileSync(join(synthHome, ".mcph", "config.json"), "utf8"));
+    expect(mcphCfg.token).toBe("mcp_pat_all");
+  });
+
+  it("refuses with exit 1 when no clients are installable on the OS", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      // Synthetic OS value. Cast to bypass the TS guard since we're
+      // probing the runtime error path.
+      os: "plan9" as unknown as "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      token: "mcp_pat_abc",
+      all: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toContain("no installable clients");
+  });
+
+  it("returns exit 1 when at least one sub-install fails", async () => {
+    // Seed a malformed ~/.claude.json so Claude Code user-scope install
+    // refuses (exit 1); Cursor install still succeeds. Aggregate fails.
+    writeFileSync(join(synthHome, ".claude.json"), "{oops", "utf8");
+    const cap = captureIo();
+    const r = await runInstall({
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      token: "mcp_pat_x",
+      all: true,
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toMatch(/client install.*failed/);
+  });
 });

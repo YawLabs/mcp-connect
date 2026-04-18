@@ -2,6 +2,10 @@
 
 All notable changes to `@yawlabs/mcph` are documented here. This project uses [semantic versioning](https://semver.org) and a CI-gated release flow: pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which publishes to npm.
 
+## 0.44.0 — 2026-04-18
+
+- **`mcph install --list` + `mcph install --all`** — Two new modes on the install subcommand. `--list` is read-only: it enumerates every client/scope combo for the current OS and shows whether an `mcp.hosting` entry is already wired up, plus a path-per-row and a one-line summary (`N/M client scopes have mcp.hosting configured on linux`). No token, no network, no writes — just a diagnostic view that mirrors the `doctor` CLIENTS section but without the rest of doctor's noise. `--all` walks `INSTALL_TARGETS`, picks the default scope per client (user where supported, else the first non-project-dir scope, else skipped unless `--project-dir` is passed), and calls `runInstall` in a loop — so `--dry-run`, `--force`, `--skip`, and `--token` all propagate as expected. Status is aggregated into a single summary line, and the process exit code is non-zero if any sub-install failed so CI can still gate on one-shot onboarding. Works around the main drop-off during setup ("which client am I supposed to pick?") by offering both the answer (`--list`) and the sledgehammer (`--all`) from the same subcommand.
+
 ## 0.43.0 — 2026-04-18
 
 - **`mcph servers <namespace-filter>` — positional filter** — Passing a bare positional argument now filters the listing to servers whose namespace contains that substring (case-insensitive): `mcph servers git` matches both `github` and `gitlab`. Applies to both the text table and the `--json` output so the two surfaces agree. Summary line reflects the filtered count, and a filter that matches nothing prints an explanatory "No servers match …" instead of an empty table (which previously looked like an empty account).
