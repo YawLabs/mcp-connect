@@ -49,6 +49,40 @@ export interface DoctorOptions {
   skipRegistryCheck?: boolean;
   /** Test hook: return the latest-version string for @yawlabs/mcph. */
   registryFetch?: () => Promise<string | null>;
+  /** Emit a single JSON blob instead of the human-readable text report. */
+  json?: boolean;
+}
+
+// Machine-readable shape emitted by `mcph doctor --json`. Mirrors the
+// text sections 1:1 so support / dashboard consumers can pick fields
+// with jq. The raw token is NEVER included — only its fingerprint.
+export interface DoctorJsonSnapshot {
+  timestamp: string;
+  version: string;
+  platform: InstallOS;
+  token: { fingerprint: string; source: string };
+  apiBase: { value: string; source: string };
+  loadedFiles: Array<{ scope: string; path: string; schemaVersion?: number; schemaAhead: boolean }>;
+  warnings: string[];
+  env: Record<string, string | null>;
+  state: {
+    disabled: boolean;
+    path: string | null;
+    savedAt: string | null;
+    learningEntries: number | null;
+    packHistoryEntries: number | null;
+  };
+  reliability: Array<{
+    namespace: string;
+    dispatched: number;
+    succeeded: number;
+    successRate: number;
+    lastUsedAt: string;
+  }>;
+  clients: ClientProbeResult[];
+  shellShadows: ShadowHit[];
+  upgrade: { current: string; latest: string | null; stale: boolean };
+  diagnosis: { exitCode: number; summary: string };
 }
 
 export interface ClientProbeResult {
@@ -79,6 +113,8 @@ declare const __VERSION__: string;
 const VERSION = typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev";
 
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult> {
+  if (opts.json) return runDoctorJson(opts);
+
   const lines: string[] = [];
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
   const print = (s = ""): void => {
@@ -211,6 +247,123 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
     print("DIAGNOSIS");
     print(staleHint ? "  Healthy, but an upgrade is available (see above)." : "  All good. mcph should start cleanly.");
   }
+
+  return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
+}
+
+// JSON counterpart to runDoctor. Same data-collection sequence, no
+// print calls — emits a single JSON blob so pipelines and dashboards
+// can consume the diagnostic without parsing the text layout. Token is
+// always fingerprinted, never raw, matching the text renderer's rule.
+async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
+  const lines: string[] = [];
+  const write = opts.out ?? ((s: string) => process.stdout.write(s));
+
+  const cwd = opts.cwd ?? process.cwd();
+  const home = opts.home ?? homedir();
+  const os = opts.os ?? CURRENT_OS;
+  const env = opts.env ?? process.env;
+
+  const timestamp = new Date().toISOString();
+  const config = await loadMcphConfig({ cwd, home, env });
+  const clients = probeClients({ home, os, cwd });
+
+  const envVarNames = [
+    "MCPH_POLL_INTERVAL",
+    "MCPH_SERVER_CAP",
+    "MCPH_MIN_COMPLIANCE",
+    "MCPH_AUTO_LOAD",
+    "MCPH_PRUNE_RESPONSES",
+  ] as const;
+  const envOverrides: Record<string, string | null> = {};
+  for (const name of envVarNames) {
+    const raw = env[name];
+    envOverrides[name] = raw === undefined || raw === "" ? null : raw;
+  }
+
+  // STATE section data. Mirrors renderStateSection: MCPH_DISABLE_PERSISTENCE
+  // short-circuits, otherwise we peek the file.
+  const persistRaw = env.MCPH_DISABLE_PERSISTENCE;
+  const persistDisabled =
+    persistRaw !== undefined && persistRaw !== "" && (persistRaw === "1" || persistRaw.toLowerCase() === "true");
+  const state: DoctorJsonSnapshot["state"] = persistDisabled
+    ? { disabled: true, path: null, savedAt: null, learningEntries: null, packHistoryEntries: null }
+    : await (async () => {
+        const filePath = join(userConfigDir(home), STATE_FILENAME);
+        const persisted = await loadState(filePath);
+        const fresh = persisted.savedAt === 0;
+        return {
+          disabled: false,
+          path: filePath,
+          savedAt: fresh ? null : new Date(persisted.savedAt).toISOString(),
+          learningEntries: fresh ? 0 : Object.keys(persisted.learning).length,
+          packHistoryEntries: fresh ? 0 : persisted.packHistory.length,
+        };
+      })();
+
+  // Reliability rollup — same selectFlakyNamespaces path as renderReliabilitySection
+  // and mcp_connect_health, so all three surfaces agree on "flaky."
+  const reliability: DoctorJsonSnapshot["reliability"] = [];
+  if (!persistDisabled) {
+    const filePath = join(userConfigDir(home), STATE_FILENAME);
+    const persisted = await loadState(filePath);
+    if (persisted.savedAt !== 0) {
+      const entries = Object.entries(persisted.learning).map(([namespace, usage]) => ({ namespace, usage }));
+      for (const { namespace, usage } of selectFlakyNamespaces(entries, 5)) {
+        reliability.push({
+          namespace,
+          dispatched: usage.dispatched,
+          succeeded: usage.succeeded,
+          successRate: usage.succeeded / usage.dispatched,
+          lastUsedAt: new Date(usage.lastUsedAt).toISOString(),
+        });
+      }
+    }
+  }
+
+  const shellShadows = scanShellHistoryForShadows({ home, env });
+
+  const skipCheck = opts.skipRegistryCheck === true || Boolean(process.env.VITEST);
+  const latest = skipCheck ? null : await fetchLatestVersion(opts.registryFetch);
+  const stale = latest !== null && VERSION !== "dev" && compareSemver(VERSION, latest) < 0;
+
+  let exitCode = 0;
+  let summary: string;
+  if (config.token === null) {
+    exitCode = 1;
+    summary = "No token resolved — mcph cannot start.";
+  } else if (config.warnings.length > 0) {
+    exitCode = 2;
+    summary = "Token present, but warnings need attention.";
+  } else {
+    summary = stale ? "Healthy, but an upgrade is available." : "All good. mcph should start cleanly.";
+  }
+
+  const snapshotJson: DoctorJsonSnapshot = {
+    timestamp,
+    version: VERSION,
+    platform: os,
+    token: { fingerprint: tokenFingerprint(config.token), source: config.tokenSource },
+    apiBase: { value: config.apiBase, source: config.apiBaseSource },
+    loadedFiles: config.loadedFiles.map((f) => ({
+      scope: f.scope,
+      path: f.path,
+      ...(f.version !== undefined ? { schemaVersion: f.version } : {}),
+      schemaAhead: f.version !== undefined && f.version > CURRENT_SCHEMA_VERSION,
+    })),
+    warnings: config.warnings,
+    env: envOverrides,
+    state,
+    reliability,
+    clients,
+    shellShadows,
+    upgrade: { current: VERSION, latest, stale },
+    diagnosis: { exitCode, summary },
+  };
+
+  const blob = JSON.stringify(snapshotJson, null, 2);
+  lines.push(blob);
+  write(`${blob}\n`);
 
   return { exitCode, lines, snapshot: { version: VERSION, config, clients } };
 }

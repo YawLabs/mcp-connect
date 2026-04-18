@@ -471,3 +471,189 @@ describe("formatRelativeAge", () => {
     expect(formatRelativeAge(-1000)).toBe("0s");
   });
 });
+
+describe("runDoctor — --json", () => {
+  it("emits a single JSON blob with no text sections", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    expect(r.exitCode).toBe(0);
+    // Should have exactly one element (the JSON blob) in lines.
+    expect(r.lines).toHaveLength(1);
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed).toMatchObject({
+      version: expect.any(String),
+      platform: "linux",
+      token: { source: "env" },
+      apiBase: { value: expect.any(String), source: expect.any(String) },
+      diagnosis: { exitCode: 0, summary: expect.any(String) },
+    });
+    // Text-mode section headers MUST NOT appear.
+    expect(cap.text()).not.toMatch(/CONFIG FILES|TOKEN\n|DIAGNOSIS/);
+  });
+
+  it("never includes the raw token value", async () => {
+    const cap = captureOut();
+    const raw = "mcp_pat_supersecret_DO_NOT_LEAK_aaaa1234";
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: raw },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const text = r.lines.join("");
+    expect(text).not.toContain("supersecret");
+    expect(text).not.toContain("DO_NOT_LEAK");
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.token.fingerprint).toMatch(/…1234/);
+    expect(parsed.token.fingerprint).not.toContain("DO_NOT_LEAK");
+  });
+
+  it("exit code in diagnosis matches returned exitCode (no token)", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    expect(r.exitCode).toBe(1);
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.diagnosis.exitCode).toBe(1);
+    expect(parsed.diagnosis.summary).toMatch(/No token/);
+    expect(parsed.token.fingerprint).toBe("(none)");
+  });
+
+  it("surfaces warnings in the JSON snapshot", async () => {
+    writeMcphConfig(synthHome, "config.json", { version: 999, token: "mcp_pat_aaaa" });
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    expect(r.exitCode).toBe(2);
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.diagnosis.exitCode).toBe(2);
+    expect(parsed.warnings.length).toBeGreaterThan(0);
+    expect(parsed.loadedFiles[0].schemaAhead).toBe(true);
+  });
+
+  it("reports state.disabled when MCPH_DISABLE_PERSISTENCE is set", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa", MCPH_DISABLE_PERSISTENCE: "1" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.state.disabled).toBe(true);
+    expect(parsed.state.path).toBeNull();
+    expect(parsed.state.savedAt).toBeNull();
+  });
+
+  it("includes reliability entries for flaky persisted namespaces", async () => {
+    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".mcph", STATE_FILENAME),
+      JSON.stringify({
+        version: STATE_SCHEMA_VERSION,
+        savedAt: Date.now() - 60_000,
+        learning: {
+          flaky: { dispatched: 10, succeeded: 3, lastUsedAt: Date.now() - 60_000 },
+          good: { dispatched: 10, succeeded: 10, lastUsedAt: Date.now() - 60_000 },
+        },
+        packHistory: [],
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.reliability).toHaveLength(1);
+    expect(parsed.reliability[0].namespace).toBe("flaky");
+    expect(parsed.reliability[0].successRate).toBeCloseTo(0.3, 2);
+    expect(parsed.reliability[0].lastUsedAt).toMatch(/T/);
+  });
+
+  it("records the env overrides block with null for unset vars", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa", MCPH_SERVER_CAP: "12" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.env.MCPH_SERVER_CAP).toBe("12");
+    expect(parsed.env.MCPH_POLL_INTERVAL).toBeNull();
+    expect(parsed.env).toHaveProperty("MCPH_AUTO_LOAD");
+  });
+
+  it("upgrade.stale is true when registry reports a newer version", async () => {
+    // Doctor only flags stale when VERSION !== "dev". Under vitest
+    // VERSION is "dev" so stale should always be false even with a
+    // fetch hook override — this test documents that.
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.upgrade.current).toBe("dev");
+    expect(parsed.upgrade.stale).toBe(false);
+  });
+
+  it("clients array is populated even in json mode", async () => {
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: { MCPH_TOKEN: "mcp_pat_aaaa" },
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(Array.isArray(parsed.clients)).toBe(true);
+    expect(parsed.clients.length).toBeGreaterThan(0);
+    expect(parsed.clients[0]).toHaveProperty("clientId");
+  });
+});

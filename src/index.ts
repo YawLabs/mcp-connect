@@ -45,7 +45,20 @@ if (subcommand === "compliance") {
   }
   runInstall(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "doctor") {
-  runDoctor().then((r) => process.exit(r.exitCode));
+  const doctorArgs = process.argv.slice(3);
+  const doctorJson = doctorArgs.includes("--json");
+  const doctorUnknown = doctorArgs.find((a) => a !== "--json" && a !== "--help" && a !== "-h");
+  if (doctorArgs.includes("--help") || doctorArgs.includes("-h")) {
+    process.stdout.write(
+      "Usage: mcph doctor [--json]\n\n  Print a diagnostic of your mcph setup.\n\n  --json  Emit machine-readable JSON instead of text.\n",
+    );
+    process.exit(0);
+  }
+  if (doctorUnknown) {
+    process.stderr.write(`mcph doctor: unknown argument "${doctorUnknown}"\n`);
+    process.exit(2);
+  }
+  runDoctor({ json: doctorJson }).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "reset-learning") {
   runResetLearning().then((r) => process.exit(r.exitCode));
 } else if (subcommand === "servers") {
@@ -65,7 +78,7 @@ if (subcommand === "compliance") {
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   const installBlock = `    ${INSTALL_USAGE.replace(/^Usage: /, "").replace(/\n/g, "\n    ")}`;
   process.stdout.write(
-    `\n  mcph — MCP server orchestrator for mcp.hosting\n\n  Usage:\n    mcph                              Run as MCP server (requires a token)\n    mcph install <client> [flags]     Auto-edit an MCP client's config to launch mcph\n    mcph doctor                       Print loaded config + detected clients (support diagnostic)\n    mcph servers [--json]             List servers configured in your mcp.hosting dashboard\n    mcph bundles [list|match]         Browse curated multi-server bundles\n    mcph compliance <target> [flags]  Run the compliance suite against an MCP server\n    mcph reset-learning               Clear cross-session learning history (~/.mcph/state.json)\n    mcph --version                    Print version\n\n  Install:\n${installBlock}\n\n  Compliance flags:\n    --publish   Publish the report to mcp.hosting and print the URL\n\n  Token resolution (highest first):\n    1. MCPH_TOKEN env var\n    2. <project>/.mcph/config.local.json  (machine-local override; gitignore)\n    3. ~/.mcph/config.json                (user-global default)\n\n  Token rotation: mcph reads its config at startup. Restart the MCP\n  client (or kill mcph; the client will respawn it) after editing.\n\n`,
+    `\n  mcph — MCP server orchestrator for mcp.hosting\n\n  Usage:\n    mcph                              Run as MCP server (requires a token)\n    mcph install <client> [flags]     Auto-edit an MCP client's config to launch mcph\n    mcph doctor [--json]              Print loaded config + detected clients (support diagnostic)\n    mcph servers [--json]             List servers configured in your mcp.hosting dashboard\n    mcph bundles [list|match]         Browse curated multi-server bundles\n    mcph compliance <target> [flags]  Run the compliance suite against an MCP server\n    mcph reset-learning               Clear cross-session learning history (~/.mcph/state.json)\n    mcph --version                    Print version\n\n  Install:\n${installBlock}\n\n  Compliance flags:\n    --publish   Publish the report to mcp.hosting and print the URL\n\n  Token resolution (highest first):\n    1. MCPH_TOKEN env var\n    2. <project>/.mcph/config.local.json  (machine-local override; gitignore)\n    3. ~/.mcph/config.json                (user-global default)\n\n  Token rotation: mcph reads its config at startup. Restart the MCP\n  client (or kill mcph; the client will respawn it) after editing.\n\n`,
   );
   process.exit(0);
 } else if (subcommand === "--version" || subcommand === "-V") {
