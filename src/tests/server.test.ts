@@ -1280,6 +1280,28 @@ describe("ConnectServer", () => {
       expect(text).toMatch(/namespaces=\[.*"gh".*"linear".*\]|namespaces=\[.*"linear".*"gh".*\]/);
     });
 
+    it("routes meta-tool bundles and separates ready vs partial against installed servers", async () => {
+      const priv = getPrivate(server);
+      // Install github + linear + slack. pr-review (github+linear) must
+      // surface as ready; devops-incident (github+pagerduty+slack) must
+      // surface as partial with pagerduty missing.
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "github" }),
+        makeServerConfig({ namespace: "linear" }),
+        makeServerConfig({ namespace: "slack" }),
+      ]);
+      const result = await priv.handleToolCall("mcp_connect_bundles", { action: "match" });
+      expect(result.isError).toBeUndefined();
+      const text = result.content[0].text;
+      expect(text).toContain("Bundles ready to activate now:");
+      expect(text).toContain("pr-review");
+      expect(text).toContain('activate: mcp_connect_activate({ namespaces: ["github","linear"] })');
+      expect(text).toContain("Bundles partially installed:");
+      expect(text).toContain("devops-incident");
+      expect(text).toContain("missing: pagerduty");
+      expect(text).toContain("https://mcp.hosting/explore");
+    });
+
     it("routes meta-tool exec through a two-step pipeline with $ref binding", async () => {
       // Exec threads the first tool's output into the second tool's
       // args via {"$ref": "first.content[0].text"}. Proves the server

@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { request } from "undici";
 import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
+import { CURATED_BUNDLES, bundleActivateHint, matchBundles } from "./bundles.js";
 import { formatShadowLine } from "./cli-shadows.js";
 import { type Profile, loadEffectiveProfile, profileAllows } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
@@ -782,6 +783,11 @@ export class ConnectServer {
         success: !result.isError,
       });
       return this.attachGuideNudge(result);
+    }
+    if (name === META_TOOLS.bundles.name) {
+      const action = args.action === "match" ? "match" : "list";
+      recordConnectEvent({ namespace: null, toolName: null, action: "bundles", latencyMs: null, success: true });
+      return this.attachGuideNudge(this.handleBundles(action));
     }
 
     // Snapshot routes at method entry. rebuildRoutes() may fire during
@@ -2573,6 +2579,67 @@ export class ConnectServer {
     const top = ranked[0];
     const nsJson = JSON.stringify(top.namespaces);
     lines.push(`\nTo load the top pack in one step, call \`mcp_connect_activate\` with namespaces=${nsJson}.`);
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+
+  // Curated multi-server bundles. Static client-side data (see bundles.ts)
+  // — no network call. `action=list` prints every bundle with a ready-to-
+  // run `mcp_connect_activate` snippet; `action=match` cross-references
+  // the installed server list and partitions into fully-ready vs
+  // partially-installed so the caller only sees bundles that are actually
+  // actionable on this account.
+  private handleBundles(action: "list" | "match"): { content: Array<{ type: string; text: string }> } {
+    if (action === "list") {
+      const lines: string[] = [`Curated server bundles (${CURATED_BUNDLES.length}):\n`];
+      for (const bundle of CURATED_BUNDLES) {
+        lines.push(`  ${bundle.id} — ${bundle.description}`);
+        lines.push(`    namespaces: ${JSON.stringify(bundle.namespaces)}`);
+        lines.push(`    activate: ${bundleActivateHint(bundle)}`);
+      }
+      lines.push("");
+      lines.push(
+        'Call mcp_connect_bundles with action="match" to filter these against servers already installed on this account.',
+      );
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
+    // action === "match"
+    const installedNamespaces = this.getProfiledActiveServers().map((s) => s.namespace);
+    const { ready, partial } = matchBundles(installedNamespaces);
+
+    if (ready.length === 0 && partial.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No curated bundles match your currently installed servers. Browse https://mcp.hosting/explore to add the servers a bundle needs, then re-run mcp_connect_bundles.",
+          },
+        ],
+      };
+    }
+
+    const lines: string[] = [];
+
+    if (ready.length > 0) {
+      lines.push("Bundles ready to activate now:");
+      for (const bundle of ready) {
+        lines.push(`  ${bundle.id} — ${bundle.description}`);
+        lines.push(`    namespaces: ${JSON.stringify(bundle.namespaces)}`);
+        lines.push(`    activate: ${bundleActivateHint(bundle)}`);
+      }
+    }
+
+    if (partial.length > 0) {
+      if (ready.length > 0) lines.push("");
+      lines.push("Bundles partially installed:");
+      for (const entry of partial) {
+        const { bundle, have, missing } = entry;
+        lines.push(`  ${bundle.id} — ${bundle.description}`);
+        lines.push(`    have: ${have.join(", ")}`);
+        lines.push(`    missing: ${missing.join(", ")} (install from https://mcp.hosting/explore)`);
+      }
+    }
 
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }

@@ -14,7 +14,8 @@ export interface ConnectAnalyticsEvent {
     | "health"
     | "suggest"
     | "read_tool"
-    | "exec";
+    | "exec"
+    | "bundles";
   latencyMs: number | null;
   success: boolean;
   error?: string;

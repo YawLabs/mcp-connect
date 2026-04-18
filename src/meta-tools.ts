@@ -246,6 +246,29 @@ export const META_TOOLS = {
       openWorldHint: false,
     },
   },
+  bundles: {
+    name: "mcp_connect_bundles",
+    description:
+      "List curated multi-server 'bundles' — presets like `pr-review` (github + linear) or `devops-incident` (github + pagerduty + slack) that commonly ship together. Use this BEFORE mcp_connect_discover when the user's intent maps to a known workflow (on-call triage, PR review, data pipeline debugging) — it returns a ready-to-run `mcp_connect_activate namespaces=[...]` call per bundle. With `action=\"match\"` (recommended after the user's installed list is known) the response partitions bundles into READY (every namespace already installed — activate now) and PARTIAL (some installed, some missing — shows the missing names and the mcp.hosting/explore install URL). With `action=\"list\"` (default) it returns the full curated catalog. Bundles are static client-side data, not a network call.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        action: {
+          type: "string",
+          enum: ["list", "match"],
+          description:
+            'Either "list" (return the full curated catalog; default) or "match" (partition bundles against installed servers into ready-to-activate vs partially-installed).',
+        },
+      },
+    },
+    annotations: {
+      title: "Curated Server Bundles",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
   exec: {
     name: "mcp_connect_exec",
     description:
@@ -411,4 +434,5 @@ export const META_TOOL_NAMES = new Set([
   META_TOOLS.read_tool.name,
   META_TOOLS.suggest.name,
   META_TOOLS.exec.name,
+  META_TOOLS.bundles.name,
 ]);
