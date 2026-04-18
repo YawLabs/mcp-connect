@@ -35,6 +35,6 @@
 
 - [ ] **Server recommendation engine** — "Users who use GitHub MCP also use Slack MCP" based on anonymized load patterns
 - [x] **Pre-built orchestrator configs** — Curated bundles ("The DevOps Stack: GitHub + AWS + PagerDuty", "The Marketing Stack: HubSpot + Slack + Analytics"). `mcp_connect_bundles` meta-tool lists the curated catalog and with `action="match"` partitions bundles against installed servers (ready-to-activate vs partially-installed with missing-namespace hints). Static client-side data — see `src/bundles.ts`.
-- [ ] **Compliance-aware routing** — Only load servers that pass a minimum compliance grade
+- [x] **Compliance-aware routing** — `MCPH_MIN_COMPLIANCE=A|B|C|D|F` refuses activation of servers whose `complianceGrade` is below the floor; discover annotates below-grade servers in place with a `(grade X — below MCPH_MIN_COMPLIANCE=Y, won't auto-activate)` marker and emits a "Compliance filter active" header. Forward-compatible schema: the optional `complianceGrade` field on `UpstreamServerConfig` rides the existing `/api/connect/config` response. Ungraded servers always pass ("don't punish unknown"). See `src/compliance.ts`.
 - [x] **Tool deduplication** — `discover()` surfaces bare tool names that appear in ≥2 currently-connected servers in an "Overlapping tools" block (top 5, sorted by namespace count desc then alphabetical), with a dispatch-to-disambiguate hint.
 - [ ] **Conversation-aware routing** — If mcph could receive conversation context (future MCP spec), route automatically based on what the user is talking about

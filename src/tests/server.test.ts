@@ -448,6 +448,105 @@ describe("ConnectServer", () => {
     });
   });
 
+  describe("compliance-aware routing", () => {
+    // vi.unstubAllEnvs() restores every stubbed env var after each case so
+    // an errant MCPH_MIN_COMPLIANCE can't leak into later suites.
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("refuses to activate a below-grade server with a clear error", async () => {
+      vi.stubEnv("MCPH_MIN_COMPLIANCE", "B");
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "D" })]);
+
+      const result = await priv.handleActivate(["gh"]);
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      expect(text).toContain('Refused to load "gh"');
+      expect(text).toContain("grade D");
+      expect(text).toContain("MCPH_MIN_COMPLIANCE=B");
+      expect(text).toContain("Unset MCPH_MIN_COMPLIANCE");
+      // No upstream spawn — the gate must short-circuit before activation.
+      expect(connectToUpstream).not.toHaveBeenCalled();
+      expect(priv.connections.has("gh")).toBe(false);
+    });
+
+    it("allows activation when the grade meets the minimum", async () => {
+      vi.stubEnv("MCPH_MIN_COMPLIANCE", "B");
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "A" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+      const result = await priv.handleActivate(["gh"]);
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain('Loaded "gh"');
+      expect(priv.connections.has("gh")).toBe(true);
+    });
+
+    it("allows activation for ungraded servers even when the filter is on (don't punish unknown)", async () => {
+      vi.stubEnv("MCPH_MIN_COMPLIANCE", "A");
+      const priv = getPrivate(server);
+      // No complianceGrade on this config — mirrors today's backend.
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["create_issue"]));
+
+      const result = await priv.handleActivate(["gh"]);
+      expect(result.isError).toBeUndefined();
+      expect(priv.connections.has("gh")).toBe(true);
+    });
+
+    it("does not filter anything when MCPH_MIN_COMPLIANCE is unset", async () => {
+      vi.stubEnv("MCPH_MIN_COMPLIANCE", "");
+      const priv = getPrivate(server);
+      // Even an F-grade server is activatable with the filter disabled.
+      priv.config = makeConfig([makeServerConfig({ namespace: "bad", name: "Bad", complianceGrade: "F" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("bad", ["t"]));
+
+      const result = await priv.handleActivate(["bad"]);
+      expect(result.isError).toBeUndefined();
+      expect(priv.connections.has("bad")).toBe(true);
+    });
+
+    it("annotates below-grade servers in discover output and emits a filter header", () => {
+      vi.stubEnv("MCPH_MIN_COMPLIANCE", "B");
+      const priv = getPrivate(server);
+      priv.config = makeConfig([
+        makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "A" }),
+        makeServerConfig({ namespace: "bad", name: "Bad Server", complianceGrade: "D" }),
+        makeServerConfig({ namespace: "raw", name: "Ungraded" }),
+      ]);
+
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      expect(text).toContain("Compliance filter active: MCPH_MIN_COMPLIANCE=B");
+      // Passing grade is surfaced inline as `[A]`.
+      expect(text).toMatch(/gh — GitHub.*\[A\]/);
+      // Failing server is surfaced in place with the refusal reason.
+      expect(text).toContain("bad — Bad Server");
+      expect(text).toContain("(grade D — below MCPH_MIN_COMPLIANCE=B, won't auto-activate)");
+      // Ungraded server gets no annotation — avoids cluttering every
+      // current deploy where nothing is scored yet.
+      expect(text).not.toMatch(/raw — Ungraded.*\[[A-F]\]/);
+      expect(text).not.toMatch(/raw — Ungraded.*won't auto-activate/);
+    });
+
+    it("omits the filter header and `[grade]` annotations when the env is unset", () => {
+      vi.stubEnv("MCPH_MIN_COMPLIANCE", "");
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", complianceGrade: "B" })]);
+
+      const result = priv.handleDiscover();
+      const text = result.content[0].text;
+      expect(text).not.toContain("Compliance filter active");
+      // With the filter off we still don't clutter the line with a
+      // grade tag — the annotation is only interesting relative to a
+      // configured minimum. (Current behavior: `[B]` appears only when
+      // the filter is on. Keep this test honest to that contract.)
+      expect(text).not.toMatch(/gh — GitHub.*\[B\]/);
+    });
+  });
+
   describe("per-tool load", () => {
     // `tools/list` is constructed by buildToolList(this.connections, …,
     // this.toolFilters). These tests drive handleToolCall so the full

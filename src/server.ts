@@ -15,6 +15,7 @@ import { request } from "undici";
 import { initAnalytics, recordConnectEvent, recordDispatchEvent, shutdownAnalytics } from "./analytics.js";
 import { CURATED_BUNDLES, bundleActivateHint, matchBundles } from "./bundles.js";
 import { formatShadowLine } from "./cli-shadows.js";
+import { type ComplianceGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
 import { type Profile, loadEffectiveProfile, profileAllows } from "./config-loader.js";
 import { ConfigError, fetchConfig } from "./config.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
@@ -101,6 +102,15 @@ export function isPersistenceDisabled(): boolean {
   const raw = process.env.MCPH_DISABLE_PERSISTENCE;
   if (raw === undefined || raw === "") return false;
   return raw === "1" || raw.toLowerCase() === "true";
+}
+
+// Current minimum compliance filter, parsed from MCPH_MIN_COMPLIANCE.
+// Re-read on every call so tests can stub the env between cases. Null
+// means "filter disabled" — every server passes regardless of grade.
+// Invalid values log a one-shot warning (see parseMinCompliance) and
+// fall back to disabled so a typo never hides the user's whole catalog.
+export function resolveMinCompliance(): ComplianceGrade | null {
+  return parseMinCompliance(process.env.MCPH_MIN_COMPLIANCE);
 }
 
 // Opt-in auto-load. Set MCPH_AUTO_LOAD=1 (or "true") to pre-activate the
@@ -1222,6 +1232,16 @@ export class ConnectServer {
       lines.push(`Auto-loaded "${sorted[0].namespace}" — top match for your query.\n`);
     }
 
+    // Compliance filter banner. When MCPH_MIN_COMPLIANCE is active, the
+    // per-server lines below will annotate any below-grade server with a
+    // "won't auto-activate" marker; this header tells the model WHY
+    // those markers are there so it doesn't try to activate them and
+    // get a refusal surprise.
+    const minCompliance = resolveMinCompliance();
+    if (minCompliance !== null) {
+      lines.push(`Compliance filter active: MCPH_MIN_COMPLIANCE=${minCompliance}\n`);
+    }
+
     // Compact "Matches your query" summary. Prepended when context is
     // given AND at least one server scored above zero, so the model
     // sees the short answer before the long list. Without this block
@@ -1318,7 +1338,25 @@ export class ConnectServer {
         }
       }
 
-      lines.push(`  ${server.namespace} — ${server.name} [${status}] (${server.type})${relevance}${costLabel}`);
+      // Compliance annotation — only surfaces when the filter is active,
+      // since the grade is only interesting RELATIVE to a configured
+      // minimum. Passing graded server → show `[A]` as a reassurance tag;
+      // below-min → spell out the reason inline so the model knows why
+      // it's surfaced but won't be activated. Ungraded servers stay
+      // unannotated (don't clutter lines for servers the backend hasn't
+      // scored yet — most of the current catalog).
+      let complianceLabel = "";
+      if (minCompliance !== null && server.complianceGrade) {
+        if (passesMinCompliance(server.complianceGrade, minCompliance)) {
+          complianceLabel = ` [${server.complianceGrade}]`;
+        } else {
+          complianceLabel = ` (grade ${server.complianceGrade} — below MCPH_MIN_COMPLIANCE=${minCompliance}, won't auto-activate)`;
+        }
+      }
+
+      lines.push(
+        `  ${server.namespace} — ${server.name} [${status}] (${server.type})${relevance}${costLabel}${complianceLabel}`,
+      );
 
       const shadow = formatShadowLine(server);
       if (shadow) lines.push(`    ${shadow}`);
@@ -1700,10 +1738,27 @@ export class ConnectServer {
     let anyChanged = false;
     let anyError = false;
 
+    // Compliance gate. When MCPH_MIN_COMPLIANCE is set, refuse to
+    // activate any server whose reported grade is below the floor.
+    // Ungraded servers always pass — see passesMinCompliance. Parsed
+    // once per handleActivate call so a mid-session env change takes
+    // effect on the next activation, not after a restart.
+    const minCompliance = resolveMinCompliance();
+
     const total = namespaces.length;
     let i = 0;
     for (const namespace of namespaces) {
       i += 1;
+      if (minCompliance !== null) {
+        const cfg = this.config?.servers.find((s) => s.namespace === namespace);
+        if (cfg && !passesMinCompliance(cfg.complianceGrade, minCompliance)) {
+          const grade = cfg.complianceGrade ?? "unknown";
+          const message = `Refused to load "${namespace}": compliance grade ${grade} is below MCPH_MIN_COMPLIANCE=${minCompliance}. Unset MCPH_MIN_COMPLIANCE (or lower it) to override.`;
+          results.push(message);
+          anyError = true;
+          continue;
+        }
+      }
       progress?.(`Loading ${namespace} (${i}/${total})`, i - 1, total);
       const r = await this.activateOne(namespace, progress);
       results.push(r.message);

@@ -22,6 +22,13 @@ export interface UpstreamServerConfig {
   // the ranker doesn't need to cold-start every dispatch by activating
   // every candidate.
   toolCache?: Array<{ name: string; description?: string }>;
+  /**
+   * A–F grade reported by the mcp.hosting compliance pipeline. Absent
+   * on older backends or servers that haven't been scored yet. When
+   * absent, the server is treated as "ungraded" and passes filters by
+   * default (we don't punish unknown).
+   */
+  complianceGrade?: "A" | "B" | "C" | "D" | "F";
 }
 
 export interface ConnectConfig {
