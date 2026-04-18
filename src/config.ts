@@ -1,4 +1,5 @@
 import { request } from "undici";
+import { tokenFingerprint } from "./config-loader.js";
 import { log } from "./logger.js";
 import type { ConnectConfig } from "./types.js";
 
@@ -44,12 +45,18 @@ export async function fetchConfig(
 
   if (res.statusCode === 401) {
     await res.body.text().catch(() => {});
-    throw new ConfigError("Invalid MCPH_TOKEN — check your token at mcp.hosting", true);
+    throw new ConfigError(
+      `Token rejected (HTTP 401) — the token ${tokenFingerprint(token)} is invalid or revoked.\n  Generate a new token at https://mcp.hosting/dashboard/settings/tokens,\n  then re-run \`mcph install <client> --token mcp_pat_...\` or set MCPH_TOKEN.`,
+      true,
+    );
   }
 
   if (res.statusCode === 403) {
     await res.body.text().catch(() => {});
-    throw new ConfigError("Access denied — your token may have expired", true);
+    throw new ConfigError(
+      `Access denied (HTTP 403) — the token ${tokenFingerprint(token)} was accepted but lacks permission to read this account's servers.\n  The account may be suspended or the token scope reduced — check\n  https://mcp.hosting/dashboard/settings/tokens, or reach support@mcp.hosting.`,
+      true,
+    );
   }
 
   if (res.statusCode !== 200) {

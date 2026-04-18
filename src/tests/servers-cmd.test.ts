@@ -234,11 +234,15 @@ describe("runServersCommand", () => {
       out: io.push,
       err: io.pushErr,
       fetcher: async () => {
-        throw new Error("Invalid MCPH_TOKEN — check your token at mcp.hosting");
+        throw new Error(
+          "Token rejected (HTTP 401) — the token mcp_pat_…abcd is invalid or revoked.\n  Generate a new token at https://mcp.hosting/dashboard/settings/tokens,\n  then re-run `mcph install <client> --token mcp_pat_...` or set MCPH_TOKEN.",
+        );
       },
     });
     expect(r.exitCode).toBe(2);
-    expect(io.err.join("")).toContain("Invalid MCPH_TOKEN");
+    const combinedErr = io.err.join("");
+    expect(combinedErr).toContain("Token rejected");
+    expect(combinedErr).toContain("https://mcp.hosting/dashboard/settings/tokens");
   });
 
   it("exits 2 on an unexpected 304 (null response)", async () => {
