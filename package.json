@@ -3,7 +3,7 @@
   "version": "0.46.3",
   "description": "mcp.hosting — one install, all your MCP servers, managed from the cloud",
   "license": "UNLICENSED",
-  "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
+  "author": "Yaw Labs <support@mcp.hosting> (https://mcp.hosting)",
   "type": "module",
   "bin": {
     "mcph": "./dist/index.js"
