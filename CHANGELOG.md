@@ -2,6 +2,10 @@
 
 All notable changes to `@yawlabs/mcph` are documented here. This project uses [semantic versioning](https://semver.org) and a CI-gated release flow: pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which publishes to npm.
 
+## 0.46.3 — 2026-04-18
+
+- **`mcph --help` rewritten: quickstart, grouped subcommands, env vars, config precedence** — The old help listed ten subcommands in a flat table and spent most of its real estate on install flag details (already available via `mcph install --help`) and a three-line token-resolution note. Subcommands are now grouped by purpose (Setup, Inspection, Maintenance, Other), each with a multi-line description that explains what the command actually does — not just its name. A numbered Quickstart at the top points users at the token URL and shows the two commands needed to finish onboarding. An Environment variables section documents the eight `MCPH_*` overrides (`MCPH_URL`, `MCPH_POLL_INTERVAL`, `MCPH_SERVER_CAP`, `MCPH_MIN_COMPLIANCE`, `MCPH_AUTO_LOAD`, `MCPH_PRUNE_RESPONSES`, `MCPH_DISABLE_PERSISTENCE`) that were previously only discoverable by reading the doctor source. Config resolution is expanded from three lines to a proper four-tier precedence list (env → project.local → project → user-global). Trailing pointer to `mcph <subcommand> --help` for flag-level detail so the top-level stays scannable. `INSTALL_USAGE` import removed from `index.ts` since the install flag block no longer inlines into top-level help.
+
 ## 0.46.2 — 2026-04-18
 
 - **Doctor's UPGRADE AVAILABLE section points at `mcph upgrade`** — Previously it inlined `npm install -g @yawlabs/mcph@latest` with a long prose aside about npx-vs-global. Now it tells the user to run `mcph upgrade` (prints the exact command for their install method) or `mcph upgrade --run` (executes for global-npm). Shorter, single source of truth for "how do I actually update?" since doctor already detects staleness and the upgrade subcommand already understands how the install was done.

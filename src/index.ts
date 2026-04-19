@@ -5,7 +5,7 @@ import { loadMcphConfig, tokenFingerprint } from "./config-loader.js";
 import { ConfigError } from "./config.js";
 import { runDoctor } from "./doctor-cmd.js";
 import { closestNames } from "./fuzzy.js";
-import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
+import { parseInstallArgs, runInstall } from "./install-cmd.js";
 import { log } from "./logger.js";
 import { runResetLearning } from "./reset-learning-cmd.js";
 import { ConnectServer } from "./server.js";
@@ -94,10 +94,73 @@ if (subcommand === "compliance") {
   }
   runUpgrade(parsed.options).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
-  const installBlock = `    ${INSTALL_USAGE.replace(/^Usage: /, "").replace(/\n/g, "\n    ")}`;
-  process.stdout.write(
-    `\n  mcph — MCP server orchestrator for mcp.hosting\n\n  Usage:\n    mcph                              Run as MCP server (requires a token)\n    mcph install <client> [flags]     Auto-edit an MCP client's config to launch mcph\n    mcph doctor [--json]              Print loaded config + detected clients (support diagnostic)\n    mcph servers [--json]             List servers configured in your mcp.hosting dashboard\n    mcph bundles [list|match]         Browse curated multi-server bundles\n    mcph compliance <target> [flags]  Run the compliance suite against an MCP server\n    mcph reset-learning               Clear cross-session learning history (~/.mcph/state.json)\n    mcph completion <shell>           Print a shell completion script (bash|zsh|fish|powershell)\n    mcph upgrade [--run] [--json]     Show (or run) the upgrade command for @yawlabs/mcph\n    mcph --version                    Print version\n\n  Install:\n${installBlock}\n\n  Compliance flags:\n    --publish   Publish the report to mcp.hosting and print the URL\n\n  Token resolution (highest first):\n    1. MCPH_TOKEN env var\n    2. <project>/.mcph/config.local.json  (machine-local override; gitignore)\n    3. ~/.mcph/config.json                (user-global default)\n\n  Token rotation: mcph reads its config at startup. Restart the MCP\n  client (or kill mcph; the client will respawn it) after editing.\n\n`,
-  );
+  process.stdout.write(`
+  mcph — one install, every MCP server, managed from the cloud.
+
+  Quickstart:
+    1. Get a token      https://mcp.hosting/dashboard/settings/tokens
+    2. Install mcph     mcph install claude-code --token mcp_pat_...
+    3. Verify setup     mcph doctor
+
+  Setup:
+    install <client>         Auto-edit an MCP client's config to launch mcph.
+                             Clients: claude-code | claude-desktop | cursor | vscode.
+    install --list           Detect MCP clients on this machine (read-only).
+    install --all            Install into every detected client in one shot.
+
+  Inspection:
+    doctor                   Diagnose setup: config, token, clients, learning,
+                             upgrade, flaky-namespace reliability rollup.
+    servers [<filter>]       List servers in your mcp.hosting dashboard; the
+                             positional arg substring-filters by namespace.
+    bundles [list|match]     Browse curated multi-server bundles. \`list\` shows
+                             all; \`match\` partitions against your enabled
+                             servers (ready vs. partially installed).
+
+  Maintenance:
+    upgrade                  Show (or --run) the command that bumps
+                             @yawlabs/mcph to the latest version.
+    reset-learning           Clear cross-session learning history
+                             (~/.mcph/state.json).
+    completion <shell>       Print a shell completion script for bash, zsh,
+                             fish, or powershell. Redirect to your
+                             completions directory to install.
+
+  Other:
+    compliance <target>      Run the 88-test compliance suite against an MCP
+                             server. --publish posts the report to
+                             mcp.hosting and prints the public URL.
+    help, --help, -h         Show this help.
+    --version, -V            Print mcph version.
+
+  Running \`mcph\` with no subcommand starts the MCP server (requires a
+  resolved token). Most read-only subcommands accept \`--json\` for
+  machine-readable output. Run \`mcph <subcommand> --help\` for per-
+  subcommand flag details.
+
+  Environment variables:
+    MCPH_TOKEN                 API token (overrides every config file).
+    MCPH_URL                   API base URL (default https://mcp.hosting).
+    MCPH_POLL_INTERVAL         Dashboard polling interval, seconds (default 60).
+    MCPH_SERVER_CAP            Max concurrently active servers (default 6).
+    MCPH_MIN_COMPLIANCE        Minimum grade to auto-activate (A|B|C|D|F).
+    MCPH_AUTO_LOAD             Load all servers at startup, ignoring SERVER_CAP.
+    MCPH_PRUNE_RESPONSES       Set to \`0\` to disable response pruning.
+    MCPH_DISABLE_PERSISTENCE   Disable cross-session learning state.
+
+  Config resolution (highest precedence first):
+    1. MCPH_TOKEN / MCPH_URL env vars
+    2. <project>/.mcph/config.local.json   machine-local overrides (gitignore)
+    3. <project>/.mcph/config.json         project-shared (checked in)
+    4. ~/.mcph/config.json                 user-global default
+
+  Token rotation: mcph reads config at startup. Restart the MCP client
+  (or kill mcph; the client will respawn it) after editing any config.
+
+  Docs:   https://mcp.hosting
+  Source: https://github.com/YawLabs/mcph
+
+`);
   process.exit(0);
 } else if (subcommand === "--version" || subcommand === "-V") {
   // __VERSION__ is substituted at build time by tsup (see tsup.config.ts);
