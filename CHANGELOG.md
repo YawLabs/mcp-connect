@@ -2,6 +2,10 @@
 
 All notable changes to `@yawlabs/mcph` are documented here. This project uses [semantic versioning](https://semver.org) and a CI-gated release flow: pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which publishes to npm.
 
+## 0.46.2 — 2026-04-18
+
+- **Doctor's UPGRADE AVAILABLE section points at `mcph upgrade`** — Previously it inlined `npm install -g @yawlabs/mcph@latest` with a long prose aside about npx-vs-global. Now it tells the user to run `mcph upgrade` (prints the exact command for their install method) or `mcph upgrade --run` (executes for global-npm). Shorter, single source of truth for "how do I actually update?" since doctor already detects staleness and the upgrade subcommand already understands how the install was done.
+
 ## 0.46.1 — 2026-04-18
 
 - **Fix `mcph upgrade` reporting `Current: dev` in shipped bundles** — The v0.46.0 `readCurrentVersion()` used `(globalThis as ...).__VERSION__`, but tsup's `define` only substitutes bare identifier references, not property accesses — so the compiled bundle fell through to the "dev" fallback regardless of what version was installed. Switched to the same `declare const __VERSION__ / typeof __VERSION__ !== "undefined"` pattern used in `index.ts`, `doctor-cmd.ts`, `server.ts`, and `upstream.ts`. Smoke-tested via `npx @yawlabs/mcph@latest upgrade`: now reports the actual installed version.

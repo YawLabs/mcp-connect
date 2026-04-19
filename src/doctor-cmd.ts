@@ -227,9 +227,8 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   if (staleHint) {
     print("UPGRADE AVAILABLE");
     print(`  Running ${VERSION}; npm latest is ${staleHint}.`);
-    print("  If `mcph` is globally installed it shadows `npx` — upgrade with:");
-    print("    npm install -g @yawlabs/mcph@latest");
-    print("  Otherwise restart your MCP client; `npx -y @yawlabs/mcph` will fetch the new version.");
+    print("  Run `mcph upgrade` to see the exact command for your install, or");
+    print("  `mcph upgrade --run` to execute it (global-npm installs only).");
     print("");
   }
 
