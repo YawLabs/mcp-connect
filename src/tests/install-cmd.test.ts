@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
@@ -515,6 +515,35 @@ describe("runInstall — token resolution", () => {
     });
     expect(r.exitCode).toBe(1);
     expect(cap.stderr()).toMatch(/no token available/i);
+  });
+
+  it("backs up a malformed ~/.mcph/config.json before overwriting (token recovery path)", async () => {
+    mkdirSync(join(synthHome, ".mcph"), { recursive: true });
+    const malformedPath = join(synthHome, ".mcph", "config.json");
+    const malformedBytes = '{"token": "mcp_pat_old_aaaa", "version": 1';
+    writeFileSync(malformedPath, malformedBytes, "utf8");
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      token: "mcp_pat_new_bbbb",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    // New config has the new token.
+    const cfg = JSON.parse(readFileSync(malformedPath, "utf8"));
+    expect(cfg.token).toBe("mcp_pat_new_bbbb");
+    // A .bak-* sibling exists with the original malformed bytes.
+    const siblings = readdirSync(join(synthHome, ".mcph"));
+    const backups = siblings.filter((f) => f.startsWith("config.json.bak-"));
+    expect(backups).toHaveLength(1);
+    const backedUp = readFileSync(join(synthHome, ".mcph", backups[0]), "utf8");
+    expect(backedUp).toBe(malformedBytes);
+    // User-facing message names the backup path.
+    expect(cap.stdout()).toMatch(/was malformed/);
+    expect(cap.stdout()).toMatch(/backed up to/);
   });
 
   it("--token overrides existing ~/.mcph/config.json token", async () => {

@@ -239,7 +239,22 @@ describe("runUpgrade", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(didSpawn).toBe(false);
-    expect(io.err.join("\n")).toContain("refusing to auto-run");
+    expect(io.err.join("\n")).toContain("can't be upgraded automatically");
+  });
+
+  it("without --run on a non-global method, prints suggested command and notes --run won't work", async () => {
+    const io = captureIO();
+    const r = await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: "/proj/app/node_modules/@yawlabs/mcph/dist/index.js",
+      fetchLatest: async () => "0.45.0",
+      out: io.push,
+      err: io.pushErr,
+    });
+    expect(r.exitCode).toBe(1);
+    const out = io.out.join("\n");
+    expect(out).toContain("Suggested command");
+    expect(out).toContain("--run only works for global-npm");
   });
 
   it("--json emits the plan and exits 1 when stale without --run", async () => {

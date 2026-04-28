@@ -26,7 +26,7 @@ vi.mock("../upstream.js", async (importOriginal) => {
 });
 
 import { request } from "undici";
-import { initTestRunner, startTestRunner, stopTestRunner } from "../test-runner.js";
+import { __testRunnerConsecutive404, initTestRunner, startTestRunner, stopTestRunner } from "../test-runner.js";
 import type { ConnectConfig, UpstreamConnection, UpstreamServerConfig } from "../types.js";
 import { ActivationError, connectToUpstream } from "../upstream.js";
 
@@ -117,14 +117,49 @@ describe("test runner", () => {
     expect(callUrl).toContain("/api/connect/test-requests");
   });
 
-  it("stops polling when the endpoint returns 404 (older mcp.hosting deploy)", async () => {
+  it("keeps polling on a single 404 (transient deploy / CDN edge cache miss)", async () => {
     initTestRunner("https://mcp.hosting", "tok", () => null);
     vi.mocked(request).mockResolvedValue(mockStatusResponse(404) as any);
     startTestRunner();
     await tickPoll();
-    // Subsequent ticks should NOT trigger another fetch.
+    expect(__testRunnerConsecutive404()).toBe(1);
+    // A second tick should still fire a fetch -- the runner has not stopped.
     await tickPoll();
-    expect(vi.mocked(request)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(request)).toHaveBeenCalledTimes(2);
+    expect(__testRunnerConsecutive404()).toBe(2);
+    stopTestRunner();
+  });
+
+  it("stops polling after a sustained 404 streak (endpoint genuinely gone)", async () => {
+    initTestRunner("https://mcp.hosting", "tok", () => null);
+    vi.mocked(request).mockResolvedValue(mockStatusResponse(404) as any);
+    startTestRunner();
+    // 10 consecutive 404s should trip the limit.
+    for (let i = 0; i < 10; i++) await tickPoll();
+    const callsAtLimit = vi.mocked(request).mock.calls.length;
+    // After the limit fires, stopTestRunner has run; further ticks don't fetch.
+    await tickPoll();
+    await tickPoll();
+    expect(vi.mocked(request).mock.calls.length).toBe(callsAtLimit);
+  });
+
+  it("a successful 200 resets the consecutive-404 counter", async () => {
+    initTestRunner("https://mcp.hosting", "tok", () => null);
+    let callCount = 0;
+    vi.mocked(request).mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) return mockStatusResponse(404) as any;
+      if (callCount === 2) return mockEmptyResponse() as any; // 200 with no work
+      return mockStatusResponse(404) as any;
+    });
+    startTestRunner();
+    await tickPoll();
+    expect(__testRunnerConsecutive404()).toBe(1);
+    await tickPoll();
+    expect(__testRunnerConsecutive404()).toBe(0);
+    await tickPoll();
+    expect(__testRunnerConsecutive404()).toBe(1);
+    stopTestRunner();
   });
 
   it("posts not_in_config when the server isn't in the current config", async () => {

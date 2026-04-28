@@ -139,6 +139,22 @@ describe("persistence.saveState", () => {
     expect(loaded.packHistory[0].namespace).toBe("gh");
     expect(loaded.packHistory[1].namespace).toBe("linear");
   });
+
+  it("serializes concurrent saves so the later call's data wins on disk", async () => {
+    const stateA = {
+      learning: { gh: { dispatched: 1, succeeded: 1, lastUsedAt: 1 } },
+      packHistory: [{ namespace: "gh", toolName: "a", at: 1 }],
+    };
+    const stateB = {
+      learning: { linear: { dispatched: 9, succeeded: 9, lastUsedAt: 99 } },
+      packHistory: [{ namespace: "linear", toolName: "b", at: 99 }],
+    };
+    await Promise.all([saveState(stateA, file), saveState(stateB, file)]);
+    const loaded = await loadState(file);
+    expect(loaded.learning).toEqual(stateB.learning);
+    expect(loaded.packHistory).toEqual(stateB.packHistory);
+    expect(loaded.learning.gh).toBeUndefined();
+  });
 });
 
 describe("LearningStore snapshot round-trip", () => {

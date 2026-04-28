@@ -23,6 +23,33 @@ import { join } from "node:path";
 import { userConfigDir } from "./paths.js";
 import { STATE_FILENAME, loadState } from "./persistence.js";
 
+export const RESET_LEARNING_USAGE = `Usage: mcph reset-learning
+
+  Delete ~/.mcph/state.json so cross-session learning starts fresh.
+  Use this after fixing the root cause of a flaky upstream (token
+  rotated, account swapped, server replaced) so the routing penalty
+  doesn't keep suppressing it.
+
+  -h, --help  Show this help.`;
+
+export type ParsedResetLearning =
+  | { kind: "help" }
+  | { kind: "error"; error: string }
+  | { kind: "ok"; options: Record<string, never> };
+
+// Argv parser. Crucially, this exists so `mcph reset-learning --help`
+// doesn't fall through to runResetLearning() and silently delete state.
+export function parseResetLearningArgs(argv: string[]): ParsedResetLearning {
+  for (const arg of argv) {
+    if (arg === "-h" || arg === "--help") return { kind: "help" };
+    return {
+      kind: "error",
+      error: `mcph reset-learning: unknown argument "${arg}"\n\n${RESET_LEARNING_USAGE}`,
+    };
+  }
+  return { kind: "ok", options: {} };
+}
+
 export interface ResetLearningOptions {
   home?: string;
   env?: NodeJS.ProcessEnv;

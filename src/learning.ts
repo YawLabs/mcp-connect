@@ -1,8 +1,14 @@
-// Lightweight usage signal. Tracks how often each namespace was picked
-// by dispatch AND the tool call that followed actually succeeded, then
-// exposes a bounded boost factor so future dispatches nudge toward
-// servers that have been genuinely useful — and AWAY from servers that
-// have been flaky.
+// Lightweight usage signal. Tracks how often each namespace's tools
+// were called AND how often the upstream answered without isError,
+// then exposes a bounded boost factor so future dispatches nudge
+// toward servers that have been genuinely useful — and AWAY from
+// servers that have been flaky.
+//
+// Recorded on the proxy path in handleToolCall (every routed tool
+// call increments dispatched; non-errored replies also increment
+// succeeded). Activation success is deliberately NOT recorded —
+// otherwise a server that activates fine but every tool call 500s
+// would still look 100% reliable in the cross-session signal.
 //
 // Deliberately conservative:
 //   - Positive boost never exceeds +10% — relevance is the primary

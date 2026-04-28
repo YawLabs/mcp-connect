@@ -16,6 +16,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { type AnalyticsFailure, getLastAnalyticsFailure } from "./analytics.js";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -35,7 +36,8 @@ import {
 } from "./install-targets.js";
 import { parseJsonc } from "./jsonc.js";
 import { userConfigDir } from "./paths.js";
-import { STATE_FILENAME, loadState } from "./persistence.js";
+import { STATE_FILENAME, STATE_SCHEMA_VERSION, loadState } from "./persistence.js";
+import { type ReportFailure, getLastReportFailure } from "./tool-report.js";
 import { selectFlakyNamespaces } from "./usage-hints.js";
 
 export interface DoctorOptions {
@@ -171,6 +173,14 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // cross-session block in mcp_connect_health, so "flaky" means the
   // same thing whether you check via the LLM or via the CLI.
   await renderReliabilitySection({ home, env, print });
+
+  // Background HTTP posters (analytics, tool-report) fire-and-forget by
+  // design, but a 401/403 there means the user's token has lost write
+  // scope and their analytics is silently disappearing. Latches in the
+  // poster modules capture only the most recent rejection per module;
+  // the section is rendered ONLY when at least one latch is set so
+  // healthy installs stay quiet.
+  renderBackgroundPostersSection({ print });
 
   // Probe every supported client/scope combo on the current OS.
   const clients = probeClients({ home, os, cwd });
@@ -417,6 +427,30 @@ async function renderStateSection(opts: {
   }
   const filePath = join(userConfigDir(home), STATE_FILENAME);
   print(`  path:   ${filePath}`);
+  // Peek before delegating to loadState. loadState swallows malformed
+  // JSON and version mismatches silently (returns emptyState), which is
+  // correct for runtime but hides real diagnostic info from doctor. We
+  // re-read the bytes here so a user with a corrupted state file gets
+  // an actionable message instead of "(no persisted state yet)".
+  const peek = await peekStateFile(filePath);
+  if (peek.kind === "malformed") {
+    print("  status: corrupt -- file exists but JSON is unparseable");
+    print(`  fix:    \`mcph reset-learning\` to clear, or open ${filePath} and fix by hand`);
+    print(`  detail: ${peek.message}`);
+    print("");
+    return;
+  }
+  if (peek.kind === "stale-version") {
+    print(`  status: schema mismatch (file is v${peek.version ?? "?"}, this mcph reads v${peek.expected})`);
+    print("  fix:    `mcph reset-learning` to drop the old file -- learning will rebuild on use");
+    print("");
+    return;
+  }
+  if (peek.kind === "unreadable") {
+    print(`  status: unreadable (${peek.message})`);
+    print("");
+    return;
+  }
   const persisted = await loadState(filePath);
   if (persisted.savedAt === 0) {
     print("  (no persisted state yet — will be created on the first tool call)");
@@ -426,6 +460,37 @@ async function renderStateSection(opts: {
     print(`  pack history entries: ${persisted.packHistory.length}`);
   }
   print("");
+}
+
+type StatePeek =
+  | { kind: "missing" }
+  | { kind: "ok" }
+  | { kind: "malformed"; message: string }
+  | { kind: "stale-version"; version: unknown; expected: number }
+  | { kind: "unreadable"; message: string };
+
+async function peekStateFile(filePath: string): Promise<StatePeek> {
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (err) {
+    if (err && typeof err === "object" && "code" in err && (err as { code?: unknown }).code === "ENOENT") {
+      return { kind: "missing" };
+    }
+    return { kind: "unreadable", message: err instanceof Error ? err.message : String(err) };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { kind: "malformed", message: err instanceof Error ? err.message : String(err) };
+  }
+  if (!parsed || typeof parsed !== "object") return { kind: "malformed", message: "top-level value is not an object" };
+  const version = (parsed as { version?: unknown }).version;
+  if (version !== STATE_SCHEMA_VERSION) {
+    return { kind: "stale-version", version, expected: STATE_SCHEMA_VERSION };
+  }
+  return { kind: "ok" };
 }
 
 // Roll up the flaky-dormant list from persisted state.json. Mirrors the
@@ -458,6 +523,31 @@ async function renderReliabilitySection(opts: {
     const age = formatRelativeAge(now - usage.lastUsedAt);
     print(`  ${namespace} — ${usage.dispatched} calls, ${rate}% success, last used ${age} ago`);
   }
+  print("");
+}
+
+// Render the BACKGROUND POSTERS section -- only when at least one
+// latch is set. The point is to be silent when everything is working;
+// a healthy install must not see this header. Reads the latches via
+// the module getters (no cross-module circular: doctor depends on
+// analytics/tool-report, never the reverse). The "no recent failure"
+// row appears only alongside a sibling that DID fail, so the user can
+// tell which poster is broken vs. which is fine.
+function renderBackgroundPostersSection(opts: {
+  print: (s?: string) => void;
+}): void {
+  const { print } = opts;
+  const analyticsFailure = getLastAnalyticsFailure();
+  const reportFailure = getLastReportFailure();
+  if (!analyticsFailure && !reportFailure) return;
+
+  const now = Date.now();
+  const fmt = (f: AnalyticsFailure | ReportFailure): string =>
+    `HTTP ${f.statusCode} from ${f.url}, ${formatRelativeAge(now - f.at)} ago`;
+
+  print("BACKGROUND POSTERS (recent failures)");
+  print(`  analytics:    ${analyticsFailure ? fmt(analyticsFailure) : "(no recent failure)"}`);
+  print(`  tool-report:  ${reportFailure ? fmt(reportFailure) : "(no recent failure)"}`);
   print("");
 }
 

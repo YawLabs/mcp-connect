@@ -67,4 +67,14 @@ describe("stripJsoncComments", () => {
   it("parseJsonc still throws SyntaxError on invalid JSON (not silently empty)", () => {
     expect(() => parseJsonc("{ not valid }")).toThrow(SyntaxError);
   });
+
+  it("parseJsonc strips a leading UTF-8 BOM (Notepad-saved configs)", () => {
+    const src = `﻿${JSON.stringify({ a: 1 })}`;
+    expect(parseJsonc(src)).toEqual({ a: 1 });
+  });
+
+  it("parseJsonc strips BOM before processing comments", () => {
+    const src = `﻿// header\n{"a": 1}`;
+    expect(parseJsonc(src)).toEqual({ a: 1 });
+  });
 });

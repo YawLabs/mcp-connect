@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CONFIG_DIRNAME } from "../paths.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
-import { runResetLearning } from "../reset-learning-cmd.js";
+import { parseResetLearningArgs, runResetLearning } from "../reset-learning-cmd.js";
 
 // All tests use an isolated fake home dir so we never touch the real
 // user's ~/.mcph/state.json. userConfigDir(home) joins home + ".mcph".
@@ -199,5 +199,32 @@ describe("runResetLearning", () => {
     const r = await runResetLearning({ home, env: {}, out: io.push, err: io.pushErr });
     expect(r.exitCode).toBe(0);
     expect(io.out.join("")).toContain("learning entries removed:     3");
+  });
+});
+
+describe("parseResetLearningArgs", () => {
+  it("returns help kind for --help / -h (so dispatch never falls through to delete)", () => {
+    expect(parseResetLearningArgs(["--help"]).kind).toBe("help");
+    expect(parseResetLearningArgs(["-h"]).kind).toBe("help");
+  });
+
+  it("returns ok kind with empty options when no argv", () => {
+    const r = parseResetLearningArgs([]);
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") expect(r.options).toEqual({});
+  });
+
+  it("returns error kind on unknown flag, with usage hint", () => {
+    const r = parseResetLearningArgs(["--bogus"]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") {
+      expect(r.error).toContain("--bogus");
+      expect(r.error).toContain("Usage: mcph reset-learning");
+    }
+  });
+
+  it("returns error kind on stray positional too", () => {
+    const r = parseResetLearningArgs(["something"]);
+    expect(r.kind).toBe("error");
   });
 });

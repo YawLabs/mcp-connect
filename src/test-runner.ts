@@ -17,11 +17,17 @@ import { ActivationError, connectToUpstream, disconnectFromUpstream } from "./up
 
 const POLL_INTERVAL_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 10_000;
+// Tolerate a transient 404 storm (e.g. a CDN edge cache miss during
+// deploy) before giving up on the endpoint. 10 polls @ 30s each = 5
+// minutes of leeway. A successful 200 anywhere in that window resets
+// the counter, so we only stop when the endpoint is genuinely gone.
+const CONSECUTIVE_404_LIMIT = 10;
 
 let apiUrl = "";
 let token = "";
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let running = false;
+let consecutive404 = 0;
 // Resolved at start() time so we can pass it to the test runner without
 // the runner needing to know about ConnectServer's internals.
 let configRef: () => ConnectConfig | null = () => null;
@@ -35,15 +41,23 @@ export function initTestRunner(url: string, tok: string, getConfig: () => Connec
 export function startTestRunner(): void {
   if (running) return;
   running = true;
+  consecutive404 = 0;
   schedule();
 }
 
 export function stopTestRunner(): void {
   running = false;
+  consecutive404 = 0;
   if (pollTimer) {
     clearTimeout(pollTimer);
     pollTimer = null;
   }
+}
+
+// Test hook -- expose the consecutive-404 counter so tests can assert
+// the recovery semantics without poking module internals.
+export function __testRunnerConsecutive404(): number {
+  return consecutive404;
 }
 
 function schedule(): void {
@@ -89,17 +103,28 @@ async function fetchPending(): Promise<PendingRequest[]> {
       bodyTimeout: REQUEST_TIMEOUT_MS,
     });
     if (res.statusCode === 404) {
-      // Endpoint missing — older mcp.hosting deploy. Stop polling so
-      // we don't spam logs; admin will redeploy and a restart picks it
-      // back up.
       await res.body.text().catch(() => {});
-      stopTestRunner();
+      consecutive404++;
+      // Log on the first 404 of a streak, then stay quiet. Stop polling
+      // only after a sustained outage -- a transient 404 during a deploy
+      // shouldn't permanently disable the runner.
+      if (consecutive404 === 1) {
+        log("warn", "Test runner endpoint returned 404; will retry", { url: `${apiUrl}/api/connect/test-requests` });
+      }
+      if (consecutive404 >= CONSECUTIVE_404_LIMIT) {
+        log("warn", "Test runner endpoint persistently 404; stopping poller", {
+          consecutive: consecutive404,
+        });
+        stopTestRunner();
+      }
       return [];
     }
     if (res.statusCode !== 200) {
       await res.body.text().catch(() => {});
+      consecutive404 = 0;
       return [];
     }
+    consecutive404 = 0;
     const body = (await res.body.json()) as { requests?: PendingRequest[] };
     return Array.isArray(body?.requests) ? body.requests : [];
   } catch {

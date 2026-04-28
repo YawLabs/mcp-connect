@@ -26,6 +26,19 @@ const CONNECT_TIMEOUT = (() => {
   return Number.isFinite(n) && n > 0 ? n : 15_000;
 })();
 
+// Bound on per-request listTools/listResources/listPrompts after the
+// initial handshake. Without this, a server that completes connect but
+// then hangs on an inventory call would lock up activation forever (the
+// CONNECT_TIMEOUT timer above is already cleared by the time we reach
+// the listX calls). 15s matches the connect ceiling -- if a server
+// can't list its own tools in 15s, surface it as a real failure.
+const LIST_TIMEOUT = (() => {
+  const env = process.env.MCP_LIST_TIMEOUT;
+  if (!env) return 15_000;
+  const n = Number.parseInt(env, 10);
+  return Number.isFinite(n) && n > 0 ? n : 15_000;
+})();
+
 // Cap captured stderr so a chatty server can't balloon mcph's memory.
 // 8KB tail is plenty to see the last error message — servers that emit
 // multi-megabyte output to stderr before crashing are doing something
@@ -303,7 +316,7 @@ export async function disconnectFromUpstream(connection: UpstreamConnection): Pr
 
 export async function fetchResourcesFromUpstream(client: Client, namespace: string): Promise<UpstreamResourceDef[]> {
   try {
-    const result = await client.listResources();
+    const result = await client.listResources({}, { timeout: LIST_TIMEOUT });
     const raw = result.resources ?? [];
     if (raw.length > MAX_RESOURCES_PER_SERVER) {
       log("warn", "Upstream returned more resources than cap; truncating", {
@@ -327,7 +340,7 @@ export async function fetchResourcesFromUpstream(client: Client, namespace: stri
 
 export async function fetchPromptsFromUpstream(client: Client, namespace: string): Promise<UpstreamPromptDef[]> {
   try {
-    const result = await client.listPrompts();
+    const result = await client.listPrompts({}, { timeout: LIST_TIMEOUT });
     const raw = result.prompts ?? [];
     if (raw.length > MAX_PROMPTS_PER_SERVER) {
       log("warn", "Upstream returned more prompts than cap; truncating", {
@@ -349,7 +362,7 @@ export async function fetchPromptsFromUpstream(client: Client, namespace: string
 }
 
 export async function fetchToolsFromUpstream(client: Client, namespace: string): Promise<UpstreamToolDef[]> {
-  const result = await client.listTools();
+  const result = await client.listTools({}, { timeout: LIST_TIMEOUT });
   const raw = result.tools ?? [];
   if (raw.length > MAX_TOOLS_PER_SERVER) {
     log("warn", "Upstream returned more tools than cap; truncating", {

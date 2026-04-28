@@ -7,7 +7,7 @@ import { runDoctor } from "./doctor-cmd.js";
 import { closestNames } from "./fuzzy.js";
 import { parseInstallArgs, runInstall } from "./install-cmd.js";
 import { log } from "./logger.js";
-import { runResetLearning } from "./reset-learning-cmd.js";
+import { RESET_LEARNING_USAGE, parseResetLearningArgs, runResetLearning } from "./reset-learning-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
 import { parseUpgradeArgs, runUpgrade } from "./upgrade-cmd.js";
@@ -64,6 +64,15 @@ if (subcommand === "compliance") {
   }
   runDoctor({ json: doctorJson }).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "reset-learning") {
+  const parsed = parseResetLearningArgs(process.argv.slice(3));
+  if (parsed.kind === "help") {
+    process.stdout.write(`${RESET_LEARNING_USAGE}\n`);
+    process.exit(0);
+  }
+  if (parsed.kind === "error") {
+    process.stderr.write(`${parsed.error}\n`);
+    process.exit(2);
+  }
   runResetLearning().then((r) => process.exit(r.exitCode));
 } else if (subcommand === "servers") {
   const parsed = parseServersArgs(process.argv.slice(3));

@@ -56,20 +56,33 @@ export function buildTiebreakPrompt(intent: string, candidates: TiebreakCandidat
 }
 
 // Extract the chosen namespace from the LLM's free-text response. The
-// prompt asks for just the namespace, but LLMs sometimes add prose —
-// scan each non-empty line against the candidate list, prefer the
-// first match. Returns null if no candidate appears in the response.
+// prompt asks for just the namespace, but LLMs sometimes add prose --
+// scan each non-empty line against the candidate list. Within a single
+// line we pick whichever candidate appears earliest (by character
+// index); a response like "I prefer gitlab over github" must return
+// "gitlab", not the first candidate iterated. Returns null if no
+// candidate appears anywhere.
 export function parseTiebreakResponse(response: string, candidates: TiebreakCandidate[]): string | null {
-  const namespaces = new Set(candidates.map((c) => c.namespace));
+  const namespaces = candidates.map((c) => c.namespace);
+  const namespaceSet = new Set(namespaces);
   for (const rawLine of response.split(/\r?\n/)) {
     const line = rawLine.trim().replace(/^[`"'*>\-\s]+|[`"'*\s]+$/g, "");
     if (!line) continue;
-    if (namespaces.has(line)) return line;
-    // Allow inline mentions like "I pick github because..."
+    if (namespaceSet.has(line)) return line;
+    // Allow inline mentions like "I pick github because..." -- pick the
+    // earliest-positioned candidate so the LLM's lexical choice wins
+    // even when iteration order says otherwise.
+    let bestNs: string | null = null;
+    let bestPos = Number.POSITIVE_INFINITY;
     for (const ns of namespaces) {
       const re = new RegExp(`\\b${escapeRegex(ns)}\\b`);
-      if (re.test(line)) return ns;
+      const match = re.exec(line);
+      if (match && match.index < bestPos) {
+        bestPos = match.index;
+        bestNs = ns;
+      }
     }
+    if (bestNs) return bestNs;
   }
   return null;
 }

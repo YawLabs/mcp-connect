@@ -3,9 +3,10 @@ import type { DetectedPack } from "./pack-detect.js";
 
 // Inline usage hints for discover() output. Two signals:
 //
-//   1. Success count from LearningStore — "you called this N times
-//      and it worked." Populated by dispatch's post-call success
-//      tracking. Manual `activate` calls don't contribute.
+//   1. Success count from LearningStore — "you called a tool on this
+//      server N times and it worked." Populated on the proxy path in
+//      handleToolCall: every routed tool call where the upstream
+//      replied without isError. Activation alone doesn't contribute.
 //
 //   2. Co-activation peers from PackDetector — "when you loaded X
 //      you usually had Y loaded too." Populated by successful proxied

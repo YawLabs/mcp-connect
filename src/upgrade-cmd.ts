@@ -252,15 +252,26 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     return { exitCode: 0, lines };
   }
 
+  // Only `global-npm` is auto-runnable -- the others need the user to
+  // pick the right tool (pnpm vs npm, the right repo to git pull, etc.)
+  // so the prompt is honest about whether `--run` will work.
+  const autoRunnable = method === "global-npm";
+
   if (!opts.run) {
-    print(`Run:\n  ${plan.command}`);
+    if (autoRunnable) {
+      print(`Run:\n  ${plan.command}\n\nOr re-run with --run to upgrade in place.`);
+    } else {
+      print(`Suggested command (run it yourself; --run only works for global-npm installs):\n  ${plan.command}`);
+    }
     return { exitCode: 1, lines };
   }
 
   // --run: attempt the upgrade. Only whitelisted commands — never
   // pass arbitrary user input into a shell.
-  if (method !== "global-npm") {
-    printErr(`mcph upgrade --run: refusing to auto-run upgrade for method "${method}". Run manually: ${plan.command}`);
+  if (!autoRunnable) {
+    printErr(
+      `mcph upgrade --run: install method "${method}" can't be upgraded automatically. Run manually:\n  ${plan.command}`,
+    );
     return { exitCode: 2, lines };
   }
 

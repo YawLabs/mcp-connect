@@ -15,8 +15,9 @@
 //   - Atomic writes. Write-rename so a crash mid-flush can't leave
 //     half-written JSON where the loader would see garbage.
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { atomicWriteFile } from "./atomic-write.js";
 import { log } from "./logger.js";
 import { userConfigDir } from "./paths.js";
 
@@ -73,24 +74,38 @@ export async function loadState(filePath: string = statePath()): Promise<Persist
   }
 }
 
-// Save persisted state to disk atomically. Best-effort — failures log
+// In-process serializer. Two saveState calls debounced too close in time
+// would otherwise race -- both would mkdir, both would write to distinct
+// .tmp- files (the pid-timestamp suffix makes the temp names unique),
+// and both would rename onto the same target. Atomic-rename means we
+// never see torn JSON, but the loser's increments are silently dropped.
+// Chaining via this promise serializes the writes; the .catch reset
+// keeps a failed save from poisoning the chain for subsequent callers.
+//
+// The cross-process race (two mcph instances writing the same file) is
+// a separate problem that needs an OS-level file lock; not handled here.
+let saveChain: Promise<void> = Promise.resolve();
+
+// Save persisted state to disk atomically. Best-effort -- failures log
 // but never throw, since a missing save shouldn't crash the session.
-export async function saveState(
+export function saveState(
   state: Pick<PersistedState, "learning" | "packHistory">,
   filePath: string = statePath(),
 ): Promise<void> {
+  const next = saveChain.then(() => doSaveState(state, filePath));
+  saveChain = next.catch(() => undefined);
+  return next;
+}
+
+async function doSaveState(state: Pick<PersistedState, "learning" | "packHistory">, filePath: string): Promise<void> {
   const payload: PersistedState = {
     version: STATE_SCHEMA_VERSION,
     savedAt: Date.now(),
     learning: state.learning,
     packHistory: state.packHistory,
   };
-  const dir = path.dirname(filePath);
-  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
   try {
-    await mkdir(dir, { recursive: true });
-    await writeFile(tmp, JSON.stringify(payload, null, 2), "utf8");
-    await rename(tmp, filePath);
+    await atomicWriteFile(filePath, JSON.stringify(payload, null, 2));
   } catch (err) {
     log("warn", "Failed to save mcph state", { error: errorMessage(err) });
   }

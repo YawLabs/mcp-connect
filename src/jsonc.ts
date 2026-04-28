@@ -73,6 +73,11 @@ export function stripJsoncComments(src: string): string {
 // context when JSON.parse fails (so "bad JSON on line 7" works even after
 // we strip comments).
 export function parseJsonc(src: string): unknown {
-  const stripped = stripJsoncComments(src);
+  // Strip a leading UTF-8 BOM (U+FEFF). Notepad on Windows defaults to
+  // BOM-prefixed UTF-8, so a user who hand-edits ~/.claude.json there and
+  // saves it back produces a file JSON.parse rejects. The strip lives in the
+  // wrapper so stripJsoncComments stays focused on comments/strings.
+  const debommed = src.charCodeAt(0) === 0xfeff ? src.slice(1) : src;
+  const stripped = stripJsoncComments(debommed);
   return JSON.parse(stripped);
 }

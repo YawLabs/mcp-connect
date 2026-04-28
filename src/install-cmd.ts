@@ -22,11 +22,11 @@
 //                                                  and exit 0 without writing.
 
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { atomicWriteFile } from "./atomic-write.js";
 import { CONFIG_FILENAME, CURRENT_SCHEMA_VERSION, loadMcphConfig } from "./config-loader.js";
 import { type ClientProbeResult, probeClientsAsync } from "./doctor-cmd.js";
 import {
@@ -256,7 +256,13 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   const writeMcphConfig = !opts.skipMcphConfig;
   const home = opts.home ?? homedir();
   const mcphConfigPath = join(home, CONFIG_DIRNAME, CONFIG_FILENAME);
-  const mcphConfigJson = await composeMcphConfig(mcphConfigPath, token);
+  const mcphConfigComposed = await composeMcphConfig(mcphConfigPath, token);
+  if (mcphConfigComposed.backupPath) {
+    log(
+      `mcph install: existing ${mcphConfigPath} was malformed; original bytes backed up to ${mcphConfigComposed.backupPath} before overwriting.`,
+    );
+  }
+  const mcphConfigJson = mcphConfigComposed.json;
 
   // Claude Code: also ensure `permissions.allow` carries our pattern so
   // the user isn't re-prompted for every mcph tool call. No-op for other
@@ -275,31 +281,25 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
 
   if (opts.dryRun) {
     log("\n--- dry run: would write the following ---");
-    log(`\n# ${resolved.absolute}\n${clientJson}`);
     if (writeMcphConfig) log(`# ${mcphConfigPath}\n${mcphConfigJson}`);
+    log(`\n# ${resolved.absolute}\n${clientJson}`);
     if (settingsPatch?.changed) log(`# ${settingsPatch.path}\n${settingsPatch.nextJson}`);
-    const wouldWrite = [resolved.absolute];
+    const wouldWrite: string[] = [];
     if (writeMcphConfig) wouldWrite.push(mcphConfigPath);
+    wouldWrite.push(resolved.absolute);
     if (settingsPatch?.changed) wouldWrite.push(settingsPatch.path);
     return { written: [], wouldWrite, messages, exitCode: 0 };
   }
 
-  // Write client config (creating parent dirs if missing).
-  try {
-    await mkdir(dirname(resolved.absolute), { recursive: true });
-    await writeFile(resolved.absolute, clientJson, "utf8");
-  } catch (e) {
-    err(`mcph install: failed to write ${resolved.absolute}: ${(e as Error).message}`);
-    return { written: [], wouldWrite: [], messages, exitCode: 1 };
-  }
-  log(`Wrote ${resolved.absolute}`);
-  const written = [resolved.absolute];
+  const written: string[] = [];
 
-  // Write ~/.mcph/config.json with the token.
+  // Write ~/.mcph/config.json FIRST. If the second write (client config)
+  // fails, at least the token is captured here for the next install --
+  // otherwise the user would have a launch entry pointing at a token
+  // we never recorded, and would be re-prompted on every other client.
   if (writeMcphConfig) {
     try {
-      await mkdir(dirname(mcphConfigPath), { recursive: true });
-      await writeFile(mcphConfigPath, mcphConfigJson, "utf8");
+      await atomicWriteFile(mcphConfigPath, mcphConfigJson);
       // Best-effort POSIX permissions tighten — ignored on Windows.
       if (process.platform !== "win32") {
         try {
@@ -310,19 +310,30 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       }
     } catch (e) {
       err(`mcph install: failed to write ${mcphConfigPath}: ${(e as Error).message}`);
-      return { written, wouldWrite: [], messages, exitCode: 1 };
+      return { written: [], wouldWrite: [], messages, exitCode: 1 };
     }
     log(`Wrote ${mcphConfigPath}`);
     written.push(mcphConfigPath);
   }
+
+  // Write client config atomically. ~/.claude.json carries every
+  // project's mcpServers + permissions + history; a non-atomic write
+  // killed mid-flight could blow away the lot.
+  try {
+    await atomicWriteFile(resolved.absolute, clientJson);
+  } catch (e) {
+    err(`mcph install: failed to write ${resolved.absolute}: ${(e as Error).message}`);
+    return { written, wouldWrite: [], messages, exitCode: 1 };
+  }
+  log(`Wrote ${resolved.absolute}`);
+  written.push(resolved.absolute);
 
   // Claude Code: merge permissions.allow into settings.json so tool
   // calls don't prompt. Best-effort: any failure here is logged but does
   // NOT fail the overall install — the launch entry is already written.
   if (settingsPatch?.changed) {
     try {
-      await mkdir(dirname(settingsPatch.path), { recursive: true });
-      await writeFile(settingsPatch.path, settingsPatch.nextJson, "utf8");
+      await atomicWriteFile(settingsPatch.path, settingsPatch.nextJson);
       log(`Wrote ${settingsPatch.path} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow)`);
       written.push(settingsPatch.path);
     } catch (e) {
@@ -469,26 +480,47 @@ export function mergeClientConfig(
 }
 
 /** Compose the ~/.mcph/config.json contents — preserves any existing fields,
- *  upserts the token, ensures `version` is set. */
-async function composeMcphConfig(path: string, token: string): Promise<string> {
+ *  upserts the token, ensures `version` is set. When the existing file is
+ *  unparseable, the original bytes are saved to `${path}.bak-<ts>` first
+ *  so the user can recover their token by hand if anything else of value
+ *  was in there. Backup is best-effort; if it fails, we proceed without
+ *  it rather than blocking the install. */
+async function composeMcphConfig(path: string, token: string): Promise<{ json: string; backupPath?: string }> {
   let existing: Record<string, unknown> = {};
+  let backupPath: string | undefined;
   if (existsSync(path)) {
+    let raw = "";
     try {
-      const raw = await readFile(path, "utf8");
-      const parsed = parseJsonc(raw);
-      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-        existing = parsed as Record<string, unknown>;
-      }
+      raw = await readFile(path, "utf8");
     } catch {
-      // Existing file is malformed; we'll overwrite with a fresh one
-      // rather than refuse, because the user explicitly asked to install.
-      // (The malformed file is presumably their own typo, not ours.)
+      // Couldn't read -- treat as missing; nothing to back up.
+      raw = "";
+    }
+    if (raw) {
+      try {
+        const parsed = parseJsonc(raw);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          existing = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Malformed file: copy raw bytes aside before we overwrite, so
+        // a user who had a real token (or anything else) in there can
+        // recover it. The new config still gets written -- the user
+        // explicitly asked to install.
+        const candidate = `${path}.bak-${Date.now()}`;
+        try {
+          await atomicWriteFile(candidate, raw);
+          backupPath = candidate;
+        } catch {
+          // Couldn't write backup; not fatal. Proceed with overwrite.
+        }
+      }
     }
   }
   const next: Record<string, unknown> = { version: CURRENT_SCHEMA_VERSION, ...existing };
   next.token = token;
   if (typeof next.version !== "number") next.version = CURRENT_SCHEMA_VERSION;
-  return `${JSON.stringify(next, null, 2)}\n`;
+  return { json: `${JSON.stringify(next, null, 2)}\n`, backupPath };
 }
 
 /** CLI argv parser used by index.ts dispatcher. Exported so tests can

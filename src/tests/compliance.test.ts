@@ -71,11 +71,25 @@ describe("passesMinCompliance", () => {
     expect(passesMinCompliance("unknown", null)).toBe(true);
   });
 
-  it("returns true for ungraded servers regardless of min (don't punish unknown)", () => {
+  it("returns true for ungraded servers regardless of min (don't punish absent)", () => {
     expect(passesMinCompliance(undefined, "A")).toBe(true);
     expect(passesMinCompliance(null, "B")).toBe(true);
     expect(passesMinCompliance("", "F")).toBe(true);
-    expect(passesMinCompliance("Z", "A")).toBe(true); // unknown letter treated as ungraded
+    expect(passesMinCompliance("   ", "A")).toBe(true); // whitespace-only counts as ungraded
+  });
+
+  it("fails closed on unrecognized grade strings when a min is set", () => {
+    __resetComplianceWarningLatch();
+    expect(passesMinCompliance("Z", "A")).toBe(false);
+    expect(passesMinCompliance("AAA", "A")).toBe(false);
+    expect(passesMinCompliance("E", "F")).toBe(false); // no E in A-F scale
+    expect(passesMinCompliance("grade-a", "A")).toBe(false);
+  });
+
+  it("unrecognized grade with no min set still passes (no gate to apply)", () => {
+    __resetComplianceWarningLatch();
+    expect(passesMinCompliance("Z", null)).toBe(true);
+    expect(passesMinCompliance("AAA", null)).toBe(true);
   });
 
   it("passes when grade equals min (A passes min=A)", () => {

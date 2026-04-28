@@ -1552,6 +1552,53 @@ describe("ConnectServer", () => {
       expect(priv.packDetector.getHistory().length).toBe(0);
     });
 
+    it("records each successful proxied tool call as dispatched + succeeded in learning", async () => {
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      conn.client.callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      await priv.handleToolCall("gh_create_issue", {});
+      await priv.handleToolCall("gh_create_issue", {});
+      const usage = priv.learning.get("gh");
+      expect(usage?.dispatched).toBe(2);
+      expect(usage?.succeeded).toBe(2);
+    });
+
+    it("counts upstream isError responses toward dispatched but NOT succeeded", async () => {
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue"]);
+      // Upstream returns a structured error response (not a transport
+      // throw) — isError: true is the upstream's own assessment.
+      conn.client.callTool = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "validation failed" }],
+        isError: true,
+      });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      await priv.handleToolCall("gh_create_issue", {});
+      const usage = priv.learning.get("gh");
+      expect(usage?.dispatched).toBe(1);
+      expect(usage?.succeeded).toBe(0);
+    });
+
+    it("does not record activation alone as a learning signal", async () => {
+      // handleDispatch activates a winner; previously that incremented
+      // both dispatched and succeeded, masking flaky tool-call paths.
+      // Tool-call success is now the only learning input.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+      const conn = makeConnection("gh", ["create_issue"]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(conn);
+
+      await priv.handleDispatch("github issue", 1);
+      expect(priv.learning.get("gh")).toBeUndefined();
+    });
+
     it("routes meta-tool suggest and returns friendly message with no patterns", async () => {
       const priv = getPrivate(server);
       const result = await priv.handleToolCall("mcp_connect_suggest", {});

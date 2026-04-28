@@ -82,6 +82,13 @@ describe("parseTiebreakResponse", () => {
   it("prefers first line that names a candidate", () => {
     expect(parseTiebreakResponse("github\ngitlab", candidates)).toBe("github");
   });
+
+  it("within a single line, picks the candidate at the earliest position (LLM's lexical choice wins)", () => {
+    // "I prefer gitlab over github" -- the LLM is naming gitlab first;
+    // we must not return github just because it iterates first.
+    expect(parseTiebreakResponse("I prefer gitlab over github", candidates)).toBe("gitlab");
+    expect(parseTiebreakResponse("github vs gitlab -- pick github", candidates)).toBe("github");
+  });
 });
 
 describe("buildCandidates", () => {

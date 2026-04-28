@@ -860,8 +860,15 @@ export class ConnectServer {
         const serverConfig = this.config?.servers.find((s) => s.namespace === route.namespace);
         if (serverConfig) {
           let reconnected = false;
-          let lastErr: any;
-          for (let attempt = 0; attempt < 2; attempt++) {
+          let lastErr: unknown;
+          // Retry once with a 1s delay between attempts. Two attempts is
+          // intentional (we don't want a slow upstream to stall a tool call
+          // for a long time -- after this, surface the error and let the
+          // user re-activate manually).
+          const RECONNECT_ATTEMPTS = 2;
+          const RECONNECT_DELAY_MS = 1000;
+          for (let attempt = 0; attempt < RECONNECT_ATTEMPTS; attempt++) {
+            if (attempt > 0) await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS));
             try {
               await disconnectFromUpstream(conn);
               const newConn = await connectToUpstream(
@@ -875,25 +882,25 @@ export class ConnectServer {
               log("info", "Auto-reconnected to upstream", { namespace: route.namespace });
               reconnected = true;
               break;
-            } catch (err: any) {
+            } catch (err) {
               lastErr = err;
-              if (attempt === 0) {
+              if (attempt < RECONNECT_ATTEMPTS - 1) {
                 log("warn", "Auto-reconnect attempt failed, retrying", {
                   namespace: route.namespace,
-                  error: err.message,
+                  error: err instanceof Error ? err.message : String(err),
                 });
-                await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
               }
             }
           }
           if (!reconnected) {
             conn.status = "error";
-            log("error", "Auto-reconnect failed", { namespace: route.namespace, error: lastErr.message });
+            const lastErrMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+            log("error", "Auto-reconnect failed", { namespace: route.namespace, error: lastErrMsg });
             return {
               content: [
                 {
                   type: "text",
-                  text: `Server "${route.namespace}" disconnected and auto-reconnect failed: ${lastErr.message}. Use mcp_connect_activate with server "${route.namespace}" to reload it manually.`,
+                  text: `Server "${route.namespace}" disconnected and auto-reconnect failed: ${lastErrMsg}. Use mcp_connect_activate with server "${route.namespace}" to reload it manually.`,
                 },
               ],
               isError: true,
@@ -929,7 +936,6 @@ export class ConnectServer {
         action: "tool_call",
         latencyMs,
         success: !result.isError,
-        error: result.isError ? result.content[0]?.text : undefined,
       });
 
       // Prune the response before it hits the LLM. Rules are
@@ -991,13 +997,22 @@ export class ConnectServer {
           // is strictly best-effort, never fail the tool call for it.
         }
       }
+      // Cross-session learning signal. Every dispatched proxy call
+      // increments the denominator; only non-errored upstream replies
+      // increment the numerator. This is the ground truth that
+      // boostFactor + formatReliabilityWarning + the cross-session
+      // reliability block in handleHealth all read — activation
+      // success is deliberately NOT counted here (see handleDispatch).
+      this.learning.recordDispatch(route.namespace);
+      if (!result.isError) this.learning.recordSuccess(route.namespace);
+      this.scheduleStateSave();
+
       // Only count successful calls toward chain detection. An errored
       // call isn't a real usage signal — the user likely abandons or
       // retries on a different server. Meta-tools were short-circuited
       // above so they never reach this point.
       if (!result.isError) {
         this.packDetector.recordCall(route.namespace, route.originalName, Date.now());
-        this.scheduleStateSave();
       }
       await this.trackUsageAndAutoDeactivate(route.namespace);
     }
@@ -1057,7 +1072,7 @@ export class ConnectServer {
   private async twoStageRank(
     context: string,
     servers: UpstreamServerConfig[],
-  ): Promise<Array<{ namespace: string; score: number }>> {
+  ): Promise<Array<{ namespace: string; score: number; hasRerank: boolean }>> {
     const bm25Input = servers.map((s) => this.rankableFor(s));
     const bm25 = rankServers(context, bm25Input);
     if (bm25.length === 0) return [];
@@ -1067,10 +1082,10 @@ export class ConnectServer {
     const candidateIds = shortlist
       .map((r) => idByNamespace.get(r.namespace))
       .filter((id): id is string => typeof id === "string" && id.length > 0);
-    if (candidateIds.length === 0) return shortlist;
+    if (candidateIds.length === 0) return shortlist.map((r) => ({ ...r, hasRerank: false }));
 
     const rerankResults = await rerank(context, candidateIds);
-    if (!rerankResults) return shortlist;
+    if (!rerankResults) return shortlist.map((r) => ({ ...r, hasRerank: false }));
 
     // Map id → namespace so we can reorder the BM25 shortlist by the
     // rerank scores. Any BM25 candidate missing from rerank output
@@ -1098,7 +1113,7 @@ export class ConnectServer {
       if (a.hasRerank !== b.hasRerank) return a.hasRerank ? -1 : 1;
       return b.score - a.score;
     });
-    return reordered.map((r) => ({ namespace: r.namespace, score: r.score }));
+    return reordered;
   }
 
   // Auto-warm confidence gate — applied to discover(context) so a single
@@ -1110,10 +1125,15 @@ export class ConnectServer {
     return raw === undefined || raw === "" || raw === "1" || raw.toLowerCase() === "true";
   })();
   // Top score must clear this floor AND the gap over the runner-up must
-  // be convincing before we auto-activate. Values tuned by intuition;
-  // when we have real usage data we can re-pick them.
-  private static readonly AUTO_ACTIVATE_MIN_SCORE = 1.0;
-  private static readonly AUTO_ACTIVATE_MARGIN = 1.3;
+  // be convincing before we auto-activate. Values are scale-dependent --
+  // BM25 scores are unbounded positive numbers, rerank cosines are in
+  // [0, 1] -- so we keep separate thresholds and pick based on whether
+  // the top entry was reranked. Tuned by intuition; revisit when we
+  // have real usage data.
+  private static readonly AUTO_ACTIVATE_MIN_SCORE_BM25 = 1.0;
+  private static readonly AUTO_ACTIVATE_MARGIN_BM25 = 1.3;
+  private static readonly AUTO_ACTIVATE_MIN_SCORE_COSINE = 0.5;
+  private static readonly AUTO_ACTIVATE_MARGIN_COSINE = 1.25;
 
   // Below this installed-server count, discover() appends a one-line
   // marketplace pointer so sparse-config users see where to add more.
@@ -1143,13 +1163,20 @@ export class ConnectServer {
 
     // Only auto-warm if one candidate dominates: top score clears the
     // floor and either stands alone or beats the runner-up by the
-    // margin. Ambiguous queries fall through to the manual-pick list.
+    // margin. Use scale-appropriate thresholds -- without this, the
+    // BM25-tuned floor (1.0) would essentially never fire when rerank
+    // is up (cosines in [0, 1]), so discover and dispatch would silently
+    // pick different winners depending on backend mode.
     const top = ranked[0];
     const second = ranked[1];
+    const minScore = top?.hasRerank
+      ? ConnectServer.AUTO_ACTIVATE_MIN_SCORE_COSINE
+      : ConnectServer.AUTO_ACTIVATE_MIN_SCORE_BM25;
+    const margin = top?.hasRerank ? ConnectServer.AUTO_ACTIVATE_MARGIN_COSINE : ConnectServer.AUTO_ACTIVATE_MARGIN_BM25;
     const topWinsDecisively =
       top !== undefined &&
-      top.score >= ConnectServer.AUTO_ACTIVATE_MIN_SCORE &&
-      (second === undefined || top.score / (second.score || 1e-6) >= ConnectServer.AUTO_ACTIVATE_MARGIN);
+      top.score >= minScore &&
+      (second === undefined || top.score / (second.score || 1e-6) >= margin);
 
     if (!topWinsDecisively || !top) return this.handleDiscover(context);
 
@@ -1945,13 +1972,12 @@ export class ConnectServer {
       results.push(`${winner.namespace} (score ${winner.score.toFixed(2)}): ${r.message}`);
       if (r.isChanged) anyChanged = true;
       if (!r.ok) anyError = true;
-      // Treat a successful activation as a positive dispatch signal.
-      // Actual tool-call success is tracked via trackUsageAndAutoDeactivate
-      // on the proxy path, so dispatch-success is the right granularity
-      // here — we're grading the routing decision, not the tool call.
-      this.learning.recordDispatch(winner.namespace);
-      if (r.ok) this.learning.recordSuccess(winner.namespace);
-      this.scheduleStateSave();
+      // Activation success is NOT recorded as a learning signal — that
+      // would inflate "this server worked" into "every activation
+      // counts as a successful tool call," which collapses the
+      // dispatched/succeeded ratio that boostFactor and the flaky-
+      // namespace warnings rely on. The ground truth is tool-call
+      // success, recorded in handleToolCall on the proxy path.
     }
     // No trailing "Dispatch complete" progress — see handleActivate for
     // the client-side race this avoids.

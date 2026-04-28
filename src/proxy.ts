@@ -134,8 +134,21 @@ export function buildToolRoutes(
 ): Map<string, ToolRoute> {
   const routes = new Map<string, ToolRoute>();
 
+  // Active routes. The namespaced name is `${namespace}_${tool}` and the
+  // separator is `_` -- combinations like (ns=`gh`, tool=`actions_list`)
+  // and (ns=`gh_actions`, tool=`list`) both produce `gh_actions_list`.
+  // Last writer used to win silently; warn once per collision so the
+  // operator can rename one of the upstreams.
   for (const conn of activeConnections.values()) {
     for (const tool of conn.tools) {
+      const existing = routes.get(tool.namespacedName);
+      if (existing && existing.namespace !== conn.config.namespace) {
+        log("warn", "Tool route collision; later upstream shadows earlier", {
+          tool: tool.namespacedName,
+          shadowedNamespace: existing.namespace,
+          winningNamespace: conn.config.namespace,
+        });
+      }
       routes.set(tool.namespacedName, {
         namespace: conn.config.namespace,
         originalName: tool.name,
@@ -337,11 +350,22 @@ export async function routeToolCall(
     });
 
     return result as { content: Array<{ type: string; text: string }>; isError?: boolean };
-  } catch (err: any) {
-    log("error", "Tool call failed", { tool: toolName, namespace: route.namespace, error: err.message });
-
+  } catch (err) {
+    // Transport-level errors (timeouts, JSON-RPC errors, disconnects)
+    // come through here; structured upstream errors (`isError: true` in
+    // the result) flow back through the success path above. Include the
+    // MCP error code if present so the LLM can tell "args were wrong"
+    // (-32602) from "the upstream is down" (transport) and decide
+    // whether retrying makes sense.
+    const message = err instanceof Error ? err.message : String(err);
+    const code =
+      err && typeof err === "object" && "code" in err && typeof (err as { code: unknown }).code === "number"
+        ? (err as { code: number }).code
+        : undefined;
+    log("error", "Tool call failed", { tool: toolName, namespace: route.namespace, error: message, code });
+    const codeTag = code !== undefined ? ` [code=${code}]` : "";
     return {
-      content: [{ type: "text", text: `Error calling ${toolName}: ${err.message}` }],
+      content: [{ type: "text", text: `Error calling ${toolName}${codeTag}: ${message}` }],
       isError: true,
     };
   }
