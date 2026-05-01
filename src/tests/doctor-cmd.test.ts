@@ -153,6 +153,55 @@ describe("runDoctor — client detection", () => {
     });
     expect(cap.text()).toMatch(/run `mcph install claude-code`/);
   });
+
+  it("under CLAUDE_CONFIG_DIR, probes <DIR>/.claude.json — not the home file", async () => {
+    // Sets up the trap: home has the entry, wrapper dir does NOT.
+    // Doctor must report claude-code user as "not configured" (not "OK"),
+    // matching what `claude mcp list` actually sees in this session.
+    const wrapperDir = mkdtempSync(join(tmpdir(), "mcph-doctor-wrapper-"));
+    try {
+      writeFileSync(
+        join(synthHome, ".claude.json"),
+        JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx" } } }),
+      );
+      const cap = captureOut();
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: { MCPH_TOKEN: "mcp_pat_aaaa", CLAUDE_CONFIG_DIR: wrapperDir },
+        os: "linux",
+        out: cap.out,
+      });
+      const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+      expect(userScope?.hasMcphEntry).toBe(false);
+      expect(userScope?.path).toBe(join(wrapperDir, ".claude.json"));
+    } finally {
+      rmSync(wrapperDir, { recursive: true, force: true });
+    }
+  });
+
+  it("under CLAUDE_CONFIG_DIR, finds the entry when it lives in <DIR>/.claude.json", async () => {
+    const wrapperDir = mkdtempSync(join(tmpdir(), "mcph-doctor-wrapper-found-"));
+    try {
+      writeFileSync(
+        join(wrapperDir, ".claude.json"),
+        JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "npx" } } }),
+      );
+      const cap = captureOut();
+      const r = await runDoctor({
+        cwd: synthCwd,
+        home: synthHome,
+        env: { MCPH_TOKEN: "mcp_pat_aaaa", CLAUDE_CONFIG_DIR: wrapperDir },
+        os: "linux",
+        out: cap.out,
+      });
+      const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+      expect(userScope?.hasMcphEntry).toBe(true);
+      expect(cap.text()).toMatch(/Claude Code \(user\): OK/);
+    } finally {
+      rmSync(wrapperDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("scanShellHistoryForShadows", () => {

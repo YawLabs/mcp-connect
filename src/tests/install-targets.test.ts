@@ -1,5 +1,12 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ENTRY_NAME, INSTALL_TARGETS, buildLaunchEntry, resolveInstallPath } from "../install-targets.js";
+import {
+  ENTRY_NAME,
+  INSTALL_TARGETS,
+  buildLaunchEntry,
+  resolveClaudeCodeSettingsPath,
+  resolveInstallPath,
+} from "../install-targets.js";
 
 describe("INSTALL_TARGETS metadata", () => {
   it("includes the four expected clients", () => {
@@ -96,6 +103,160 @@ describe("resolveInstallPath — Claude Code", () => {
     expect(() =>
       resolveInstallPath({ clientId: "claude-code", scope: "project", os: "linux", home: "/home/alice" }),
     ).toThrow(/requires a project directory/);
+  });
+});
+
+describe("resolveInstallPath — Claude Code with CLAUDE_CONFIG_DIR override", () => {
+  // Locks the v0.47.2 fix: when Claude Code runs under a wrapper that sets
+  // CLAUDE_CONFIG_DIR (Yaw Mode, dev containers, sandboxed sessions), the
+  // user-scope `.claude.json` it reads moves to <DIR>/.claude.json. If
+  // mcph install ignores the env, the entry lands in ~/.claude.json while
+  // Claude Code is reading from somewhere else — `claude mcp list` shows
+  // nothing despite a "successful" install.
+
+  it("user scope honors claudeConfigDir, not home", () => {
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: "/home/alice",
+      claudeConfigDir: "/tmp/wrapper-session",
+    });
+    expect(r.absolute).toBe(join("/tmp/wrapper-session", ".claude.json"));
+    expect(r.absolute).not.toContain("alice");
+    expect(r.containerPath).toEqual(["mcpServers"]);
+  });
+
+  it("user scope display is the absolute resolved path when overridden (no ~ shortcut)", () => {
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: "/home/alice",
+      claudeConfigDir: "/tmp/wrapper-session",
+    });
+    // Must not pretend it's still ~/.claude.json — that would mislead
+    // users staring at doctor output trying to figure out where the
+    // entry actually went.
+    expect(r.display).toBe(join("/tmp/wrapper-session", ".claude.json"));
+    expect(r.display).not.toBe("~/.claude.json");
+  });
+
+  it("local scope honors claudeConfigDir while preserving the projects[<dir>].mcpServers containerPath", () => {
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "local",
+      os: "linux",
+      home: "/home/alice",
+      projectDir: "/home/alice/repo",
+      claudeConfigDir: "/tmp/wrapper-session",
+    });
+    expect(r.absolute).toBe(join("/tmp/wrapper-session", ".claude.json"));
+    // Container path is unchanged — local-scope MCP still nests under
+    // projects[<absDir>].mcpServers regardless of which file it's in.
+    // The projectDir key is a JSON property, not a path, so we keep
+    // the literal string form (it must match what Claude Code wrote).
+    expect(r.containerPath).toEqual(["projects", "/home/alice/repo", "mcpServers"]);
+  });
+
+  it("project scope is unaffected by claudeConfigDir (project-relative .mcp.json)", () => {
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "project",
+      os: "linux",
+      home: "/home/alice",
+      projectDir: "/home/alice/repo",
+      claudeConfigDir: "/tmp/wrapper-session",
+    });
+    // Project scope writes <project>/.mcp.json — Claude Code reads it
+    // relative to the project, env redirect doesn't apply.
+    expect(r.absolute).toBe(join("/home/alice/repo", ".mcp.json"));
+  });
+
+  it("empty claudeConfigDir falls back to home (treated as unset)", () => {
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: "/home/alice",
+      claudeConfigDir: "",
+    });
+    expect(r.absolute).toBe(join("/home/alice", ".claude.json"));
+    expect(r.display).toBe("~/.claude.json");
+  });
+
+  it("undefined claudeConfigDir falls back to home (no env-fallback inside resolver)", () => {
+    // Resolver is pure: it does NOT consult process.env.CLAUDE_CONFIG_DIR
+    // on its own. Callers (install-cmd, doctor-cmd, index.ts) read env
+    // and pass it; this keeps unit tests deterministic regardless of
+    // whether the test runner inherits a real CLAUDE_CONFIG_DIR.
+    const r = resolveInstallPath({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: "/home/alice",
+    });
+    expect(r.absolute).toBe(join("/home/alice", ".claude.json"));
+  });
+
+  it("does not leak into other clients (cursor user scope unaffected)", () => {
+    const r = resolveInstallPath({
+      clientId: "cursor",
+      scope: "user",
+      os: "linux",
+      home: "/home/alice",
+      claudeConfigDir: "/tmp/wrapper-session",
+    });
+    // Cursor has its own redirect mechanism (none, today) — claude_config_dir
+    // must not bleed into ~/.cursor/mcp.json resolution.
+    expect(r.absolute).toBe(join("/home/alice", ".cursor", "mcp.json"));
+  });
+});
+
+describe("resolveClaudeCodeSettingsPath", () => {
+  it("user scope without override resolves to ~/.claude/settings.json", () => {
+    const p = resolveClaudeCodeSettingsPath("user", { home: "/home/alice", os: "linux" });
+    expect(p).toBe(join("/home/alice", ".claude", "settings.json"));
+  });
+
+  it("user scope with claudeConfigDir resolves to <DIR>/settings.json", () => {
+    // Note: NOT <DIR>/.claude/settings.json — the .claude segment is
+    // absorbed by the env redirect (the dir IS the .claude equivalent).
+    const p = resolveClaudeCodeSettingsPath("user", {
+      home: "/home/alice",
+      os: "linux",
+      claudeConfigDir: "/tmp/wrapper-session",
+    });
+    expect(p).toBe(join("/tmp/wrapper-session", "settings.json"));
+  });
+
+  it("project scope is unaffected by claudeConfigDir", () => {
+    const p = resolveClaudeCodeSettingsPath("project", {
+      home: "/home/alice",
+      projectDir: "/home/alice/repo",
+      os: "linux",
+      claudeConfigDir: "/tmp/wrapper-session",
+    });
+    expect(p).toBe(join("/home/alice/repo", ".claude", "settings.json"));
+  });
+
+  it("local scope writes settings.local.json in the project dir, not the wrapper dir", () => {
+    const p = resolveClaudeCodeSettingsPath("local", {
+      home: "/home/alice",
+      projectDir: "/home/alice/repo",
+      os: "linux",
+      claudeConfigDir: "/tmp/wrapper-session",
+    });
+    expect(p).toBe(join("/home/alice/repo", ".claude", "settings.local.json"));
+  });
+
+  it("empty claudeConfigDir falls back to home (treated as unset)", () => {
+    const p = resolveClaudeCodeSettingsPath("user", {
+      home: "/home/alice",
+      os: "linux",
+      claudeConfigDir: "",
+    });
+    expect(p).toBe(join("/home/alice", ".claude", "settings.json"));
   });
 });
 

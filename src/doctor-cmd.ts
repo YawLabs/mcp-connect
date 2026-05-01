@@ -182,8 +182,11 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // healthy installs stay quiet.
   renderBackgroundPostersSection({ print });
 
-  // Probe every supported client/scope combo on the current OS.
-  const clients = probeClients({ home, os, cwd });
+  // Probe every supported client/scope combo on the current OS. Honor
+  // CLAUDE_CONFIG_DIR so doctor sees the same file Claude Code reads
+  // when run inside a wrapper (Yaw Mode, dev container with the env set).
+  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  const clients = probeClients({ home, os, cwd, claudeConfigDir });
   print("INSTALLED CLIENTS (probed config files)");
   for (const c of clients) {
     const status = c.unavailable
@@ -275,7 +278,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 
   const timestamp = new Date().toISOString();
   const config = await loadMcphConfig({ cwd, home, env });
-  const clients = probeClients({ home, os, cwd });
+  const claudeConfigDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0 ? env.CLAUDE_CONFIG_DIR : undefined;
+  const clients = probeClients({ home, os, cwd, claudeConfigDir });
 
   const envVarNames = [
     "MCPH_POLL_INTERVAL",
@@ -577,6 +581,10 @@ interface ProbeOptions {
   home: string;
   os: InstallOS;
   cwd: string;
+  /** Claude Code's `CLAUDE_CONFIG_DIR`. When set, claude-code probes hit
+   *  `<DIR>/.claude.json` instead of `<HOME>/.claude.json` so doctor and
+   *  `mcph install --list` see the same file Claude Code reads. */
+  claudeConfigDir?: string;
 }
 
 function probeClients(opts: ProbeOptions): ClientProbeResult[] {
@@ -607,6 +615,7 @@ function probeClients(opts: ProbeOptions): ClientProbeResult[] {
           os: opts.os,
           home: opts.home,
           projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
+          claudeConfigDir: opts.claudeConfigDir,
         });
       } catch {
         // resolveInstallPath throws when project is required but missing —
@@ -689,6 +698,7 @@ export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbe
         os: opts.os,
         home: opts.home,
         projectDir: scope.requiresProjectDir ? opts.cwd : undefined,
+        claudeConfigDir: opts.claudeConfigDir,
       });
       const exists = existsSync(resolved.absolute);
       let hasMcphEntry = false;

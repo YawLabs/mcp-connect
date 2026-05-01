@@ -47,7 +47,13 @@ if (subcommand === "compliance") {
     process.stderr.write(`${parsed.error}\n`);
     process.exit(2);
   }
-  runInstall(parsed.options).then((r) => process.exit(r.exitCode));
+  // Read CLAUDE_CONFIG_DIR here (not inside runInstall) so tests stay
+  // hermetic — they call runInstall directly and never inherit env state.
+  const claudeConfigDir =
+    process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.length > 0
+      ? process.env.CLAUDE_CONFIG_DIR
+      : undefined;
+  runInstall({ ...parsed.options, claudeConfigDir }).then((r) => process.exit(r.exitCode));
 } else if (subcommand === "doctor") {
   const doctorArgs = process.argv.slice(3);
   const doctorJson = doctorArgs.includes("--json");

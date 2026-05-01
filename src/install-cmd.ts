@@ -68,6 +68,14 @@ export interface InstallCommandOptions {
   home?: string;
   /** Override for tests; defaults to process.cwd(). */
   cwd?: string;
+  /** Claude Code's `CLAUDE_CONFIG_DIR`. When set, claude-code writes go
+   *  to `<DIR>/.claude.json` and `<DIR>/settings.json` instead of the
+   *  HOME-based defaults. Wrappers like Yaw Mode set this to point Claude
+   *  Code at a per-session config; install must follow the redirect or
+   *  the entry lands where Claude Code never reads it. The CLI dispatcher
+   *  in index.ts populates this from `process.env.CLAUDE_CONFIG_DIR`;
+   *  tests leave it undefined to stay hermetic against an env-set value. */
+  claudeConfigDir?: string;
   /** Override for tests; defaults to process.stdin/stdout. */
   io?: {
     stdin: NodeJS.ReadableStream;
@@ -165,6 +173,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       os,
       home: opts.home,
       projectDir,
+      claudeConfigDir: opts.claudeConfigDir,
     });
   } catch (e) {
     err(`mcph install: ${(e as Error).message}`);
@@ -276,6 +285,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           home,
           projectDir,
           os,
+          claudeConfigDir: opts.claudeConfigDir,
         })
       : null;
 
@@ -360,11 +370,13 @@ async function prepareClaudeCodeSettingsPatch(opts: {
   home: string;
   projectDir: string | undefined;
   os: InstallOS;
+  claudeConfigDir: string | undefined;
 }): Promise<{ path: string; nextJson: string; changed: boolean } | null> {
   const path = resolveClaudeCodeSettingsPath(opts.scope, {
     home: opts.home,
     projectDir: opts.projectDir,
     os: opts.os,
+    claudeConfigDir: opts.claudeConfigDir,
   });
   if (!path) return null;
 
@@ -625,7 +637,7 @@ async function runInstallList(opts: InstallCommandOptions, log: (s: string) => v
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
   const os = opts.os ?? CURRENT_OS;
-  const probes = await probeClientsAsync({ home, os, cwd });
+  const probes = await probeClientsAsync({ home, os, cwd, claudeConfigDir: opts.claudeConfigDir });
 
   const rows = probes.map((p) => ({
     client: INSTALL_TARGETS.find((t) => t.clientId === p.clientId)?.label ?? p.clientId,

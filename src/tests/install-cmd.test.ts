@@ -324,6 +324,98 @@ describe("runInstall — happy path (claude-code, user scope, fresh install)", (
   });
 });
 
+describe("runInstall — claudeConfigDir override (CLAUDE_CONFIG_DIR wrapper)", () => {
+  // Locks the v0.47.2 fix: when Claude Code runs under a wrapper that
+  // sets CLAUDE_CONFIG_DIR, BOTH the mcpServers config AND the
+  // permissions.allow patch must follow the redirect. Otherwise the
+  // user sees a "successful" install but `claude mcp list` shows nothing.
+
+  it("writes .claude.json + settings.json into the wrapper dir, not home", async () => {
+    const wrapperDir = mkdtempSync(join(tmpdir(), "mcph-wrapper-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "user",
+        os: "linux",
+        home: synthHome,
+        claudeConfigDir: wrapperDir,
+        token: "mcp_pat_wrapper_aaaa",
+        io: cap.io,
+      });
+      expect(r.exitCode).toBe(0);
+
+      // The two claude-code files land in the wrapper dir.
+      const wrapperClient = join(wrapperDir, ".claude.json");
+      const wrapperSettings = join(wrapperDir, "settings.json");
+      expect(existsSync(wrapperClient)).toBe(true);
+      expect(existsSync(wrapperSettings)).toBe(true);
+      const client = JSON.parse(readFileSync(wrapperClient, "utf8"));
+      expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
+      const settings = JSON.parse(readFileSync(wrapperSettings, "utf8"));
+      expect(settings.permissions.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+
+      // Crucially, the home-based defaults are NOT created — that was
+      // the original bug (entry written, but to a file Claude Code
+      // doesn't read under the wrapper).
+      expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+      expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
+
+      // ~/.mcph/config.json still lives in home — it's the mcph-side
+      // config, not Claude-side, and unaffected by CLAUDE_CONFIG_DIR.
+      expect(existsSync(join(synthHome, ".mcph", "config.json"))).toBe(true);
+    } finally {
+      rmSync(wrapperDir, { recursive: true, force: true });
+    }
+  });
+
+  it("local scope under wrapper writes to <wrapperDir>/.claude.json projects[<dir>].mcpServers", async () => {
+    const wrapperDir = mkdtempSync(join(tmpdir(), "mcph-wrapper-local-"));
+    try {
+      const cap = captureIo();
+      const r = await runInstall({
+        clientId: "claude-code",
+        scope: "local",
+        os: "linux",
+        home: synthHome,
+        projectDir: synthCwd,
+        claudeConfigDir: wrapperDir,
+        token: "mcp_pat_wrapper_local_aaaa",
+        io: cap.io,
+      });
+      expect(r.exitCode).toBe(0);
+
+      const wrapperClient = join(wrapperDir, ".claude.json");
+      expect(existsSync(wrapperClient)).toBe(true);
+      const client = JSON.parse(readFileSync(wrapperClient, "utf8"));
+      // Nested under projects[<absDir>].mcpServers — locks the local-scope
+      // shape against accidental flattening when redirecting.
+      expect(client.projects[synthCwd].mcpServers[ENTRY_NAME].command).toBe("npx");
+
+      // Home version not created.
+      expect(existsSync(join(synthHome, ".claude.json"))).toBe(false);
+    } finally {
+      rmSync(wrapperDir, { recursive: true, force: true });
+    }
+  });
+
+  it("empty claudeConfigDir falls back to home (treated as unset)", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      claudeConfigDir: "",
+      token: "mcp_pat_empty_aaaa",
+      io: cap.io,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(join(synthHome, ".claude.json"))).toBe(true);
+    expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(true);
+  });
+});
+
 describe("runInstall — Windows uses cmd /c", () => {
   it("emits cmd-wrapped command on --os windows", async () => {
     const cap = captureIo();

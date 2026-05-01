@@ -13,6 +13,14 @@
 //     `~/.claude/settings.json` is silently ignored — settings.json holds
 //     hooks/model/permissions only. (We discovered this the hard way in
 //     v0.11.0–0.11.1: install wrote to settings.json, /mcp showed nothing.)
+//   • Claude Code honors the `CLAUDE_CONFIG_DIR` env var: when set, BOTH
+//     `.claude.json` AND `settings.json` move to that dir (`<DIR>/.claude.json`,
+//     `<DIR>/settings.json`), not `<HOME>/.claude.json` and
+//     `<HOME>/.claude/settings.json`. Wrappers like Yaw Mode use this to
+//     overlay a per-session config. If install ignores it, the entry lands
+//     in `~/.claude.json` while Claude Code reads from the wrapper dir —
+//     and `claude mcp list` shows nothing. We accept `claudeConfigDir`
+//     here so install/doctor/list-probe all see the same file Claude does.
 //   • VS Code uses `servers` (not `mcpServers`) as the top-level key in
 //     `.vscode/mcp.json`. Pasting a Claude Code shape fails silently.
 //   • Claude Desktop has no Linux build, so install on Linux for that
@@ -156,12 +164,18 @@ export interface ResolvePathOptions {
   home?: string;
   /** Override for tests; defaults to process.env.APPDATA (Windows). */
   appData?: string;
+  /** Claude Code's `CLAUDE_CONFIG_DIR`. When set (truthy), claude-code
+   *  user/local scope writes to `<dir>/.claude.json` instead of
+   *  `<home>/.claude.json`, matching Claude Code's actual read path.
+   *  Resolver stays pure: callers (install-cmd, doctor-cmd, index.ts)
+   *  read `process.env.CLAUDE_CONFIG_DIR` and pass it in. */
+  claudeConfigDir?: string;
 }
 
 export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
   const home = opts.home ?? homedir();
   const appData = opts.appData ?? process.env.APPDATA ?? join(home, "AppData", "Roaming");
-  const { clientId, scope, os, projectDir } = opts;
+  const { clientId, scope, os, projectDir, claudeConfigDir } = opts;
   const target = INSTALL_TARGETS.find((t) => t.clientId === clientId);
   if (!target) throw new Error(`Unknown client: ${clientId}`);
   const scopeSpec = target.scopes.find((s) => s.scope === scope);
@@ -173,7 +187,12 @@ export function resolveInstallPath(opts: ResolvePathOptions): ResolvedPath {
     throw new Error(`Scope ${scope} for ${clientId} requires a project directory`);
   }
 
-  const p = pathFor(clientId, scope, os, { home, appData, projectDir: projectDir ?? "" });
+  const p = pathFor(clientId, scope, os, {
+    home,
+    appData,
+    projectDir: projectDir ?? "",
+    claudeConfigDir: claudeConfigDir && claudeConfigDir.length > 0 ? claudeConfigDir : undefined,
+  });
   return p;
 }
 
@@ -181,9 +200,9 @@ function pathFor(
   client: InstallClientId,
   scope: InstallScope,
   os: InstallOS,
-  base: { home: string; appData: string; projectDir: string },
+  base: { home: string; appData: string; projectDir: string; claudeConfigDir: string | undefined },
 ): ResolvedPath {
-  const { home, appData, projectDir } = base;
+  const { home, appData, projectDir, claudeConfigDir } = base;
   const sep = os === "windows" ? "\\" : "/";
   const joinPath = (...parts: string[]): string => parts.join(sep);
 
@@ -191,6 +210,11 @@ function pathFor(
     if (scope === "user") {
       // Claude Code reads user-scope MCP from ~/.claude.json (top-level
       // mcpServers). The settings.json mcpServers field is silently ignored.
+      // CLAUDE_CONFIG_DIR (if set) relocates this to <DIR>/.claude.json.
+      if (claudeConfigDir) {
+        const absolute = join(claudeConfigDir, ".claude.json");
+        return { absolute, display: absolute, containerPath: ["mcpServers"] };
+      }
       const display = os === "windows" ? "%USERPROFILE%\\.claude.json" : "~/.claude.json";
       return { absolute: join(home, ".claude.json"), display, containerPath: ["mcpServers"] };
     }
@@ -204,6 +228,11 @@ function pathFor(
     // local — Claude Code stores per-project local-scope MCP under
     // ~/.claude.json projects[<absolute project dir>].mcpServers. The
     // .claude/settings.local.json file is for permissions/hooks, not MCP.
+    // Same CLAUDE_CONFIG_DIR redirect applies.
+    if (claudeConfigDir) {
+      const absolute = join(claudeConfigDir, ".claude.json");
+      return { absolute, display: absolute, containerPath: ["projects", projectDir, "mcpServers"] };
+    }
     return {
       absolute: join(home, ".claude.json"),
       display: os === "windows" ? "%USERPROFILE%\\.claude.json" : "~/.claude.json",
@@ -293,13 +322,19 @@ export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp_hosting__*";
 /** Resolve the Claude Code settings.json file that holds `permissions.allow`.
  *  Different from the mcpServers path (`~/.claude.json`): permissions live
  *  in `settings.json`, not the user config. Returns null for clients that
- *  don't use this scheme. */
+ *  don't use this scheme.
+ *
+ *  When `claudeConfigDir` is set, user-scope `settings.json` lives at
+ *  `<DIR>/settings.json` (NOT `<DIR>/.claude/settings.json` — the `.claude`
+ *  segment is absorbed by the env redirect). Project/local scopes are
+ *  project-relative and unaffected. */
 export function resolveClaudeCodeSettingsPath(
   scope: InstallScope,
-  opts: { home: string; projectDir?: string; os: InstallOS },
+  opts: { home: string; projectDir?: string; os: InstallOS; claudeConfigDir?: string },
 ): string | null {
-  const { home, projectDir } = opts;
-  if (scope === "user") return join(home, ".claude", "settings.json");
+  const { home, projectDir, claudeConfigDir } = opts;
+  const cfgDir = claudeConfigDir && claudeConfigDir.length > 0 ? claudeConfigDir : null;
+  if (scope === "user") return cfgDir ? join(cfgDir, "settings.json") : join(home, ".claude", "settings.json");
   if (scope === "project" && projectDir) return join(projectDir, ".claude", "settings.json");
   if (scope === "local" && projectDir) return join(projectDir, ".claude", "settings.local.json");
   return null;
