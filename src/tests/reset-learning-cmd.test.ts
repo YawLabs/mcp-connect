@@ -91,7 +91,7 @@ describe("runResetLearning", () => {
     writeFileSync(
       stateFile,
       `${BOM}${JSON.stringify({
-        version: 2,
+        version: STATE_SCHEMA_VERSION,
         savedAt: 1,
         learning: {
           gh: { dispatched: 2, succeeded: 2, lastUsedAt: 1 },
@@ -262,6 +262,12 @@ describe("runResetLearning", () => {
     const combined = io.out.join("");
     expect(combined).toContain("persistence is disabled");
     expect(combined).toContain("nothing to clear");
+    // The line reaches a terminal, where a non-ASCII dash renders as mojibake
+    // under a non-UTF-8 Windows console codepage. Checked on the one line
+    // that carries no path, so a user-named tmpdir cannot trip it.
+    const line = io.out.find((l) => l.includes("nothing to clear"));
+    expect(line).toBeDefined();
+    expect(line ?? "").toMatch(/^[\x20-\x7e\r\n]*$/);
   });
 
   it("also treats YAW_MCP_DISABLE_PERSISTENCE=true as disabled", async () => {

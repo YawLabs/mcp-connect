@@ -9,10 +9,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 //
 // extractArchive() is win32-only and reached only through ensureUv() ->
 // resolveUv(). It builds a PowerShell `Expand-Archive -Command` string from
-// archivePath + destDir, both derived from cacheDir(). Line 198 hard-rejects
+// archivePath + destDir, both derived from cacheDir(). Its guard hard-rejects
 // paths containing a CR/LF or a Unicode smart-quote (U+2018/2019/201A/201B);
-// line 208 escapes an ASCII apostrophe (' -> '') so a username like O'Brien
-// is handled safely rather than rejected.
+// its -Command builder escapes an ASCII apostrophe (' -> '') so a username
+// like O'Brien is handled safely rather than rejected. (Both live in
+// extractArchive's win32 branch; line numbers are deliberately not cited.)
 //
 // Both gaps require process.platform === 'win32'. Everything external is
 // mocked (spawn, undici, cacheDir), so these run on every platform -- they

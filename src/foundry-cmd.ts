@@ -27,6 +27,7 @@ import {
   FOUNDRY_TOP3_FLOOR,
   parseTraceLines,
   scoreCorpus,
+  traceDropReason,
 } from "./foundry-corpus.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
@@ -57,10 +58,13 @@ export const FOUNDRY_USAGE = `Usage: yaw-mcp foundry export [--out <path>] [--ca
   --json         Emit a machine-readable summary instead of text.`;
 
 // `help: true` is the ONLY signal that `error` carries the usage text rather
-// than a real argv complaint. index.ts used to recover that by comparing
-// `error === FOUNDRY_USAGE`, which quietly re-classified `foundry --help` as a
-// usage ERROR (stderr, exit 2) the moment any site appended so much as a
-// newline to the help body. Branch on the flag, never on string identity.
+// than a real argv complaint, and index.ts's shared run() tail branches on
+// exactly that flag (stdout, exit 0) as it does for every sibling parser. It
+// used to re-derive help by comparing `error === FOUNDRY_USAGE` -- and kept
+// doing so after this flag existed, spreading its verdict OVER the flag -- so
+// `foundry --help` became a usage ERROR (stderr, exit 2) the moment any site
+// appended so much as a newline to the help body. Branch on the flag, never
+// on string identity; cli-dispatch.test.ts runs the built CLI to pin it.
 export function parseFoundryArgs(
   argv: string[],
 ): { ok: true; options: ParsedFoundryArgs } | { ok: false; error: string; help?: boolean } {
@@ -183,8 +187,20 @@ export async function runFoundryExport(opts: FoundryExportOptions): Promise<{ ex
   const corpus = buildCorpusFromTraces(traces, servers, { cap: opts.cap });
 
   if (corpus.entries.length === 0) {
+    // Name BOTH ways a trace folds to nothing (the header lists both), counted
+    // by the same rule buildCorpusFromTraces applied. This used to blame the
+    // catalog alone, so a harvest of empty token bags read as "none of the
+    // chosen servers are in the local catalog".
+    const known = new Set(servers.map((s) => s.namespace));
+    let unknownChosen = 0;
+    let emptyTokens = 0;
+    for (const t of traces) {
+      const reason = traceDropReason(t, known);
+      if (reason === "unknown-chosen") unknownChosen++;
+      else if (reason === "empty-tokens") emptyTokens++;
+    }
     printErr(
-      `yaw-mcp foundry: ${traces.length} traces but 0 usable entries -- none of the chosen servers are in the local catalog (${servers.length} servers).`,
+      `yaw-mcp foundry: ${traces.length} traces but 0 usable entries -- ${unknownChosen} chose a server that is not in the local catalog (${servers.length} servers) and ${emptyTokens} carried no tokens.`,
     );
     // 1, not 2: this is a runtime outcome (the harvest and the catalog do not
     // overlap), and 2 means "you typed the command wrong" everywhere else in

@@ -24,8 +24,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
-// Point cacheDir() at an empty temp dir. Otherwise resolveUv()'s
-// `if (await exists(finalBin)) return finalBin` short-circuit finds a REAL
+// Point cacheDir() at an empty temp dir. Otherwise resolveUv()'s cached-binary
+// short-circuit (a non-empty `finalBin` stat returns it) finds a REAL
 // cached uv binary that a previous bootstrap left under the OS cache root
 // (e.g. %LOCALAPPDATA%\yaw-mcp\Cache) and RESOLVES -- defeating the spawn
 // mock and making the rejection-path tests below pass in clean CI but fail
@@ -151,6 +151,25 @@ describe("onPath spawn options (fix 1)", () => {
     expect(probeOpts.shell).toBe(false);
     expect(probeOpts.windowsHide).toBe(false);
   });
+
+  it("hands uv an env with yaw-mcp's own secrets stripped", async () => {
+    // README promises the vault passphrase is stripped from every child
+    // yaw-mcp starts; the probe (and the download-extract spawn, same option
+    // block) inherited process.env whole. The rest of the env still arrives
+    // (uv needs PATH), so the pin is on the one key, not on an empty env.
+    const prev = process.env.YAW_MCP_VAULT_PASSPHRASE;
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "hunter2-do-not-leak";
+    try {
+      const probeOpts = await probeOptsUnder("linux");
+      const env = probeOpts.env as NodeJS.ProcessEnv | undefined;
+      expect(env, "spawn must pass an explicit env").toBeDefined();
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+      expect(Object.keys(env ?? {}).length).toBeGreaterThan(0);
+    } finally {
+      if (prev === undefined) delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+      else process.env.YAW_MCP_VAULT_PASSPHRASE = prev;
+    }
+  });
 });
 
 // ── onPath timeout path: SIGKILL + unref, not a bare default kill ─────
@@ -179,23 +198,16 @@ describe("onPath timeout path", () => {
 
 // ── uvTarget: unsupported platform/arch returns null; ensureUv surfaces message ──
 describe("uvTarget unsupported platform/arch (coverage gap)", () => {
-  // We cannot actually change process.platform/arch in a live process, but
-  // we CAN verify the branch that fires when uvTarget() returns null:
-  // resolveUv() throws with 'No prebuilt uv binary' + docs URL.
+  // The branch that fires when uvTarget() returns null: resolveUv() throws
+  // 'No prebuilt uv binary' + the docs URL.
   //
-  // Strategy: ensureUv() calls onPath("uv") first (which returns false
-  // because our spawn mock emits error), then calls resolveUv() which
-  // calls uvTarget(). On this machine uvTarget() may return a real string
-  // (supported platform), in which case it tries to download -- but we
-  // mocked undici to reject with "network mocked out". That's fine for
-  // showing the download-attempt branch. The unsupported-platform branch
-  // is verified by importing and calling uvTarget via the internal
-  // logic that rejects with the specific message.
-  //
-  // Because uvTarget is not exported we test the observable outcome:
-  // on a mocked environment that simulates an unsupported arch, resolveUv
-  // throws with the expected message. We do this by temporarily stubbing
-  // process.platform and process.arch.
+  // Strategy: ensureUv() calls onPath("uv") first (false -- the spawn mock
+  // emits error), then resolveUv() calls uvTarget() with its default
+  // parameters, which read process.platform/arch. Those two are stubbed to an
+  // unsupported combination for the duration of the test. uvTarget itself is
+  // exported and unit-tested per (platform, arch, libc) in uv-bootstrap.test.ts;
+  // this test is about the ensureUv-level rejection the caller actually sees,
+  // which only the platform stub reaches.
   it("ensureUv rejects with 'No prebuilt uv binary' message on unsupported platform/arch", async () => {
     __resetUvBootstrap();
 

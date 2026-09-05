@@ -5,6 +5,9 @@ import { resolveNamespaces } from "../server.js";
 // REAL implementation. It used to be module-private, and this file kept a
 // hand-copied re-implementation -- which passed happily while the production
 // code drifted, since nothing tied the copy to the original.
+//
+// Named for its subject. This file was `helpers.test.ts` for a long time, a
+// name that said nothing about what it covered (there is no helpers module).
 
 describe("resolveNamespaces", () => {
   it("returns single server as array", () => {

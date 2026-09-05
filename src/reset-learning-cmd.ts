@@ -137,7 +137,9 @@ export async function runResetLearning(opts: ResetLearningOptions = {}): Promise
   // running broker still believed it owned (or refusing to when the broker had
   // already stopped writing).
   if (isPersistenceDisabled(env)) {
-    print("yaw-mcp reset-learning: persistence is disabled (YAW_MCP_DISABLE_PERSISTENCE) — nothing to clear.");
+    // ASCII dash on purpose: this line reaches a terminal, and a non-ASCII
+    // dash renders as mojibake under a non-UTF-8 Windows console codepage.
+    print("yaw-mcp reset-learning: persistence is disabled (YAW_MCP_DISABLE_PERSISTENCE) -- nothing to clear.");
     return { exitCode: 0, lines, removed: false, path: filePath };
   }
 

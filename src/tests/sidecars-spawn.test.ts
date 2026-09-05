@@ -56,6 +56,10 @@ vi.mock("node:child_process", () => ({
 }));
 
 const { defaultRunNpm, npmBin, runSidecarsInstall, sidecarsRoot } = await import("../sidecars-cmd.js");
+// The one OTHER caller of the runner, whose spawn shape this file also pins:
+// it goes through the same mocked child_process because the mock is
+// module-scoped to this file's whole import graph.
+const { backgroundInstallOptions } = await import("../sidecar-refresh.js");
 
 describe("sidecars install default npm runner", () => {
   let home: string;
@@ -138,14 +142,72 @@ describe("sidecars install default npm runner", () => {
     // sidecar-refresh's backgroundInstallOptions runs this same runner from
     // inside `serve`, where fd 2 is the stream the MCP client reads our
     // diagnostics from and npm's progress has nowhere to go. It differs on
-    // stdio ALONE: a second spawn of its own would have to restate the
-    // Windows-shell concession and the fixed-literal-args condition that makes
-    // it safe. Reddens if the override is dropped and the default shape wins.
+    // stdio and windowsHide ALONE: a second spawn of its own would have to
+    // restate the Windows-shell concession and the fixed-literal-args
+    // condition that makes it safe. Reddens if the override is dropped and the
+    // default shape wins.
     await defaultRunNpm(["install"], home, { stdio: "ignore" });
 
     expect(spawnCalls).toHaveLength(1);
     expect(spawnCalls[0].opts.stdio).toBe("ignore");
     expect(spawnCalls[0].opts.cwd).toBe(home);
+  });
+
+  it("leaves the console window alone on the CLI path", async () => {
+    // The CLI runs attached to a terminal, and there windowsHide is
+    // CREATE_NO_WINDOW: it detaches npm from that console, so a Ctrl-C that
+    // kills the CLI no longer reaches npm and the install keeps running,
+    // half-owned, after the user thought they stopped it. Pinned as an
+    // explicit false rather than "unset" so a refactor that hides
+    // unconditionally reddens here and not in a user's terminal.
+    await run();
+
+    expect(spawnCalls).toHaveLength(2);
+    for (const call of spawnCalls) expect(call.opts.windowsHide).toBe(false);
+  });
+
+  it("hides the console window for the background install, and only there", async () => {
+    // `serve` under a GUI-launched MCP client has no console of its own, so a
+    // console child of it (cmd.exe running npm.cmd) is given a brand-new
+    // window on the desktop for the length of an install plus an update, once
+    // a day, from a process the user never started by hand. Pinned through
+    // backgroundInstallOptions' OWN runner rather than by handing defaultRunNpm
+    // the flag: what matters is that the background caller sets it, the same
+    // way oam-probe-options.test.ts pins the probe's.
+    const bg = backgroundInstallOptions(home);
+    await bg.runNpm?.(["install"], home);
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0].opts.windowsHide).toBe(true);
+    // And the silent stdio it always had: the two overrides travel together.
+    expect(spawnCalls[0].opts.stdio).toBe("ignore");
+  });
+
+  it("strips yaw-mcp's own secrets from npm's env on every path", async () => {
+    // npm runs arbitrary registry lifecycle scripts, and the in-server daily
+    // refresh reaches this spawn with the vault passphrase in process.env.
+    // README promises the strip for EVERY child yaw-mcp starts; this npm run
+    // was the one that inherited process.env whole. The rest of the env must
+    // still arrive (npm needs PATH), so the assertion is on the one key, not
+    // on an empty env.
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE", "hunter2-do-not-leak");
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE_NEW", "also-secret");
+    try {
+      await run();
+      const bg = backgroundInstallOptions(home);
+      await bg.runNpm?.(["install"], home);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(spawnCalls).toHaveLength(3);
+    for (const call of spawnCalls) {
+      const env = call.opts.env as NodeJS.ProcessEnv | undefined;
+      expect(env, "spawn must pass an explicit env").toBeDefined();
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE_NEW");
+      expect(Object.keys(env ?? {}).length).toBeGreaterThan(0);
+    }
   });
 
   it("goes through the shell on Windows, where npm is a .cmd shim", async () => {

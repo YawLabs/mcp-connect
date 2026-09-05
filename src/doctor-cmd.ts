@@ -21,7 +21,13 @@
 // Exit codes:
 //   0  healthy — every config file parsed cleanly and raised no warnings
 //   2  warnings (e.g., schema-version mismatch, a retired `token` /
-//      `apiBase` key still sitting in a config file)
+//      `apiBase` key still sitting in a config file, a client config that
+//      is malformed / unreadable or whose entry cannot launch yaw-mcp --
+//      see clientLaunchWarnings). One unreadable state stays at exit 0: a
+//      TRANSIENT read failure on a client config (win32 EBUSY while an AV
+//      scanner or the search indexer holds the handle, EAGAIN). Its CLIENTS
+//      line still prints, but it is a moment's contention, not a fault --
+//      see clientCannotLaunch.
 //   (1 = fatal is reserved and currently UNREACHABLE: nothing doctor
 //   inspects is fatal — a bad config file degrades to a warning.)
 //
@@ -33,7 +39,7 @@
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { join, posix, resolve, win32 } from "node:path";
 import { cliToNamespaces } from "./cli-shadows.js";
 import {
   CURRENT_SCHEMA_VERSION,
@@ -79,7 +85,7 @@ import {
   oamInstallAdvice,
   probeOam,
 } from "./oam-spawn.js";
-import { userConfigDir } from "./paths.js";
+import { normalizeForCompare, userConfigDir } from "./paths.js";
 import {
   isPersistenceDisabled,
   isReadableStateVersion,
@@ -87,7 +93,14 @@ import {
   STATE_FILENAME,
   STATE_SCHEMA_VERSION,
 } from "./persistence.js";
-import { collectSecretRefNames, listKeys, loadVault, vaultPath } from "./secrets-vault.js";
+import {
+  collectMalformedSecretRefs,
+  collectSecretRefNames,
+  listKeys,
+  loadVault,
+  SECRETS_SCHEMA_VERSION,
+  vaultPath,
+} from "./secrets-vault.js";
 import { buildRefreshPlan, isSidecarRefreshDisabled } from "./sidecar-refresh.js";
 import {
   collectSidecarSpecs,
@@ -184,7 +197,7 @@ export interface DoctorOptions {
   out?: (s: string) => void;
   /** Override for tests; defaults to process.stderr.write. Used for the
    *  always-on warning stream so pipelines that capture stdout still see
-   *  config warnings even when doctor exits 0 (e.g. local mode). */
+   *  config warnings. */
   err?: (s: string) => void;
   /** Disable the npm registry freshness check (tests, offline use). */
   skipRegistryCheck?: boolean;
@@ -211,6 +224,13 @@ export interface DoctorOptions {
   /** Test hook: replace the real `oam --version` probe so the OAM RUNTIME
    *  section is deterministic regardless of what's installed on the host. */
   oamProbe?: () => OamProbe | Promise<OamProbe>;
+  /** Test hook: the path semantics the CLIENTS launch checks judge an entry
+   *  by. Defaults to process.platform. See ProbeOptions.platform. */
+  platform?: NodeJS.Platform;
+  /** Test hook: replaces the client-config read in the CLIENTS probe, so a
+   *  transient EBUSY / EAGAIN can be injected. See
+   *  ProbeOptions.readClientConfig. */
+  readClientConfig?: (path: string) => string;
 }
 
 // Machine-readable shape emitted by `yaw-mcp doctor --json`. Mirrors the
@@ -220,8 +240,9 @@ export interface DoctorOptions {
 //   - SHADOWED CLI USAGE is carried as `shellShadows` (same data, renamed).
 //   - UPGRADE AVAILABLE's method-aware terminal hint is text-only; the JSON
 //     `upgrade` block carries the version facts but no install-method copy.
-// Everything else (CONFIG FILES, ENVIRONMENT, STATE, RELIABILITY, TRIALS,
-// INSTALLED CLIENTS, WARNINGS, DIAGNOSIS) has a structured field below.
+// Everything else (CONFIG FILES, PROJECT GUIDE, ENVIRONMENT, OAM RUNTIME,
+// SECRET VAULT, STATE, RELIABILITY, TRIALS, INSTALLED CLIENTS, WARNINGS,
+// DIAGNOSIS) has a structured field below.
 export interface DoctorJsonSnapshot {
   timestamp: string;
   version: string;
@@ -252,16 +273,14 @@ export interface DoctorJsonSnapshot {
    *  `entries` holds names only -- no secret value, and no passphrase, ever
    *  appears in this snapshot. Mirrors the text path's SECRET VAULT section
    *  (which is omitted when there is no vault and no refs; the JSON block is
-   *  always present so consumers can read it unconditionally). */
-  vault: {
-    path: string;
-    exists: boolean;
-    entries: string[] | null;
-    unreadable: string | null;
-    passphraseSet: boolean;
-    refs: Array<{ namespace: string; secretNames: string[] }>;
-    missing: string[];
-  };
+   *  always present so consumers can read it unconditionally).
+   *
+   *  Declared as the collector's own type, not re-spelled here: the emitted
+   *  object is a VaultStatus assigned wholesale (see runDoctorJson), which
+   *  bypasses excess-property checking, so a re-spelled copy could only ever
+   *  lag it -- which is exactly how `schemaVersion` reached the blob without
+   *  reaching this contract. Field docs live on VaultStatus. */
+  vault: VaultStatus;
   state: {
     disabled: boolean;
     /** Result of pre-parsing state.json, mirroring the text path's STATE
@@ -378,7 +397,24 @@ export interface ClientProbeResult {
   /** The specific legacy entry key found (e.g. "mcp.hosting" / "yaw-mcp"), or
    *  null. Lets the status line name the stale key in the trim hint. */
   legacyEntryName: string | null;
+  /** The file exists but its content did not PARSE as a JSON object. Never
+   *  set for a read failure -- that is `unreadable`. */
   malformed: boolean;
+  /** The file exists but its BYTES could not be read (EISDIR for a directory
+   *  at the path, EACCES, a win32 EBUSY while an AV scanner holds the handle)
+   *  -- the error message, or null. Kept apart from `malformed`: a read
+   *  failure used to be reported as "JSON is malformed -- fix or rerun
+   *  `yaw-mcp install`", sending the user to fix a syntax error that does not
+   *  exist. Doctor cannot tell what such a file says, so it counts as a
+   *  cannot-launch state for the warning fold (see clientLaunchWarnings) --
+   *  unless the code below says the failure is transient. */
+  unreadable: string | null;
+  /** The errno code behind `unreadable` ("EISDIR", "EACCES", "EBUSY"), or
+   *  null -- also null when the error carried no code. Additive JSON field.
+   *  Carried so the exit-code gate can tell a transient read (EBUSY / EAGAIN,
+   *  see clientCannotLaunch) from a real one WITHOUT parsing the message,
+   *  whose wording node reshapes across versions. */
+  unreadableCode: string | null;
   unavailable: boolean;
   /** An absolute launch `command` in the entry that no longer exists on disk,
    *  or null. Only absolute paths are checked -- a bare "npx"/"cmd" is
@@ -406,6 +442,14 @@ export interface ClientProbeResult {
    *  null. oam has no fetch-on-demand, so unlike the npx shape a stale entry
    *  here cannot be recovered at launch. */
   launchOamEntryMissing: string | null;
+  /** A launch command (or the oam it wraps) that is an absolute path for
+   *  ANOTHER operating system -- a `C:\` drive-letter path seen by a doctor
+   *  running on POSIX (WSL reading a Windows profile) -- or null. Neither the
+   *  exists check nor the bare-oam check can be applied to it from here, so
+   *  the entry is reported as unverifiable rather than as missing or bare
+   *  (see isForeignAbsoluteLaunch). Not a cannot-launch state: the OS the
+   *  entry was written for may well run it fine. */
+  launchForeignPath: string | null;
 }
 
 export interface DoctorResult {
@@ -429,9 +473,9 @@ const VERSION = typeof __VERSION__ !== "undefined" ? __VERSION__ : "dev";
 // which owns the state file the flag disables. Doctor used to keep its own
 // copy (as did server.ts and reset-learning-cmd.ts); doctor passes its INJECTED
 // `env` rather than process.env, which is why the shared one takes an env.
-// All four of doctor's own uses -- the STATE/RELIABILITY pair on each of the
-// text and json paths -- go through it, so no section can read state.json while
-// another treats persistence as off.
+// Its one doctor call site is collectStateStatus, which the STATE/RELIABILITY
+// pair on each of the text and json paths reads from, so no section can read
+// state.json while another treats persistence as off.
 
 export const DOCTOR_USAGE = `Usage: yaw-mcp doctor [--json]
 
@@ -522,6 +566,134 @@ async function collectDoctorBase(opts: DoctorOptions): Promise<{
   return { cwd, home, appData, os, env, timestamp, config, trustProbe, claudeConfigDir };
 }
 
+/** state.json, peeked and (when usable) loaded ONCE, for the STATE and
+ *  RELIABILITY sections of BOTH paths.
+ *
+ *  Shared for the same reason collectDoctorBase is: the text and --json paths
+ *  carried separate copies of this prologue, and the copies had already
+ *  drifted (one loaded a "missing" file, the other did not). One helper
+ *  means one answer to "what is state.json right now".
+ *
+ *  Reads the file at most twice (peek + load) rather than once per section,
+ *  and not at all when persistence is disabled. The peek runs FIRST because
+ *  loadState swallows a parse / version / read problem into an empty state
+ *  that reads as brand-new -- so only an "ok" peek is loaded, and everything
+ *  else is reported from the peek alone. A MISSING file is `persisted: null`
+ *  too: both renderers treat null the same as a never-saved state, so there
+ *  is nothing to load. */
+async function collectStateStatus(opts: { env: NodeJS.ProcessEnv; home: string }): Promise<{
+  disabled: boolean;
+  filePath: string;
+  peek: StatePeek | null;
+  persisted: Awaited<ReturnType<typeof loadState>> | null;
+}> {
+  const disabled = isPersistenceDisabled(opts.env);
+  const filePath = join(userConfigDir(opts.home), STATE_FILENAME);
+  const peek: StatePeek | null = disabled ? null : await peekStateFile(filePath);
+  const persisted = peek?.kind === "ok" ? await loadState(filePath) : null;
+  return { disabled, filePath, peek, persisted };
+}
+
+/** The CLIENTS-section wording for one probe: the bare client label, the
+ *  same label with its scope, and its status line. One function for the text
+ *  section and the warning fold below, so the same state cannot be worded two
+ *  ways. */
+function describeClient(c: ClientProbeResult): { client: string; label: string; status: string } {
+  const installCmd = `yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}`;
+  const client = INSTALL_TARGETS.find((t) => t.clientId === c.clientId)?.label ?? c.clientId;
+  return { client, label: `${client} (${c.scope})`, status: renderClientStatus(c, installCmd) };
+}
+
+/** errno codes for a read failure that is a moment's contention, not a state
+ *  of the file: EBUSY is win32's answer while an AV scanner or the search
+ *  indexer holds the handle, EAGAIN the POSIX would-block. The file is fine
+ *  and the next read succeeds. */
+const TRANSIENT_READ_CODES: ReadonlySet<string> = new Set(["EBUSY", "EAGAIN"]);
+
+/** True when the probe's read failure is one of TRANSIENT_READ_CODES. Decided
+ *  on the errno, never on the message text -- see ClientProbeResult.unreadableCode. */
+function isTransientRead(c: ClientProbeResult): boolean {
+  return c.unreadable !== null && c.unreadableCode !== null && TRANSIENT_READ_CODES.has(c.unreadableCode);
+}
+
+/** True when the probe found a config file whose CONTENTS are known: it is on
+ *  disk, on a client available on this OS, and doctor could both read and
+ *  parse it. This is the gate `yaw-mcp try`'s auto-detect picks "the client
+ *  the user is actively using" by. Both failure kinds are excluded on
+ *  purpose: `malformed` always was, but `unreadable` (split out of it later)
+ *  was not, so a directory or an EACCES file at ~/.claude.json was
+ *  auto-selected as the trial target and `try` then aborted on the very read
+ *  the probe had just failed -- while a readable ~/.cursor/mcp.json sat one
+ *  slot further along. */
+export function probeUsable(c: ClientProbeResult): boolean {
+  return !c.unavailable && c.exists && !c.malformed && c.unreadable === null;
+}
+
+/** True for every probe state renderClientStatus describes as "the client
+ *  cannot start yaw-mcp", plus a config doctor could not read at all -- which
+ *  it cannot vouch for either way, and the header's exit-0 promise ("every
+ *  config file parsed cleanly") does not hold for.
+ *
+ *  EXCEPT a transient read (isTransientRead). Yaw Terminal polls `doctor
+ *  --json`, and one AV / indexer handle race must not flip a healthy machine's
+ *  diagnosis to "Warnings need attention" for the length of a poll. The
+ *  CLIENTS line still says what happened (renderClientStatus); it just does
+ *  not move the exit code. */
+function clientCannotLaunch(c: ClientProbeResult): boolean {
+  return (
+    (c.unreadable !== null && !isTransientRead(c)) ||
+    c.malformed ||
+    c.launchCommandMissing !== null ||
+    c.launchOamEntryMissing !== null ||
+    c.launchOamNotAbsolute !== null
+  );
+}
+
+/**
+ * The client probe states doctor folds into `config.warnings`, one per
+ * (client, scope), in the house `<path>: <message>` shape every other warning
+ * uses.
+ *
+ * WHY: the exit code and DIAGNOSIS derive from config.warnings ALONE, and the
+ * CLIENTS section never fed it. So a ~/.claude.json that was malformed, or
+ * whose entry named a launch command that no longer exists, printed "the
+ * client cannot start yaw-mcp" under CLIENTS and then "All good. yaw-mcp
+ * should start cleanly." under DIAGNOSIS, exit 0 -- on --json too, where Yaw
+ * Terminal reads `.diagnosis` and `.warnings` and showed All good. Folding is
+ * the same fix foldBundleWarnings and the trial-GC failures got: the WARNINGS
+ * block, the always-on stderr stream and the exit-2 gate all see it, on both
+ * surfaces, in the same order (trust -> bundle -> trials -> clients).
+ *
+ * Only the cannot-launch states qualify. "not configured", "present, no
+ * entry" and a lone legacy entry are ordinary (a client the user never
+ * installed to); a PATH-resolved `npx` entry is the healthy default; a
+ * launch path written for another OS is unverifiable, not broken. None of
+ * them may drag a working machine to exit 2.
+ *
+ * One warning per (file, client, status), NOT one per probe. Claude Code's
+ * user and local scopes read the SAME ~/.claude.json (different containers
+ * inside it), so a FILE-level state -- malformed, unreadable -- is true of
+ * both scopes at once, and a per-probe fold said the same thing about the
+ * same file twice with only the scope label changed. The scopes are listed
+ * on the one line instead ("Claude Code (user, local)"). Entry-level states
+ * still come out one per scope on their own: each scope has its own entry,
+ * and its status names that scope's install command, so the key differs.
+ * Insertion order is kept, so the list reads in probe order like the CLIENTS
+ * section above it.
+ */
+function clientLaunchWarnings(clients: readonly ClientProbeResult[]): string[] {
+  const grouped = new Map<string, { path: string; client: string; scopes: string[]; status: string }>();
+  for (const c of clients) {
+    if (!clientCannotLaunch(c)) continue;
+    const { client, status } = describeClient(c);
+    const key = `${c.path}\0${client}\0${status}`;
+    const seen = grouped.get(key);
+    if (seen) seen.scopes.push(c.scope);
+    else grouped.set(key, { path: c.path, client, scopes: [c.scope], status });
+  }
+  return [...grouped.values()].map((g) => `${g.path}: ${g.client} (${g.scopes.join(", ")}) ${g.status}`);
+}
+
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult> {
   if (opts.json) return runDoctorJson(opts);
 
@@ -589,15 +761,15 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
   // never becomes a warning.
   renderVaultSection({ status: await collectVaultStatus({ home, env, servers: oamStatus.servers }), print });
 
-  // Load state.json ONCE for both the STATE and RELIABILITY sections.
-  // Previously each section re-read the file (peek + loadState in STATE,
-  // loadState again in RELIABILITY = up to 3 reads/run), which was wasted
-  // I/O and opened a small TOCTOU window between reads. Skip the read
-  // entirely when persistence is disabled.
-  const persistenceDisabled = isPersistenceDisabled(env);
-  const stateFilePath = join(userConfigDir(home), STATE_FILENAME);
-  const statePeek: StatePeek | null = persistenceDisabled ? null : await peekStateFile(stateFilePath);
-  const persistedState = statePeek?.kind === "ok" ? await loadState(stateFilePath) : null;
+  // state.json, peeked and loaded ONCE for both the STATE and RELIABILITY
+  // sections -- by the same helper the --json path uses, so the two surfaces
+  // read the file identically. See collectStateStatus.
+  const {
+    disabled: persistenceDisabled,
+    filePath: stateFilePath,
+    peek: statePeek,
+    persisted: persistedState,
+  } = await collectStateStatus({ env, home });
 
   // Persisted cross-session state — ~/.yaw-mcp/state.json. Shows whether
   // persistence is disabled by env, and otherwise reports the file path
@@ -629,16 +801,26 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
 
   // Probe every supported client/scope combo on the current OS, against the
   // CLAUDE_CONFIG_DIR-aware paths collectDoctorBase resolved.
-  const clients = probeClients({ home, os, cwd, claudeConfigDir, appData });
+  const clients = probeClients({
+    home,
+    os,
+    cwd,
+    claudeConfigDir,
+    appData,
+    platform: opts.platform,
+    readClientConfig: opts.readClientConfig,
+  });
   print("INSTALLED CLIENTS (probed config files)");
   for (const c of clients) {
-    const installCmd = `yaw-mcp install ${c.clientId}${c.scope === "user" ? "" : ` --scope ${c.scope}`}`;
-    const status = renderClientStatus(c, installCmd);
-    const label = INSTALL_TARGETS.find((t) => t.clientId === c.clientId)?.label ?? c.clientId;
-    print(`  ${label} (${c.scope}): ${status}`);
+    const { label, status } = describeClient(c);
+    print(`  ${label}: ${status}`);
     print(`    ${c.path}`);
   }
   print("");
+  // A client that cannot start yaw-mcp is a WARNING, not just a CLIENTS
+  // line -- see clientLaunchWarnings. Folded last (trust -> bundle -> trials
+  // -> clients); the --json path folds the same helper at the same position.
+  config.warnings = [...config.warnings, ...clientLaunchWarnings(clients)];
 
   if (config.warnings.length > 0) {
     print("WARNINGS");
@@ -742,8 +924,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorResult>
 
 // JSON counterpart to runDoctor. Same data-collection sequence, no
 // print calls — emits a single JSON blob so pipelines and dashboards
-// can consume the diagnostic without parsing the text layout. Token is
-// always fingerprinted, never raw, matching the text renderer's rule.
+// can consume the diagnostic without parsing the text layout.
 async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   const lines: string[] = [];
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
@@ -776,7 +957,15 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     scan: trialScan,
   }).catch(() => ({ cleared: 0, failed: 0, failures: [] }));
 
-  const clients = probeClients({ home, os, cwd, claudeConfigDir, appData });
+  const clients = probeClients({
+    home,
+    os,
+    cwd,
+    claudeConfigDir,
+    appData,
+    platform: opts.platform,
+    readClientConfig: opts.readClientConfig,
+  });
 
   // Same project-guide probe as the text path's PROJECT GUIDE section.
   const guide = await loadProjectGuide(cwd, home, env).catch(() => null);
@@ -797,20 +986,19 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
     envOverrides[name] = raw === undefined || raw === "" ? null : raw;
   }
 
-  // STATE + RELIABILITY section data. Load state.json ONCE for both
-  // (previously loaded twice here). YAW_MCP_DISABLE_PERSISTENCE
-  // short-circuits to a null read; otherwise we read the file a single
-  // time and thread it into both blocks.
-  //
-  // The peek runs FIRST, exactly like the text path: loadState swallows a
-  // parse error and hands back an empty state, so a corrupt / stale-schema /
-  // unreadable state.json used to be reported here as healthy-and-fresh
-  // while `doctor` (text) called it out as corrupt. Same detection now.
-  const persistDisabled = isPersistenceDisabled(env);
-  const stateFilePath = join(userConfigDir(home), STATE_FILENAME);
-  const statePeek: StatePeek | null = persistDisabled ? null : await peekStateFile(stateFilePath);
-  const stateUsable = statePeek !== null && (statePeek.kind === "ok" || statePeek.kind === "missing");
-  const persisted = stateUsable ? await loadState(stateFilePath) : null;
+  // STATE + RELIABILITY section data, from the SAME peek-then-load helper the
+  // text path uses (collectStateStatus), so the two surfaces cannot disagree
+  // about what state.json is. They used to carry separate copies of this
+  // prologue, and the copies differed on whether a missing file was loaded.
+  // The peek-first order is what keeps a corrupt / stale-schema / unreadable
+  // state.json from being reported here as healthy-and-fresh (loadState
+  // swallows those into an empty state) while `doctor` (text) calls it out.
+  const {
+    disabled: persistDisabled,
+    filePath: stateFilePath,
+    peek: statePeek,
+    persisted,
+  } = await collectStateStatus({ env, home });
   const state: DoctorJsonSnapshot["state"] = ((): DoctorJsonSnapshot["state"] => {
     if (persistDisabled || statePeek === null) {
       return {
@@ -823,7 +1011,23 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
         packHistoryEntries: null,
       };
     }
-    if (!stateUsable || !persisted) {
+    if (statePeek.kind === "missing") {
+      // Nothing on disk, so nothing to load: the counts are zero by
+      // construction. Zero -- not the null the unusable cases below report --
+      // is what keeps "never written" distinguishable from "could not be
+      // read" for a consumer, and it is the shape this block has always
+      // emitted for a missing file.
+      return {
+        disabled: false,
+        status: "missing",
+        detail: null,
+        path: stateFilePath,
+        savedAt: null,
+        learningEntries: 0,
+        packHistoryEntries: 0,
+      };
+    }
+    if (!persisted) {
       return {
         disabled: false,
         status: statePeek.kind,
@@ -906,6 +1110,10 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
   if (trialGc.failures.length > 0) {
     config.warnings = [...config.warnings, ...trialGc.failures.map(trialGcFailureWarning)];
   }
+  // Client cannot-launch states fold LAST, through the same helper and at the
+  // same position as the text path (trust -> bundle -> trials -> clients), so
+  // `.warnings` and `.diagnosis` say what the text report says.
+  config.warnings = [...config.warnings, ...clientLaunchWarnings(clients)];
   const oamRuntime: DoctorJsonSnapshot["oamRuntime"] = {
     binary: oamStatus.probe.bin,
     version: oamStatus.probe.version,
@@ -1008,8 +1216,8 @@ async function runDoctorJson(opts: DoctorOptions): Promise<DoctorResult> {
 // paste-into-a-ticket surface. Deliberate exclusions when diffing against
 // --help: DISABLE_PERSISTENCE stays in the STATE section (richer context
 // there); YAW_MCP_TRUST_PROJECT and YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS in the
-// trust gate; YAW_MCP_CATALOG_URL and YAW_MCP_BASE_URL are endpoint overrides,
-// not behavior toggles, and stay out. YAW_MCP_VAULT_PASSPHRASE and
+// trust gate; YAW_MCP_CATALOG_URL is an endpoint override, not a behavior
+// toggle, and stays out. YAW_MCP_VAULT_PASSPHRASE and
 // YAW_MCP_VAULT_PASSPHRASE_NEW are excluded for a stronger reason than any of
 // those: this list prints RAW VALUES, and those two are themselves
 // credentials -- putting either here would paste the user's vault passphrase
@@ -1062,18 +1270,34 @@ function renderEnvSection(opts: { env: NodeJS.ProcessEnv; print: (s?: string) =>
  *  values are ciphertext). `passphraseSet` is a boolean for the same reason
  *  YAW_MCP_VAULT_PASSPHRASE is deliberately absent from DOCTOR_ENV_VARS,
  *  which prints raw values: doctor output is the paste-into-a-ticket surface,
- *  and the one env var here that is itself a credential must never be in it. */
-interface VaultStatus {
+ *  and the one env var here that is itself a credential must never be in it.
+ *
+ *  Exported because it IS the `vault` block of DoctorJsonSnapshot -- the
+ *  --json consumer contract -- rather than a private shape the block copies. */
+export interface VaultStatus {
   path: string;
   exists: boolean;
   /** Entry names, or null when the file exists but could not be read/parsed. */
   entries: string[] | null;
   /** Why the vault could not be read. Non-null only when `entries` is null. */
   unreadable: string | null;
+  /** On-disk schema version, or null when there is no readable vault. A vault
+   *  stays at the version it was created with until `secrets rotate` rewrites
+   *  it (setSecret preserves it), so this is the ONLY place a user learns that
+   *  a v1 vault never gained the v2 name binding. Additive JSON field. */
+  schemaVersion: number | null;
   /** Whether a passphrase is present in this process's env. NEVER the value. */
   passphraseSet: boolean;
   /** Servers whose configured env carries `${secret:NAME}` refs. */
   refs: Array<{ namespace: string; secretNames: string[] }>;
+  /** Local servers whose env carries a `${secret:` the strict regex cannot
+   *  parse (a space in the name, a missing `}`), each as secrets-vault's
+   *  bounded display form of the span -- never the raw env value.
+   *  resolveServerEnv refuses these spawns exactly as it does a missing name,
+   *  and without this line the section said "no server env references
+   *  ${secret:NAME}" about the very ref the spawn was refused over. Additive
+   *  JSON field. */
+  malformed: Array<{ namespace: string; refs: string[] }>;
   /** Referenced names that are NOT in the vault. Empty when the vault is
    *  unreadable -- we cannot tell, and guessing would invent a false alarm. */
   missing: string[];
@@ -1088,6 +1312,7 @@ async function collectVaultStatus(opts: {
   const exists = existsSync(path);
   let entries: string[] | null = exists ? null : [];
   let unreadable: string | null = null;
+  let schemaVersion: number | null = null;
   if (exists) {
     try {
       const vault = await loadVault(path);
@@ -1095,12 +1320,14 @@ async function collectVaultStatus(opts: {
       // out -- but a race between the two is possible, and "no entries" is
       // the honest reading of a vault file that vanished mid-run.
       entries = vault ? listKeys(vault) : [];
+      schemaVersion = vault ? vault.version : null;
     } catch (err) {
       unreadable = err instanceof Error ? err.message : String(err);
     }
   }
 
   const refs: VaultStatus["refs"] = [];
+  const malformed: VaultStatus["malformed"] = [];
   for (const s of opts.servers) {
     // LOCAL servers only. A remote entry's env is never sent anywhere --
     // upstream.ts logs "Ignoring env on a remote server" and connects
@@ -1119,6 +1346,8 @@ async function collectVaultStatus(opts: {
     // meta-tools.ts's and upstream.ts's.
     const names = collectSecretRefNames(s.env);
     if (names.size > 0) refs.push({ namespace: s.namespace, secretNames: [...names].sort() });
+    const malformedRefs = collectMalformedSecretRefs(s.env);
+    if (malformedRefs.length > 0) malformed.push({ namespace: s.namespace, refs: malformedRefs });
   }
 
   const known = entries;
@@ -1130,8 +1359,10 @@ async function collectVaultStatus(opts: {
     exists,
     entries,
     unreadable,
+    schemaVersion,
     passphraseSet: (opts.env.YAW_MCP_VAULT_PASSPHRASE ?? "") !== "",
     refs,
+    malformed,
     missing,
   };
 }
@@ -1147,7 +1378,7 @@ async function collectVaultStatus(opts: {
  *  Omitted entirely when there is no vault and nothing references one. */
 function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => void }): void {
   const { status, print } = opts;
-  if (!status.exists && status.refs.length === 0) return;
+  if (!status.exists && status.refs.length === 0 && status.malformed.length === 0) return;
   print("SECRET VAULT");
   print(`  file:       ${status.path}${status.exists ? "" : " (does not exist yet)"}`);
   if (status.unreadable !== null) {
@@ -1156,6 +1387,19 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
     const entries = status.entries ?? [];
     print(`  entries:    ${entries.length === 0 ? "(none)" : `${entries.length} -- ${entries.join(", ")}`}`);
   }
+  // Schema line only when a vault was read. A vault created before v2 stays
+  // v1 forever (setSecret preserves the version), so its entries are never
+  // bound to their names and a blob swap between two names still decrypts --
+  // and until this line nothing told the user, who had no reason to run
+  // `secrets rotate` on a vault that works.
+  if (status.schemaVersion !== null) {
+    if (status.schemaVersion < SECRETS_SCHEMA_VERSION) {
+      print(`  schema:     v${status.schemaVersion} -- entries are NOT bound to their names until`);
+      print(`              \`yaw-mcp secrets rotate\` rewrites the file as v${SECRETS_SCHEMA_VERSION}`);
+    } else {
+      print(`  schema:     v${status.schemaVersion}`);
+    }
+  }
   print(`  passphrase: ${status.passphraseSet ? "set in this environment" : "not set in this environment"}`);
   if (status.refs.length === 0) {
     print("  refs:       no server env references ${secret:NAME}");
@@ -1163,6 +1407,15 @@ function renderVaultSection(opts: { status: VaultStatus; print: (s?: string) => 
     print("  refs:");
     for (const r of status.refs) {
       print(`    ${r.namespace}: ${r.secretNames.map((n) => `\${secret:${n}}`).join(", ")}`);
+    }
+  }
+  // A ref the strict regex could not parse is refused at spawn exactly like a
+  // missing name, so it gets the same prominence -- and its own remedy: the
+  // fix is the typo in bundles.json, not the vault.
+  if (status.malformed.length > 0) {
+    print("  malformed:  refs the spawn is REFUSED over (fix the typo in bundles.json):");
+    for (const m of status.malformed) {
+      print(`    ${m.namespace}: ${m.refs.join(", ")}`);
     }
   }
   if (status.refs.length > 0 && !status.passphraseSet) {
@@ -1341,7 +1594,16 @@ async function collectOamRuntimeStatus(opts: {
       // already reads as "not in the managed tree" -- its problem is not
       // staleness) and only when the registry check is on at all. In parallel,
       // so N packages cost one timeout window, not N -- doctor must not hang.
-      const latest = version !== null && opts.sidecarLatest !== null ? await opts.sidecarLatest(s.pkg) : null;
+      //
+      // A REJECTING probe is absorbed here, not trusted to the hook: the
+      // documented contract (null = unknown) is the same one registryFetch
+      // has, and that one is absorbed inside fetchLatestVersion. Left bare,
+      // a rejection propagated through this Promise.all and rejected
+      // runDoctor -- the one freshness probe that could take the whole
+      // diagnostic down, on a report that exists to be readable when things
+      // are broken.
+      const latest =
+        version !== null && opts.sidecarLatest !== null ? await opts.sidecarLatest(s.pkg).catch(() => null) : null;
       // Strictly behind, on a fetched answer only -- compareSemver treats
       // unparseable as equal, so a weird version cannot invent a false stale.
       const stale = version !== null && latest !== null && compareSemver(version, latest) < 0;
@@ -1442,11 +1704,13 @@ function renderOamRuntimeSection(opts: {
   } else {
     print(`  binary:  ${probe.bin} (v${probe.version}, min ${MIN_OAM_VERSION})`);
   }
-  // What THIS process runs on. Meaningful when doctor is called as a tool
-  // through the broker (same process), and explicitly labelled so it is not
-  // mistaken for what a client's configured entry will launch -- `yaw-mcp
-  // doctor` typed into a shell runs on node no matter what the entry says.
-  // The per-client "(runs on oam)" marker in CLIENTS answers that one.
+  // What THIS process runs on -- the shell's node in practice, since
+  // runDoctor is only ever reached from the CLI dispatcher (index.ts); it
+  // reads "oam" only if someone runs `oam run dist/index.js doctor` by hand.
+  // Explicitly labelled so it is not mistaken for what a client's configured
+  // entry will launch: `yaw-mcp doctor` typed into a shell runs on node no
+  // matter what the entry says. The per-client "(runs on oam)" marker in
+  // CLIENTS answers that one.
   // Guarded, not just cast: process.versions is another runtime's surface, and
   // an unexpected shape would otherwise render "[object Object]" into the one
   // line whose whole job is to be trustworthy.
@@ -1567,13 +1831,13 @@ function renderProjectGuideSection(opts: { guide: GuideFile | null; print: (s?: 
 function renderStateSection(opts: {
   filePath: string;
   disabled: boolean;
-  /** State loaded once by the caller, or null. Null does NOT mean "persistence
-   *  is disabled": both callers also pass null when the peek says the file is
-   *  missing, malformed, an unreadable version, or unreadable at all -- they
-   *  only call loadState on a peek they can use. Read `disabled` / `peek` for
-   *  which of those it is. */
+  /** State loaded once by collectStateStatus, or null. Null does NOT mean
+   *  "persistence is disabled": it is also null when the peek says the file
+   *  is missing, malformed, an unreadable version, or unreadable at all --
+   *  only an "ok" peek is loaded. Read `disabled` / `peek` for which of those
+   *  it is. */
   persisted: Awaited<ReturnType<typeof loadState>> | null;
-  /** Peek result hoisted to the caller to avoid re-reading state.json. */
+  /** Peek result from collectStateStatus, so state.json is not re-read. */
   peek: StatePeek | null;
   print: (s?: string) => void;
 }): void {
@@ -1604,10 +1868,10 @@ function renderStateSection(opts: {
     return;
   }
   // persisted can still be null here even though the malformed / stale-version
-  // / unreadable peeks returned above: the text path only loads state on an
-  // "ok" peek, so a MISSING file arrives as null. That is the same thing to a
-  // reader as a file that exists but has never been saved, and both take the
-  // "no persisted state yet" line below.
+  // / unreadable peeks returned above: collectStateStatus only loads state on
+  // an "ok" peek, so a MISSING file arrives as null. That is the same thing to
+  // a reader as a file that exists but has never been saved, and both take
+  // the "no persisted state yet" line below.
   if (!persisted || persisted.savedAt === 0) {
     print("  (no persisted state yet -- will be created on the first tool call)");
   } else {
@@ -1643,7 +1907,14 @@ async function peekStateFile(filePath: string): Promise<StatePeek> {
   } catch (err) {
     return { kind: "malformed", message: err instanceof Error ? err.message : String(err) };
   }
-  if (!parsed || typeof parsed !== "object") return { kind: "malformed", message: "top-level value is not an object" };
+  // Arrays are typeof "object" too. Without the explicit test a top-level
+  // `[]` slipped through to the version check below and was reported as
+  // "schema mismatch (file is v?)" -- the fix for which (`reset-learning`)
+  // happens to be right, for a reason the line did not give. Same guard
+  // classifyProbeContent applies to a client config.
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { kind: "malformed", message: "top-level value is not an object" };
+  }
   const version = (parsed as { version?: unknown }).version;
   // Readable, not identical. STATE_SCHEMA_VERSION went 1 -> 2 for the
   // additive toolCache field, and loadState MIGRATES a v1 file rather than
@@ -1731,7 +2002,15 @@ async function renderTrialsSection(opts: {
   if (gc.cleared > 0) {
     print(`  swept ${gc.cleared} expired trial${gc.cleared === 1 ? "" : "s"} this run`);
   }
-  for (const w of warnings) print(`  ! ${w}`);
+  if (gc.failed > 0) {
+    // The per-failure detail is a WARNING -- the caller folds `warnings` into
+    // config.warnings, and the WARNINGS block prints each one -- so it is
+    // printed THERE, once, like the trust and bundle warnings. This section
+    // used to print the same line as well, so every un-finishable trial
+    // appeared twice in the report. Say how many here and point at the block
+    // that carries the detail.
+    print(`  ${gc.failed} expired trial${gc.failed === 1 ? "" : "s"} could not be swept -- see WARNINGS`);
+  }
   for (const { marker, msUntilExpiry } of scan.live) {
     print(`  ${marker.slug} -> ${marker.clientName} (${marker.clientPath}) -- expires in ${formatTtl(msUntilExpiry)}`);
   }
@@ -1769,6 +2048,21 @@ function schemaSuffix(f: LoadedConfigFile): string {
  *  doesn't carry a nested ternary tree as more states get added. */
 function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.unavailable) return "unavailable on this OS";
+  // A READ failure, named as one. It used to fall into the malformed line
+  // below and send the user hunting for a syntax error in a file that is a
+  // directory, or that the process simply cannot open. No install hint: on
+  // the shapes that produce this (EISDIR, EACCES) `install` cannot write the
+  // file either, and on the transient one (win32 EBUSY) nothing needs fixing.
+  if (c.unreadable !== null) {
+    // The transient shape gets no "check its permissions": there is nothing
+    // to check, the file is fine and the next read succeeds. It also raises
+    // no warning -- see clientCannotLaunch -- so this line is the only place
+    // the contention is reported at all.
+    if (isTransientRead(c)) {
+      return `exists but could not be read just now (${c.unreadable}) -- another process holds it; rerun doctor`;
+    }
+    return `exists but could not be read (${c.unreadable}) -- check the file and its permissions, then rerun doctor`;
+  }
   if (c.malformed) return "exists but JSON is malformed -- fix or rerun `yaw-mcp install`";
   // Checked BEFORE the combined legacy branch: a launch command that no longer
   // exists is the one state that means the client cannot start yaw-mcp AT ALL,
@@ -1798,6 +2092,15 @@ function renderClientStatus(c: ClientProbeResult, installCmd: string): string {
   if (c.launchOamNotAbsolute) {
     return `has "${ENTRY_NAME}" entry with a bare "${c.launchOamNotAbsolute}" command -- it resolves against the client's PATH, which a GUI-launched client does not inherit from your shell; rerun \`${installCmd}\` to write an absolute path, or set OAM_BIN${legacy}`;
   }
+  // Below the cannot-launch branches and above the OK ones: doctor knows
+  // neither. The path is absolute on the OS the entry was written for, and
+  // that OS is not this one, so the exists / bare-oam checks were not run
+  // (see isForeignAbsoluteLaunch). Reporting OK would claim a check that did
+  // not happen; reporting broken would flag a Windows profile as seen from
+  // WSL for being a Windows profile.
+  if (c.launchForeignPath) {
+    return `has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""} whose launch path is for another OS: ${c.launchForeignPath} -- not verified from here${c.hasLegacyEntry ? `; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice` : ""}`;
+  }
   if (c.hasMcpEntry && c.hasLegacyEntry) {
     return `OK -- has "${ENTRY_NAME}" entry${c.launchRuntime === "oam" ? " (runs on oam)" : ""}; legacy "${c.legacyEntryName}" entry also present -- remove it to avoid running yaw-mcp twice`;
   }
@@ -1825,6 +2128,22 @@ interface ProbeOptions {
    *  `<DIR>/.claude.json` instead of `<HOME>/.claude.json` so doctor and
    *  `yaw-mcp install --list` see the same file Claude Code reads. */
   claudeConfigDir?: string;
+  /** Path semantics for the launch checks: which `isAbsolute` an entry's
+   *  command is judged by, and whether a drive-letter path is foreign (see
+   *  isForeignAbsoluteLaunch). Defaults to process.platform -- what the
+   *  machine running the probe actually resolves paths with -- and is a seam
+   *  so the WSL-reads-a-Windows-profile branches run from a Windows box and
+   *  the native-drive-letter branch from POSIX, instead of each being tested
+   *  only where it happens to be native. Distinct from `os`, which picks the
+   *  client LAYOUT to inspect, not the path semantics of the inspector. */
+  platform?: NodeJS.Platform;
+  /** Test seam: replaces the config-file read. Synchronous on purpose, so
+   *  the one hook serves probeClients (sync) and probeClientsAsync alike.
+   *  It is the only way to produce a transient EBUSY / EAGAIN read
+   *  deterministically -- a directory at the path gives EISDIR, a chmod
+   *  gives EACCES, but nothing a test can arrange holds a handle at just the
+   *  right moment. Production never sets it. */
+  readClientConfig?: (path: string) => string;
 }
 
 /** One (client, scope) probe slot: the result skeleton plus, when a config
@@ -1836,23 +2155,52 @@ interface ProbeSlot {
   read: { path: string; containerPath: string[] } | null;
 }
 
+/** The content-derived part of a ClientProbeResult -- everything a slot does
+ *  not already know before its file is read. The empty skeleton and
+ *  classifyProbeContent are both typed against it, so a field added to
+ *  ClientProbeResult that neither sets is a compile error rather than an
+ *  `undefined` in the --json blob. */
+type ProbeClassification = Omit<ClientProbeResult, "clientId" | "scope" | "path" | "exists" | "unavailable">;
+
 // The "nothing found" probe skeleton, in ONE place. classifyProbeContent
 // returns this shape from four separate exits (empty file, non-object JSON,
-// missing container, parse throw); spelled out at each one, a newly-added
+// missing container, parse throw) and enumerateProbeSlots spreads it into
+// both of its result literals; spelled out at each one, a newly-added
 // ClientProbeResult field only had to be forgotten at a single site to read
 // as `undefined` there while every other exit reported it properly.
-const EMPTY_PROBE = {
+const EMPTY_PROBE: Readonly<ProbeClassification> = {
   hasMcpEntry: false,
   hasLegacyEntry: false,
   legacyEntryName: null,
   malformed: false,
+  unreadable: null,
+  unreadableCode: null,
   launchCommandMissing: null,
   launchRuntime: null,
   launchOamNotAbsolute: null,
   launchOamEntryMissing: null,
-} as const;
+  launchForeignPath: null,
+};
 
-const MALFORMED = { ...EMPTY_PROBE, malformed: true } as const;
+const MALFORMED: Readonly<ProbeClassification> = { ...EMPTY_PROBE, malformed: true };
+
+/** What a slot reports when its config file's BYTES could not be read.
+ *  Distinct from MALFORMED on purpose: both probes used to wrap the read AND
+ *  the classification in one catch that assigned MALFORMED, but
+ *  classifyProbeContent has its own catch for parse failures, so that outer
+ *  catch only ever saw READ errors -- and reported a directory at
+ *  ~/.claude.json, or a transient win32 EBUSY, as "JSON is malformed". */
+function unreadableProbe(err: unknown): ProbeClassification {
+  // The errno rides along as its own field: the exit-code gate keys the
+  // transient / real split on it (isTransientRead), and node's message
+  // wording is not a stable thing to grep.
+  const code = (err as { code?: unknown } | null)?.code;
+  return {
+    ...EMPTY_PROBE,
+    unreadable: err instanceof Error ? err.message : String(err),
+    unreadableCode: typeof code === "string" ? code : null,
+  };
+}
 
 /** Enumerate every (client, scope) combo for the current OS and resolve its
  *  config path. Shared by the sync and async probe variants so the client
@@ -1867,15 +2215,8 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           scope: target.scopes[0].scope,
           path: "(n/a)",
           exists: false,
-          hasMcpEntry: false,
-          launchCommandMissing: null,
-          launchRuntime: null,
-          launchOamNotAbsolute: null,
-          launchOamEntryMissing: null,
-          hasLegacyEntry: false,
-          legacyEntryName: null,
-          malformed: false,
           unavailable: true,
+          ...EMPTY_PROBE,
         },
         read: null,
       };
@@ -1908,15 +2249,8 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
           scope: scope.scope,
           path: resolved.absolute,
           exists,
-          hasMcpEntry: false,
-          launchCommandMissing: null,
-          launchRuntime: null,
-          launchOamNotAbsolute: null,
-          launchOamEntryMissing: null,
-          hasLegacyEntry: false,
-          legacyEntryName: null,
-          malformed: false,
           unavailable: false,
+          ...EMPTY_PROBE,
         },
         read: exists ? { path: resolved.absolute, containerPath: resolved.containerPath } : null,
       };
@@ -1926,13 +2260,20 @@ function* enumerateProbeSlots(opts: ProbeOptions): Generator<ProbeSlot> {
 
 function probeClients(opts: ProbeOptions): ClientProbeResult[] {
   const out: ClientProbeResult[] = [];
+  const readConfig = opts.readClientConfig ?? ((p: string): string => readFileSync(p, "utf8"));
+  const platform = opts.platform ?? process.platform;
   for (const { result, read } of enumerateProbeSlots(opts)) {
     if (read) {
+      // The READ is caught on its own, and the classification is not caught
+      // here at all -- it catches its own parse failures. See unreadableProbe
+      // for why the two must not share a catch.
+      let raw: string | null = null;
       try {
-        Object.assign(result, classifyProbeContent(readFileSync(read.path, "utf8"), read.containerPath));
-      } catch {
-        Object.assign(result, MALFORMED);
+        raw = readConfig(read.path);
+      } catch (err) {
+        Object.assign(result, unreadableProbe(err));
       }
+      if (raw !== null) Object.assign(result, classifyProbeContent(raw, read.containerPath, existsSync, platform));
     }
     out.push(result);
   }
@@ -1952,8 +2293,16 @@ function walkContainer(root: Record<string, unknown>, path: string[]): Record<st
 }
 
 /**
- * The oam argv a launch entry ultimately runs, with any shell wrapper peeled
- * off -- or null when this entry is not an oam launch we can read.
+ * The oam a launch entry ultimately runs and the argv it runs it with, with
+ * any shell wrapper peeled off -- or null when this entry is not an oam launch
+ * we can read.
+ *
+ * `oam` is the token the client will actually resolve (`"oam"`, `"oam.exe"`,
+ * an absolute path), which inside a wrapper is NOT `command`: the bare-oam
+ * check in classifyProbeContent used to test `command` alone, so
+ * `cmd /d /s /c oam run ...` -- which isOamLaunch accepts and which resolves
+ * against the GUI client's PATH exactly like a bare `"command": "oam"` --
+ * read as "OK (runs on oam)". `rest` is what oamRunEntryPath scans.
  *
  * DELIBERATE DUPLICATION of the unwrap in `isOamLaunch` (oam-spawn.ts). That
  * function answers "is this oam?" and throws the unwrapped tokens away;
@@ -1962,8 +2311,8 @@ function walkContainer(root: Record<string, unknown>, path: string[]): Record<st
  * starts accepting has to be added here too, or the entry scan below falls back
  * to reading the wrapper's own switches as an oam path.
  */
-function oamArgvTokens(command: string, args: readonly string[]): readonly string[] | null {
-  if (isOamCommand(command)) return args;
+function oamArgvTokens(command: string, args: readonly string[]): { oam: string; rest: readonly string[] } | null {
+  if (isOamCommand(command)) return { oam: command, rest: args };
   const base = command.split(/[\\/]/).pop() ?? command;
 
   if (/^cmd(\.exe)?$/i.test(base)) {
@@ -1973,7 +2322,7 @@ function oamArgvTokens(command: string, args: readonly string[]): readonly strin
     // the switch set.
     const i = args.findIndex((a) => !/^\/[a-z]$/i.test(a));
     if (i < 0 || !isOamCommand(args[i])) return null;
-    return args.slice(i + 1);
+    return { oam: args[i], rest: args.slice(i + 1) };
   }
 
   if (/^(sh|bash|zsh|dash)$/i.test(base)) {
@@ -1989,10 +2338,32 @@ function oamArgvTokens(command: string, args: readonly string[]): readonly strin
     if (/["']/.test(payload)) return null;
     const tokens = payload.trim().split(/\s+/);
     if (tokens[0] === undefined || !isOamCommand(tokens[0])) return null;
-    return tokens.slice(1);
+    return { oam: tokens[0], rest: tokens.slice(1) };
   }
 
   return null;
+}
+
+/** True when a launch command is an absolute path for ANOTHER operating
+ *  system -- today, a drive-letter path (`C:\...\oam.exe`) seen by a doctor
+ *  running on POSIX, which is what WSL reading a Windows profile looks like.
+ *
+ *  node:path answers for the RUNNING platform, so posix `isAbsolute` calls
+ *  that path relative: the missing-command check skips it (fine) but the
+ *  bare-oam check then flags it as "resolves against the client's PATH" --
+ *  advice about PATH lookup for a path that is fully absolute on the OS the
+ *  entry was written for. Neither check can be applied from here, so the
+ *  entry is reported as unverifiable (ClientProbeResult.launchForeignPath)
+ *  rather than as broken. On win32 a drive-letter path is native and takes
+ *  the ordinary checks; a POSIX path seen from win32 is not detected here
+ *  (win32 isAbsolute accepts it and existsSync answers for the local disk).
+ *
+ *  `platform` is the probe's path-semantics seam (ProbeOptions.platform),
+ *  process.platform in production because that is what the machine doing the
+ *  inspecting resolves paths with -- never the `os` option, which picks the
+ *  client layout to inspect, not the path semantics of the inspector. */
+export function isForeignAbsoluteLaunch(command: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "win32" && /^[A-Za-z]:[\\/]/.test(command);
 }
 
 /**
@@ -2012,8 +2383,14 @@ function oamArgvTokens(command: string, args: readonly string[]): readonly strin
  * only if that value also looks like an absolute path that does not exist.
  */
 export function oamRunEntryPath(command: string, args: readonly string[]): string | null {
-  const tokens = oamArgvTokens(command, args);
-  if (tokens === null) return null;
+  const unwrapped = oamArgvTokens(command, args);
+  return unwrapped === null ? null : oamRunEntryFromTokens(unwrapped.rest);
+}
+
+/** The `run` half of oamRunEntryPath, over an already-unwrapped oam argv --
+ *  so classifyProbeContent, which needs the unwrap's oam token as well, does
+ *  not unwrap the same entry twice. */
+function oamRunEntryFromTokens(tokens: readonly string[]): string | null {
   // Leading flags belong to oam itself; the first bare token is the subcommand.
   const sub = tokens.findIndex((t) => !t.startsWith("-"));
   if (sub < 0 || tokens[sub] !== "run") return null;
@@ -2021,28 +2398,27 @@ export function oamRunEntryPath(command: string, args: readonly string[]): strin
 }
 
 /** Classify raw config file content for a probe result. Shared by both
- *  the sync and async probe variants so the parsing logic lives once. */
+ *  the sync and async probe variants so the parsing logic lives once.
+ *
+ *  `platform` picks the path semantics for every launch check below (see
+ *  ProbeOptions.platform): node:path's bare `isAbsolute` is bound to the
+ *  running platform, and with it the foreign-path branches could only ever
+ *  execute on a POSIX runner and the native-drive-letter one only on win32
+ *  -- so on a Windows-only maintainer box the WSL wiring here never ran. */
 function classifyProbeContent(
   raw: string,
   containerPath: string[],
   exists: (p: string) => boolean = existsSync,
-): {
-  hasMcpEntry: boolean;
-  hasLegacyEntry: boolean;
-  legacyEntryName: string | null;
-  malformed: boolean;
-  launchCommandMissing: string | null;
-  launchRuntime: "oam" | "node" | null;
-  launchOamNotAbsolute: string | null;
-  launchOamEntryMissing: string | null;
-} {
+  platform: NodeJS.Platform = process.platform,
+): ProbeClassification {
+  const isAbsolute = platform === "win32" ? win32.isAbsolute : posix.isAbsolute;
   if (raw.trim().length === 0) {
     return { ...EMPTY_PROBE };
   }
   try {
     const parsed = parseJsonc(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return { ...EMPTY_PROBE, malformed: true };
+      return { ...MALFORMED };
     }
     const container = walkContainer(parsed as Record<string, unknown>, containerPath);
     if (!container) {
@@ -2054,40 +2430,57 @@ function classifyProbeContent(
     let launchRuntime: "oam" | "node" | null = null;
     let launchOamNotAbsolute: string | null = null;
     let launchOamEntryMissing: string | null = null;
+    let launchForeignPath: string | null = null;
     if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
       const command = (entry as { command?: unknown }).command;
       if (typeof command === "string") {
-        if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
         const entryArgs = (entry as { args?: unknown }).args;
         // FILTERED to strings, not cast to them. A hand-edited config whose
         // args carry a number or a null parses fine, but every consumer below
-        // (isOamLaunch, oamRunEntryPath) calls string methods on each token --
+        // (isOamLaunch, oamArgvTokens) calls string methods on each token --
         // so the old `as string[]` threw a TypeError into this function's outer
         // catch and reported a perfectly parseable file as "exists but JSON is
         // malformed", sending the user to fix a syntax error that isn't there.
         const args = Array.isArray(entryArgs) ? entryArgs.filter((a): a is string => typeof a === "string") : [];
         launchRuntime = isOamLaunch(command, args) ? "oam" : "node";
-        // A BARE oam command is the one shape the absolute-path check above
-        // cannot see, and it is the shape older installs actually wrote. It
-        // resolves against the CLIENT's PATH, not the shell's, so a
-        // GUI-launched client (Claude Desktop from the Dock, Cursor from
-        // Explorer) never finds an oam that lives in ~/.oam/bin -- the broker
-        // fails to start with no fallback. `install` no longer writes this,
-        // but nothing rewrites the configs that already carry it, so doctor is
-        // the only thing that can surface it.
-        if (isOamCommand(command) && !isAbsolute(command)) launchOamNotAbsolute = command;
-        // `oam run [--no-check] <entry>`: unlike npx, oam cannot fetch a
-        // missing entry on demand, so a stale path here is a hard launch
-        // failure rather than a slow start.
-        //
-        // Goes through oamRunEntryPath rather than scanning `args` directly:
-        // launchRuntime is "oam" for the `cmd /d /s /c oam run ...` and
-        // `sh -c "oam run ..."` shapes too, and on those the raw argv's first
-        // non-flag token is the wrapper's own switch, not the entry file.
-        if (launchRuntime === "oam") {
-          const entryPath = oamRunEntryPath(command, args);
-          if (entryPath !== null && isAbsolute(entryPath) && !exists(entryPath)) {
-            launchOamEntryMissing = entryPath;
+        if (isForeignAbsoluteLaunch(command, platform)) {
+          // Written for another OS: none of the checks below can be applied
+          // from here, and applying them anyway is what produced a "bare oam"
+          // PATH warning for a fully absolute Windows path.
+          launchForeignPath = command;
+        } else {
+          if (isAbsolute(command) && !exists(command)) launchCommandMissing = command;
+          if (launchRuntime === "oam") {
+            // Every oam-specific check reads the UNWRAPPED launch, not the raw
+            // argv: launchRuntime is "oam" for the `cmd /d /s /c oam run ...`
+            // and `sh -c "oam run ..."` shapes too, and on those `command` is
+            // the wrapper and the raw argv's first non-flag token is the
+            // wrapper's own switch. A null unwrap (a quoted `sh -c` payload,
+            // which isOamLaunch still classifies) means nothing is checked --
+            // under-reporting is the safe direction.
+            const oamArgv = oamArgvTokens(command, args);
+            if (oamArgv !== null) {
+              // A BARE oam is the one shape the absolute-path check above
+              // cannot see, and it is the shape older installs actually
+              // wrote. It resolves against the CLIENT's PATH, not the shell's,
+              // so a GUI-launched client (Claude Desktop from the Dock, Cursor
+              // from Explorer) never finds an oam that lives in ~/.oam/bin --
+              // the broker fails to start with no fallback. `install` no
+              // longer writes this, but nothing rewrites the configs that
+              // already carry it, so doctor is the only thing that can
+              // surface it. Tested on the unwrapped token: a bare `oam`
+              // reached through a wrapper resolves the same way and used to
+              // read as "OK (runs on oam)".
+              if (isForeignAbsoluteLaunch(oamArgv.oam, platform)) launchForeignPath = oamArgv.oam;
+              else if (!isAbsolute(oamArgv.oam)) launchOamNotAbsolute = oamArgv.oam;
+              // `oam run [--no-check] <entry>`: unlike npx, oam cannot fetch a
+              // missing entry on demand, so a stale path here is a hard
+              // launch failure rather than a slow start.
+              const entryPath = oamRunEntryFromTokens(oamArgv.rest);
+              if (entryPath !== null && isAbsolute(entryPath) && !exists(entryPath)) {
+                launchOamEntryMissing = entryPath;
+              }
+            }
           }
         }
       }
@@ -2097,13 +2490,18 @@ function classifyProbeContent(
       hasLegacyEntry: legacyEntryName !== null,
       legacyEntryName,
       malformed: false,
+      unreadable: null,
+      unreadableCode: null,
       launchCommandMissing,
       launchRuntime,
       launchOamNotAbsolute,
       launchOamEntryMissing,
+      launchForeignPath,
     };
   } catch {
-    return { ...EMPTY_PROBE, malformed: true };
+    // Parse failures only: the READ happens in the caller, under its own
+    // catch (see unreadableProbe), so nothing but the parse can throw here.
+    return { ...MALFORMED };
   }
 }
 
@@ -2114,13 +2512,19 @@ function classifyProbeContent(
 // itself uses the sync probeClients (it runs once, interactively).
 export async function probeClientsAsync(opts: ProbeOptions): Promise<ClientProbeResult[]> {
   const out: ClientProbeResult[] = [];
+  const platform = opts.platform ?? process.platform;
   for (const { result, read } of enumerateProbeSlots(opts)) {
     if (read) {
+      // Same read-vs-classify split as probeClients; see unreadableProbe.
+      // The (sync) read seam is honoured here too -- it exists to inject a
+      // read failure, and only the default is the non-blocking read.
+      let raw: string | null = null;
       try {
-        Object.assign(result, classifyProbeContent(await readFile(read.path, "utf8"), read.containerPath));
-      } catch {
-        Object.assign(result, MALFORMED);
+        raw = opts.readClientConfig ? opts.readClientConfig(read.path) : await readFile(read.path, "utf8");
+      } catch (err) {
+        Object.assign(result, unreadableProbe(err));
       }
+      if (raw !== null) Object.assign(result, classifyProbeContent(raw, read.containerPath, existsSync, platform));
     }
     out.push(result);
   }
@@ -2271,9 +2675,12 @@ function shellHistorySources(opts: { home: string; env: NodeJS.ProcessEnv }): Sh
   // zero instead of double. The later entry is the one that knows the format.
   const lastIndex = new Map<string, number>();
   sources.forEach((s, i) => {
-    lastIndex.set(resolve(s.path), i);
+    // Keyed on the case-folded spelling (win32 / darwin), not the byte-exact
+    // resolve() output: a HISTFILE that names ~/.zsh_history in a different
+    // case is the same file on those platforms and used to be counted twice.
+    lastIndex.set(normalizeForCompare(resolve(s.path)), i);
   });
-  return sources.filter((s, i) => lastIndex.get(resolve(s.path)) === i);
+  return sources.filter((s, i) => lastIndex.get(normalizeForCompare(resolve(s.path))) === i);
 }
 
 /** Read at most the last `n` lines of a file, reading at most

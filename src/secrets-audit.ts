@@ -12,6 +12,9 @@
 //   - Writes are FAIL-OPEN: appendAuditEvent swallows every error so a
 //     broken/unwritable log can never block or crash a server spawn. The
 //     audit trail is a convenience, not a correctness dependency.
+//   - Reads are NOT: readAuditLog returns [] only for an ABSENT log and
+//     throws for one that exists but cannot be read, so `secrets audit`
+//     never reports an unreadable trail as an empty one.
 //   - Tail-capped at 5000 lines on append so the file can't grow without
 //     bound on a long-lived process.
 
@@ -147,15 +150,24 @@ export interface AuditFilter {
  * Read the audit log, newest line last (file order). Malformed lines are
  * skipped rather than throwing -- a partially-written tail line shouldn't
  * sink the whole read. Returns [] when the file does not exist.
+ *
+ * Reads are NOT fail-open the way writes are. A write that fails must never
+ * block a spawn; a read that fails has nothing to block, and reporting [] for
+ * a log that EXISTS but cannot be read told the operator "no events recorded
+ * yet" about a trail sitting right there (EACCES, EISDIR, EIO) -- the same
+ * absent-vs-unreadable collapse loadVault refuses to make. ENOENT is the only
+ * "no trail yet" signal; every other read error throws, naming the path and
+ * the errno, for `secrets audit` to render.
  */
 export async function readAuditLog(filter: AuditFilter = {}, home: string = homedir()): Promise<AuditEvent[]> {
   const path = auditLogPath(home);
-  if (!existsSync(path)) return [];
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
-  } catch {
-    return [];
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return [];
+    throw new Error(`could not read the audit log at ${path} (${e.code ?? e.message})`);
   }
   const out: AuditEvent[] = [];
   for (const line of raw.split("\n")) {

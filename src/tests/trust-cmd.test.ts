@@ -7,7 +7,7 @@
 // Path keys are built with join() (never POSIX literals) because the SUT
 // routes through path.join, which yields backslashes on the Windows runner.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { PassThrough } from "node:stream";
@@ -21,7 +21,19 @@ let synthHome: string;
 let synthCwd: string;
 
 beforeEach(() => {
-  synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-trustcmd-"));
+  // realpathSync.NATIVE, and on the root, for the same reason trust.test.ts
+  // does it: the SUT keys grants and renders paths PHYSICALLY
+  // (findProjectConfigDir realpaths the project dir before the `Approved
+  // <path>` / `Revoked <path>` / --json lines are printed), so a logical
+  // fixture root prints one spelling while the assertions below expect the
+  // other -- red across the suite on macOS, where tmpdir() is /var ->
+  // /private/var, and on any Windows account whose TEMP is an 8.3 short path.
+  // `.native` is the flavor that matters: the SUT resolves through
+  // fs.promises.realpath (libuv), which expands 8.3 names and junctions, while
+  // plain realpathSync is the JS walker and would not reproduce the same
+  // spelling on Windows. synthCwd is created INSIDE the resolved root, so it
+  // inherits the physical spelling.
+  synthHome = realpathSync.native(mkdtempSync(join(tmpdir(), "yaw-mcp-trustcmd-")));
   synthCwd = mkdtempSync(join(synthHome, "cwd-"));
 });
 

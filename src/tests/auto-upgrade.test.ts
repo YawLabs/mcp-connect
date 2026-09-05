@@ -2,10 +2,14 @@ import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   acquireUpgradeLock,
+  attemptedRecentlyAt,
   detectRunningInstallPrefix,
   maybeAutoUpgrade,
   quoteArgForDisplay,
   quoteShellArgIfNeeded,
+  readCheckMemo,
+  recordAttemptAt,
+  writeCheckMemo,
 } from "../auto-upgrade.js";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -282,17 +286,33 @@ describe("maybeAutoUpgrade", () => {
 // assertions hold on both Windows (\) and POSIX (/) runners.
 // ═══════════════════════════════════════════════════════════════════════
 
-// Only realpathSync is stubbed -- the rest of node:fs stays real, which is
-// what lets the lockfile suite below run against a genuine temp directory.
+// Only realpathSync is stubbed, and renameSync is WRAPPED (real behaviour by
+// default; a per-test mockImplementationOnce lets the steal suite interleave a
+// second stealer between acquireUpgradeLock's stat and its rename) -- the rest
+// of node:fs stays real, which is what lets the lockfile suite below run
+// against a genuine temp directory.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, realpathSync: vi.fn((p: string) => p) };
+  return { ...actual, realpathSync: vi.fn((p: string) => p), renameSync: vi.fn(actual.renameSync) };
 });
 
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 
 const mockRealpathSync = vi.mocked(realpathSync);
+const mockRenameSync = vi.mocked(renameSync);
 
 describe("detectRunningInstallPrefix", () => {
   it("returns the install prefix when argv[1] is inside a node_modules tree", () => {
@@ -441,6 +461,29 @@ describe("runAutoUpgrade: --prefix injection into spawn args", () => {
     expect(spawnImpl).toHaveBeenCalledTimes(1);
     expect(spawnImpl).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS, RELEASE_LOCK);
   });
+
+  it("re-classifies a project-local node_modules that is a symlink into a global prefix (npm link)", async () => {
+    // `local-node-modules` is a LITERAL answer, so the CLI's classifier never
+    // second-guesses it (resolving a pnpm global first lands in the store and
+    // reads as local). The background upgrader passes detectInstallMethod a
+    // resolveWhen that includes local-node-modules: the bytes running under an
+    // `npm link`ed or staged shim belong to the global install, and that
+    // install is what a restart keeps spawning. It used to keep a private copy
+    // of this realpath pass for the one difference; now it is the
+    // classifier's own option, so the resolution rule cannot drift in two
+    // places.
+    mockRealpathSync.mockImplementation((p) => (p === LOCAL_NODE_MODULES_PATH ? GLOBAL_NPM_PATH : String(p)));
+
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: LOCAL_NODE_MODULES_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl,
+    });
+
+    expect(spawnImpl).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS, RELEASE_LOCK);
+  });
 });
 
 describe("quoteArgForDisplay -- paste-safe quoting for PRINTED command lines", () => {
@@ -563,7 +606,10 @@ describe("defaultSpawn -- the real background upgrade child", () => {
   it("spawns the whitelisted npm command with stdio ignored, NOT detached, shell only on win32", async () => {
     // stdio:"ignore" keeps the child off the MCP stdio transport (a single
     // stray byte on stdout corrupts the JSON-RPC stream); detached:false
-    // makes the child die with yaw-mcp instead of outliving it.
+    // keeps the child in yaw-mcp's process group, so a client that tears down
+    // the whole tree takes it along. That is all it buys: on POSIX a plain
+    // parent exit does NOT kill it (the source's KNOWN GAPS say so), so the
+    // option is pinned for the group membership, not for "dies with us".
     mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
@@ -799,6 +845,44 @@ describe("defaultSpawn -- the real background upgrade child", () => {
       expect(install.args).toEqual(["install", "-g", "--prefix", nasty, "@yawlabs/mcp@latest"]);
     }
   });
+
+  it.each([
+    ["npm", GLOBAL_NPM_PATH],
+    ["pnpm", PNPM_PATH],
+    ["bun", BUN_PATH],
+  ])("spawns %s with yaw-mcp's own secrets STRIPPED from the child env (PATH survives)", async (tool, argvPath) => {
+    // README tells the user to park YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own
+    // env block because "yaw-mcp strips its own secrets from every child env".
+    // The upstream spawn kept that promise; this spawn inherited process.env
+    // whole, and npm runs every dependency's pre/postinstall with it -- so a
+    // compromised transitive dependency's install script plus
+    // ~/.yaw-mcp/secrets.json was the entire vault, with stdio ignored and
+    // nothing logged.
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE", "hunter2");
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE_NEW", "hunter3");
+    vi.stubEnv("YAW_MCP_TOKEN", "mcp_pat_stale");
+    try {
+      mockRealpathSync.mockReturnValue(NO_PREFIX_REALPATH);
+      await maybeAutoUpgrade({ currentVersion: "0.47.0", argvPath, fetchLatestImpl: async () => "0.47.8" });
+
+      expect(cp.calls).toHaveLength(1);
+      expect(cp.calls[0].cmd).toBe(tool);
+      const env = cp.calls[0].opts.env as NodeJS.ProcessEnv | undefined;
+      // An absent `env` option means "inherit process.env" -- the leaking shape.
+      expect(env).toBeDefined();
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE_NEW");
+      expect(env).not.toHaveProperty("YAW_MCP_TOKEN");
+      // ...and it is a strip, not a blank env: the tool still has to be found.
+      // The copy keeps process.env's own spelling of the key (`Path` on
+      // Windows), so look it up the way the OS does.
+      const pathKey = Object.keys(env ?? {}).find((k) => k.toUpperCase() === "PATH");
+      expect(pathKey).toBeDefined();
+      expect(env?.[pathKey as string]).toBe(process.env.PATH);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
@@ -806,6 +890,10 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
 
   beforeEach(() => {
     resetSpawnRecorder();
+    // Spied only to prove the warning does NOT bypass the logger: everything
+    // serve emits is one JSON line per event, and the four-line plain-text
+    // blob this used to write straight to process.stderr was what a client or
+    // operator parsing yaw-mcp's stderr tripped over.
     stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
   });
 
@@ -818,11 +906,18 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     mockRealpathSync.mockImplementation((p) => String(p));
   });
 
-  const stderrText = (): string => (stderrSpy.mock.calls as unknown[][]).map((c) => String(c[0])).join("");
+  const rawStderrText = (): string => (stderrSpy.mock.calls as unknown[][]).map((c) => String(c[0])).join("");
 
-  /** The comparison is fire-and-forget (`void compareWithNpmPrefix(...)`), so
-   *  maybeAutoUpgrade resolves before the probe's continuation writes to
-   *  stderr. Drain the microtask + immediate queues before asserting. */
+  /** The structured fields of every prefix-mismatch warn -- the only surface
+   *  the warning has now that it goes through log(). */
+  const prefixWarns = (): Array<Record<string, unknown> | undefined> =>
+    warnCalls()
+      .filter((c) => c[1].includes("running prefix differs"))
+      .map((c) => c[2]);
+
+  /** The comparison is fire-and-forget (`compareWithNpmPrefix(...).catch`),
+   *  so maybeAutoUpgrade resolves before the probe's continuation logs. Drain
+   *  the microtask + immediate queues before asserting. */
   const settle = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
 
   /** Every case here needs the same three things: a resolvable prefix, an
@@ -847,7 +942,7 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     return probe;
   }
 
-  it("warns on stderr when `npm prefix -g` disagrees with the running-install prefix", async () => {
+  it("logs ONE structured warn -- never a raw stderr write -- when `npm prefix -g` disagrees with the running prefix", async () => {
     const other = join(sep, "usr", "local");
     const probe = await runWithProbe(async () => other);
 
@@ -855,24 +950,51 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     // No `npm prefix -g` child: the probe is upgrade-cmd's shared helper, which
     // never spawns under vitest. The only spawn arm here is injected too.
     expect(cp.calls).toHaveLength(0);
-    expect(stderrText()).toContain("detected running prefix differs");
-    expect(stderrText()).toContain(DETECTED_PREFIX);
-    expect(stderrText()).toContain(other);
+    // The two paths ride as fields, not as lines of prose inside the message.
+    expect(prefixWarns()).toEqual([{ running: DETECTED_PREFIX, npmPrefix: other }]);
+    // The logger is mocked in this file, so anything about the prefix on the
+    // REAL stderr is the unstructured blob coming back.
+    expect(rawStderrText()).not.toContain("running prefix");
   });
 
   it("stays quiet when the two prefixes agree", async () => {
     await runWithProbe(async () => DETECTED_PREFIX);
-    expect(stderrText()).not.toContain("detected running prefix differs");
+    expect(prefixWarns()).toHaveLength(0);
   });
 
   it("stays quiet when the probe cannot answer (spawn failure / non-zero exit / 3s timeout)", async () => {
     // All three failure shapes collapse to null in npmGlobalPrefix, and null
     // must skip the warning rather than compare against an empty string.
     await runWithProbe(async () => null);
-    expect(stderrText()).not.toContain("detected running prefix differs");
+    expect(prefixWarns()).toHaveLength(0);
     // Blank output is the same non-answer.
     await runWithProbe(async () => "   ");
-    expect(stderrText()).not.toContain("detected running prefix differs");
+    expect(prefixWarns()).toHaveLength(0);
+  });
+
+  it("swallows a REJECTING probe instead of surfacing it as an unhandled rejection inside serve", async () => {
+    // The default probe never rejects, but the hook is caller-supplied and the
+    // comparison is fire-and-forget: without a rejection sink on that promise
+    // a throwing probe became an unhandled rejection, which Node terminates
+    // the process on -- the serve process, mid-startup.
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+    try {
+      const probe = await runWithProbe(async () => {
+        throw new Error("npm prefix -g exploded");
+      });
+      expect(probe).toHaveBeenCalledTimes(1);
+      // A second drain: Node reports an unhandled rejection a macrotask after
+      // the microtask that left it unhandled.
+      await settle();
+      expect(rejections).toEqual([]);
+      expect(prefixWarns()).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
   });
 
   it("compares the RAW prefix, not the shell-quoted argv form", async () => {
@@ -885,14 +1007,13 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     const spaced = join(sep, "Users", "Jeff Smith", "AppData", "Roaming", "npm");
     const realpath = join(spaced, "node_modules", "@yawlabs", "mcp", "dist", "index.js");
     await runWithProbe(async () => spaced, realpath);
-    expect(stderrText()).not.toContain("detected running prefix differs");
+    expect(prefixWarns()).toHaveLength(0);
 
-    // And when they genuinely differ, the message shows the raw path -- a
+    // And when they genuinely differ, the field carries the raw path -- a
     // diagnostic with stray quotes in it reads as part of the filename.
-    await runWithProbe(async () => join(sep, "opt", "node"), realpath);
-    expect(stderrText()).toContain("detected running prefix differs");
-    expect(stderrText()).toContain(spaced);
-    expect(stderrText()).not.toContain('"');
+    const other = join(sep, "opt", "node");
+    await runWithProbe(async () => other, realpath);
+    expect(prefixWarns()).toEqual([{ running: spaced, npmPrefix: other }]);
   });
 
   it("treats a case-differing prefix as the SAME prefix on win32 (and as different on POSIX)", async () => {
@@ -900,11 +1021,7 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     // is not a multi-prefix setup. POSIX paths are case-sensitive, so there the
     // difference is real and must still warn.
     await runWithProbe(async () => DETECTED_PREFIX.toUpperCase());
-    if (process.platform === "win32") {
-      expect(stderrText()).not.toContain("detected running prefix differs");
-    } else {
-      expect(stderrText()).toContain("detected running prefix differs");
-    }
+    expect(prefixWarns()).toHaveLength(process.platform === "win32" ? 0 : 1);
   });
 
   it("treats a junction/symlink prefix and its target as the SAME prefix", async () => {
@@ -934,7 +1051,7 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     await settle();
 
     expect(probe).toHaveBeenCalledTimes(1);
-    expect(stderrText()).not.toContain("detected running prefix differs");
+    expect(prefixWarns()).toHaveLength(0);
   });
 
   it("still warns when two prefixes resolve to genuinely different directories", async () => {
@@ -952,8 +1069,7 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     });
     await settle();
 
-    expect(stderrText()).toContain("detected running prefix differs");
-    expect(stderrText()).toContain(other);
+    expect(prefixWarns()).toEqual([{ running: DETECTED_PREFIX, npmPrefix: other }]);
   });
 
   it("never probes when the prefix could not be quoted (no --prefix was passed)", async () => {
@@ -967,7 +1083,7 @@ describe("compareWithNpmPrefix -- the multi-prefix warning", () => {
     );
     if (process.platform === "win32") {
       expect(probe).not.toHaveBeenCalled();
-      expect(stderrText()).not.toContain("detected running prefix differs");
+      expect(prefixWarns()).toHaveLength(0);
     } else {
       // POSIX has no unquotable path, so the prefix survives and the probe runs.
       expect(probe).toHaveBeenCalledTimes(1);
@@ -1222,6 +1338,66 @@ describe("acquireUpgradeLock", () => {
     expect(acquireUpgradeLock(dir)).toBeNull();
   });
 
+  it("steals a fresh lock whose holder process no longer exists", () => {
+    // An MCP client that kills `serve` mid-refresh leaves a lock with a live
+    // mtime and a dead pid. The mtime rule alone honoured it for the full
+    // stale window, refusing the documented recovery command with "try again
+    // in a minute" for ten of them. The pid in the file is the tell.
+    acquireUpgradeLock(dir);
+    // A pid that cannot be running: far above any real pid space on every
+    // supported OS, and never this process.
+    writeFileSync(lockFile(), `${2 ** 31 - 2}\n`);
+    const stolen = acquireUpgradeLock(dir);
+    expect(stolen).toBeTypeOf("function");
+    // The new holder's own pid is now on file, so its release is recognised.
+    expect(readFileSync(lockFile(), "utf8").trim()).toBe(String(process.pid));
+  });
+
+  it("keeps honouring a fresh lock whose holder is alive (this process stands in)", () => {
+    // Positive control for the test above: a live pid with a fresh mtime is
+    // still contention, so the liveness probe cannot have turned every held
+    // lock into a stealable one.
+    acquireUpgradeLock(dir);
+    expect(acquireUpgradeLock(dir)).toBeNull();
+  });
+
+  it("honours a fresh lock whose holder cannot be parsed, letting the mtime rule bound the wait", () => {
+    acquireUpgradeLock(dir);
+    writeFileSync(lockFile(), "not-a-pid\n");
+    expect(acquireUpgradeLock(dir)).toBeNull();
+  });
+
+  it("records the attempt in a tmpdir fallback when the prefix is unwritable, so a cached check cannot re-spawn every start", () => {
+    // The sudo-installed-global class: the check memo (tmpdir) caches the
+    // registry answer, the attempt memo could not land in the root-owned
+    // prefix, and the lock hands back a no-op release -- so before the
+    // fallback, EVERY serve start within the check window spawned a doomed
+    // `npm install -g`. A prefix that does not exist stands in for EACCES:
+    // writeFileSync fails the same way, and no test may chmod a real dir.
+    // The fallback dir is injected: the production default is the machine's
+    // tmpdir, which no unit test may write into.
+    const fallback = join(dir, "fallback-tmp");
+    mkdirSync(fallback);
+    const unwritable = join(dir, "no-such-prefix");
+    recordAttemptAt(unwritable, ".yaw-mcp-upgrade.lock", "0.47.8", fallback);
+    expect(existsSync(join(unwritable, ".yaw-mcp-upgrade.lock.attempt"))).toBe(false);
+    expect(readdirSync(fallback).filter((f) => f.startsWith(".yaw-mcp-upgrade-attempt-"))).toHaveLength(1);
+    expect(attemptedRecentlyAt(unwritable, ".yaw-mcp-upgrade.lock", "0.47.8", fallback)).toBe(true);
+    // Keyed on the version: a memo for one target says nothing about another.
+    expect(attemptedRecentlyAt(unwritable, ".yaw-mcp-upgrade.lock", "0.47.9", fallback)).toBe(false);
+    // And scoped to the prefix: a different unwritable prefix has no memo.
+    expect(attemptedRecentlyAt(join(dir, "other-prefix"), ".yaw-mcp-upgrade.lock", "0.47.8", fallback)).toBe(false);
+  });
+
+  it("prefers the in-prefix attempt memo when the prefix is writable, touching no fallback", () => {
+    const fallback = join(dir, "fallback-tmp");
+    mkdirSync(fallback);
+    recordAttemptAt(dir, ".yaw-mcp-upgrade.lock", "0.47.8", fallback);
+    expect(existsSync(join(dir, ".yaw-mcp-upgrade.lock.attempt"))).toBe(true);
+    expect(readdirSync(fallback)).toEqual([]);
+    expect(attemptedRecentlyAt(dir, ".yaw-mcp-upgrade.lock", "0.47.8", fallback)).toBe(true);
+  });
+
   it("steals a lock left behind by a killed process once it goes stale", () => {
     acquireUpgradeLock(dir);
     // Backdate the FILE rather than steering the clock: acquireUpgradeLock
@@ -1246,6 +1422,104 @@ describe("acquireUpgradeLock", () => {
     const future = new Date(Date.now() + 60 * 60 * 1000);
     utimesSync(lockFile(), future, future);
     expect(acquireUpgradeLock(dir)).toBeTypeOf("function");
+  });
+
+  describe("the steal is by rename, so two stealers cannot both win", () => {
+    // Two processes that both read the lock as stale used to both unlinkSync
+    // it. A successful unlink cannot tell "I removed the stale file" from "I
+    // removed the file the OTHER stealer just took": A unlinks and retakes, B's
+    // unlink then removes A's fresh lock and B's take succeeds too -- two
+    // concurrent installs into one prefix, the outcome the lock exists to
+    // prevent. A rename of the stale inode can succeed exactly once, and the
+    // loser sees ENOENT. Each case below interleaves "the other stealer" (A)
+    // into THIS process's (B's) steal through the wrapped renameSync: the real
+    // rename runs, with A's move slotted in just before it.
+    const STALE = new Date(Date.now() - 11 * 60 * 1000);
+    const staleLock = (): void => {
+      acquireUpgradeLock(dir);
+      utimesSync(lockFile(), STALE, STALE);
+    };
+    const otherPid = `${process.pid + 1}\n`;
+    const staleLeftovers = (): string[] => readdirSync(dir).filter((f) => f.includes(".stale-"));
+    const enoent = (): NodeJS.ErrnoException => {
+      const err = new Error("ENOENT: no such file") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return err;
+    };
+
+    afterEach(() => {
+      // mockReset restores the implementation vi.fn was created with (the real
+      // renameSync) and drops any *Once a failed assertion left unconsumed.
+      mockRenameSync.mockReset();
+    });
+
+    it("leaves no `.stale-<pid>` file behind after an uncontended steal", () => {
+      staleLock();
+      const release = acquireUpgradeLock(dir);
+      expect(release).toBeTypeOf("function");
+      expect(readFileSync(lockFile(), "utf8").trim()).toBe(String(process.pid));
+      expect(staleLeftovers()).toEqual([]);
+      release?.();
+      expect(existsSync(lockFile())).toBe(false);
+    });
+
+    it("gives the lock back and yields when the file it moved is another stealer's FRESH retake", () => {
+      // B's view of the race: stale at the stat, but by the time B renames, A
+      // has already stolen the stale file and retaken the path. B's rename
+      // therefore moves A's LIVE lock -- the one thing an unlink-based steal
+      // could never notice. B must put it back under A's own pid (so A's
+      // ownership-checked release still recognises it) and yield.
+      staleLock();
+      mockRenameSync.mockImplementationOnce((from, to) => {
+        unlinkSync(String(from));
+        writeFileSync(String(from), otherPid); // A's retake: fresh mtime, A's pid
+        renameSync(from, to); // ...and B's real rename now moves A's lock
+      });
+
+      expect(acquireUpgradeLock(dir)).toBeNull();
+      expect(readFileSync(lockFile(), "utf8")).toBe(otherPid);
+      expect(staleLeftovers()).toEqual([]);
+      // ...and A's restored lock keeps its force: the next caller yields too.
+      expect(acquireUpgradeLock(dir)).toBeNull();
+    });
+
+    it("retakes the freed path once when the other stealer's rename won (ENOENT) and it has not retaken yet", () => {
+      staleLock();
+      mockRenameSync.mockImplementationOnce((from) => {
+        unlinkSync(String(from)); // A's rename already moved it away
+        throw enoent();
+      });
+
+      const release = acquireUpgradeLock(dir);
+      expect(release).toBeTypeOf("function");
+      expect(readFileSync(lockFile(), "utf8").trim()).toBe(String(process.pid));
+      expect(staleLeftovers()).toEqual([]);
+      release?.();
+    });
+
+    it("yields when the other stealer's rename won (ENOENT) and it already holds a fresh lock", () => {
+      staleLock();
+      mockRenameSync.mockImplementationOnce((from) => {
+        unlinkSync(String(from));
+        writeFileSync(String(from), otherPid); // A won the steal AND retook the path
+        throw enoent();
+      });
+
+      expect(acquireUpgradeLock(dir)).toBeNull();
+      expect(readFileSync(lockFile(), "utf8")).toBe(otherPid);
+    });
+
+    it("yields on any other rename failure -- whoever holds the path now owns it", () => {
+      staleLock();
+      mockRenameSync.mockImplementationOnce(() => {
+        const err = new Error("EPERM: operation not permitted") as NodeJS.ErrnoException;
+        err.code = "EPERM";
+        throw err;
+      });
+      expect(acquireUpgradeLock(dir)).toBeNull();
+      // Nothing was moved, so the stale file is still there for the next steal.
+      expect(existsSync(lockFile())).toBe(true);
+    });
   });
 
   it("does NOT block the upgrade when the lock cannot be created at all", () => {
@@ -1329,10 +1603,44 @@ describe("maybeAutoUpgrade -- check + attempt throttles", () => {
   beforeEach(resetSpawnRecorder);
   afterEach(resetSpawnRecorder);
 
-  it("skips the registry probe entirely when a check ran recently", async () => {
+  it("skips the registry probe when a check ran recently, and STILL evaluates staleness from the cached answer", async () => {
     // The lock is taken long AFTER the fetch, so it never covered it: without
-    // this memo every serve start hits registry.npmjs.org, and N panes starting
-    // at once means N requests.
+    // this memo every serve start hits registry.npmjs.org. But the memo is
+    // keyed by uid alone, and it used to be a bare "checked recently" that
+    // returned before any plan: a copy that cannot act on staleness (Yaw
+    // Terminal's bundled copy, an npx run) restarting within the hour re-armed
+    // it every time, and a stale global-npm copy on the same machine never
+    // evaluated itself at all. The memo carries the ANSWER now, and a cached
+    // answer goes through the same plan a fresh fetch would.
+    const fetchLatestImpl = vi.fn(async () => "9.9.9");
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl,
+      spawnImpl,
+      checkedRecentlyImpl: () => ({ latest: "0.47.8" }),
+    });
+
+    expect(fetchLatestImpl).not.toHaveBeenCalled();
+    expect(spawnImpl).toHaveBeenCalledWith("npm", GLOBAL_NPM_ARGS, RELEASE_LOCK);
+  });
+
+  it("a cached up-to-date answer skips both the probe and the spawn", async () => {
+    const fetchLatestImpl = vi.fn(async () => "9.9.9");
+    const spawnImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.8",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl,
+      spawnImpl,
+      checkedRecentlyImpl: () => ({ latest: "0.47.8" }),
+    });
+    expect(fetchLatestImpl).not.toHaveBeenCalled();
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+
+  it("honours a cached 'unreachable' answer (latest: null) -- no re-probe of an offline registry every start", async () => {
     const fetchLatestImpl = vi.fn(async () => "0.47.8");
     const spawnImpl = vi.fn();
     await maybeAutoUpgrade({
@@ -1340,15 +1648,26 @@ describe("maybeAutoUpgrade -- check + attempt throttles", () => {
       argvPath: GLOBAL_NPM_PATH,
       fetchLatestImpl,
       spawnImpl,
-      checkedRecentlyImpl: () => true,
+      checkedRecentlyImpl: () => ({ latest: null }),
     });
-
     expect(fetchLatestImpl).not.toHaveBeenCalled();
     expect(spawnImpl).not.toHaveBeenCalled();
   });
 
-  it("records the check whichever way it went -- an unreachable registry must not re-probe every start", async () => {
+  it("records the check WITH its answer, whichever way it went", async () => {
     const recordCheckImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+      recordCheckImpl,
+    });
+    expect(recordCheckImpl).toHaveBeenCalledWith("0.47.8");
+
+    // An unreachable registry is an answer too: re-probing it on each start is
+    // the same waste the memo exists to stop.
+    recordCheckImpl.mockClear();
     await maybeAutoUpgrade({
       currentVersion: "0.47.0",
       argvPath: GLOBAL_NPM_PATH,
@@ -1356,7 +1675,20 @@ describe("maybeAutoUpgrade -- check + attempt throttles", () => {
       spawnImpl: vi.fn(),
       recordCheckImpl,
     });
-    expect(recordCheckImpl).toHaveBeenCalledTimes(1);
+    expect(recordCheckImpl).toHaveBeenCalledWith(null);
+  });
+
+  it("does not re-record a check it answered from the cache", async () => {
+    const recordCheckImpl = vi.fn();
+    await maybeAutoUpgrade({
+      currentVersion: "0.47.0",
+      argvPath: GLOBAL_NPM_PATH,
+      fetchLatestImpl: async () => "0.47.8",
+      spawnImpl: vi.fn(),
+      checkedRecentlyImpl: () => ({ latest: "0.47.8" }),
+      recordCheckImpl,
+    });
+    expect(recordCheckImpl).not.toHaveBeenCalled();
   });
 
   it("does not re-spawn an upgrade already attempted at the same target version", async () => {
@@ -1406,5 +1738,53 @@ describe("maybeAutoUpgrade -- check + attempt throttles", () => {
 
     expect(order).toEqual(["record", "spawn"]);
     expect(recordAttemptImpl).toHaveBeenCalledWith(GLOBAL_NPM_PREFIX, ".yaw-mcp-upgrade.lock", "0.47.8");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// The check memo's on-disk contract. The default hooks short-circuit under
+// vitest, so the exported reader/writer are exercised here against a real
+// temp file -- what a later process of ANY install method reads back.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("readCheckMemo / writeCheckMemo -- the on-disk check memo", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "yaw-mcp-check-memo-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const memo = (): string => join(dir, "check.json");
+
+  it("round-trips the answer, a cached 'unreachable' (null) included", () => {
+    writeCheckMemo(memo(), "0.47.8");
+    expect(readCheckMemo(memo())).toEqual({ latest: "0.47.8" });
+    writeCheckMemo(memo(), null);
+    expect(readCheckMemo(memo())).toEqual({ latest: null });
+  });
+
+  it("does NOT honour the timestamp-only memo an older yaw-mcp wrote", () => {
+    // `{ at }` with no `latest` is the exact shape that starved global-npm
+    // copies: it says "checked recently" without saying what the check found,
+    // and honouring it would skip the staleness evaluation for another hour.
+    writeFileSync(memo(), `${JSON.stringify({ at: Date.now() })}\n`);
+    expect(readCheckMemo(memo())).toBeNull();
+  });
+
+  it("expires after the check interval, and ignores a future-dated, malformed or absent memo", () => {
+    writeFileSync(memo(), JSON.stringify({ at: Date.now() - 61 * 60 * 1000, latest: "0.47.8" }));
+    expect(readCheckMemo(memo())).toBeNull();
+    // Stepped clock: an `at` an hour ahead is not evidence of a recent check.
+    writeFileSync(memo(), JSON.stringify({ at: Date.now() + 60 * 60 * 1000, latest: "0.47.8" }));
+    expect(readCheckMemo(memo())).toBeNull();
+    writeFileSync(memo(), "{not json");
+    expect(readCheckMemo(memo())).toBeNull();
+    writeFileSync(memo(), JSON.stringify({ at: Date.now(), latest: 47 }));
+    expect(readCheckMemo(memo())).toBeNull();
+    expect(readCheckMemo(join(dir, "absent.json"))).toBeNull();
   });
 });

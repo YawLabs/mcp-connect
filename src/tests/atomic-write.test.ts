@@ -160,6 +160,20 @@ describe("atomicWriteFile", () => {
     expect(vi.mocked(chmod).mock.calls[0]?.[1]).toBe(0o600);
   });
 
+  it("carries only the permission bits, never setuid/setgid/sticky, onto the replacement", async () => {
+    // `& 0o7777` copied the special bits too: a target that had picked up
+    // setgid from a setgid parent directory was replaced by a tmp file BORN
+    // setgid, which is not what "carry the perms forward" means.
+    const file = join(dir, "setgid.json");
+    writeFileSync(file, "{}", "utf8");
+    await asPosix(async () => {
+      vi.mocked(stat).mockResolvedValueOnce({ mode: 0o102640 } as unknown as Stats);
+      await atomicWriteFile(file, '{"a":1}');
+    });
+    expect(birthOptions(file)).toEqual({ encoding: "utf8", mode: 0o640 });
+    expect(vi.mocked(chmod).mock.calls[0]?.[1]).toBe(0o640);
+  });
+
   it("an explicit mode still wins over the target's existing mode", async () => {
     // Preservation must not block a caller that TIGHTENS on purpose: `yaw-mcp
     // try` passes 0o600 precisely because the write it is doing is what puts a

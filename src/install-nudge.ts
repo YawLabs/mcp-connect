@@ -71,21 +71,20 @@ export function installNudgeEnabled(env: NodeJS.ProcessEnv, config: { installNud
 
 /** Last parse of the state file, keyed by identity (path + mtime + size).
  *
- *  WHY: one discover surfaces N install candidates, and server.ts calls
- *  shouldNudge once per candidate in its filter loop and recordNudge once per
- *  candidate in its render loop -- 2N reads of the same tiny file per
- *  discover. The parse is memoized on the file's identity rather than on a
- *  TTL, so an edit from any process (or from recordNudge, which refreshes the
- *  memo itself) is picked up on the very next call: a changed file has a
- *  different mtime or size. Only a same-millisecond, same-byte-length
- *  external rewrite can be missed, and this module is fail-open by design --
- *  the worst case there is one extra nudge, exactly like a lost write.
+ *  WHY: one discover surfaces N install candidates, and server.ts
+ *  (buildInstallCandidatesLines) calls shouldNudge once per candidate in its
+ *  filter loop -- N reads of the same tiny file per discover -- before it
+ *  records the survivors with ONE recordNudges call. The parse is memoized on
+ *  the file's identity rather than on a TTL, so an edit from any process (or
+ *  from recordNudges, which refreshes the memo itself) is picked up on the
+ *  very next call: a changed file has a different mtime or size. Only a
+ *  same-millisecond, same-byte-length external rewrite can be missed, and
+ *  this module is fail-open by design -- the worst case there is one extra
+ *  nudge, exactly like a lost write.
  *
- *  The WRITE side is batched separately, by `recordNudges`: one discover
- *  surfaces its candidates together, so the whole set lands in a single
- *  read-modify-write. `recordNudge` is the one-CLI spelling of it, so a caller
- *  that still loops per candidate pays one write per CLI -- pass the whole
- *  list instead. */
+ *  The write side is `recordNudges`, which lands a whole discover's
+ *  candidates in that one read-modify-write; `recordNudge` is its single-CLI
+ *  spelling, kept as the convenience the tests drive it through. */
 let stateMemo: { path: string; mtimeMs: number; size: number; state: NudgeState } | null = null;
 
 /** Read + parse the suppression state. Fail-open: any absent / unreadable /
@@ -159,18 +158,23 @@ export function shouldNudge(cli: string, home: string, now: () => number = Date.
 }
 
 /** Record that `cli` was just nudged so it's suppressed for the cooldown.
- *  The one-CLI spelling of `recordNudges` -- see there for the semantics. A
- *  caller with several CLIs from one discover should pass them together rather
- *  than loop, so the whole set costs a single write. */
+ *  The one-CLI spelling of `recordNudges` -- see there for the semantics.
+ *  Nothing in server.ts calls it (discover records its whole candidate set
+ *  through the batch form); it stays as the convenience the tests use, and
+ *  for any caller with exactly one CLI to record. A caller with several CLIs
+ *  from one discover should pass them together rather than loop, so the
+ *  whole set costs a single write. */
 export function recordNudge(cli: string, home: string, now: () => number = Date.now): void {
   recordNudges([cli], home, now);
 }
 
 /** Record that every CLI in `clis` was just nudged, in ONE read-modify-write,
  *  so each is suppressed for the cooldown. A discover surfaces its candidates
- *  as a set, so this is the shape the call site wants: looping recordNudge
- *  re-read and rewrote the whole state file once per candidate, and every
- *  record landed with a slightly different timestamp for what was one event.
+ *  as a set, so this is the shape the call site wants, and it is what
+ *  buildInstallCandidatesLines in server.ts calls -- once per discover, with
+ *  every surviving candidate. Looping recordNudge per candidate instead
+ *  re-read and rewrote the whole state file once per CLI and landed every
+ *  record with a slightly different timestamp for what was one event.
  *
  *  Prior timestamps for the named CLIs are replaced, a repeated name in `clis`
  *  collapses to one record, and stale entries past the cooldown are pruned on
@@ -202,9 +206,9 @@ export function recordNudges(clis: string[], home: string, now: () => number = D
     const path = installNudgeStatePath(home);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${JSON.stringify({ nudges: kept }, null, 2)}\n`, "utf8");
-    // Refresh the read memo from what we just wrote, so the rest of this
-    // discover's shouldNudge/recordNudge calls neither re-read the file nor
-    // observe a stale parse.
+    // Refresh the read memo from what we just wrote, so later shouldNudge
+    // calls in this process (the next discover's filter loop) neither re-read
+    // the file nor observe a stale parse.
     try {
       const st = statSync(path);
       stateMemo = { path, mtimeMs: st.mtimeMs, size: st.size, state: { nudges: kept } };

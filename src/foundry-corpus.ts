@@ -120,9 +120,26 @@ function capStratified(entries: FoundryCorpusEntry[], cap: number): FoundryCorpu
   return out;
 }
 
+/** Why buildCorpusFromTraces drops a trace, or null when it folds in. The
+ *  export's zero-entries message counts these so it can name both causes
+ *  instead of blaming the catalog for a harvest of empty token bags, and the
+ *  fold below consults the same function so the two can never disagree. A
+ *  trace failing both tests reports the unknown `chosen`: a catalog mismatch
+ *  is the one the maintainer can act on. "empty-tokens" covers a bag with no
+ *  string in it at all, which the fold would otherwise sort down to nothing. */
+export function traceDropReason(
+  t: HarvestedTrace,
+  known: ReadonlySet<string>,
+): "unknown-chosen" | "empty-tokens" | null {
+  if (!t || typeof t.chosen !== "string" || !known.has(t.chosen)) return "unknown-chosen";
+  if (!Array.isArray(t.tokens) || !t.tokens.some((x) => typeof x === "string")) return "empty-tokens";
+  return null;
+}
+
 // Fold harvested traces into a corpus: drop traces whose `chosen` is not in the
-// snapshot server set (unscorable) or that carry no tokens, dedup by
-// (sorted-tokens, chosen) accumulating weight, then stratify-cap. Pure.
+// snapshot server set (unscorable) or that carry no tokens (traceDropReason),
+// dedup by (sorted-tokens, chosen) accumulating weight, then stratify-cap.
+// Pure.
 export function buildCorpusFromTraces(
   traces: HarvestedTrace[],
   servers: RankableServer[],
@@ -131,10 +148,8 @@ export function buildCorpusFromTraces(
   const known = new Set(servers.map((s) => s.namespace));
   const byKey = new Map<string, FoundryCorpusEntry>();
   for (const t of traces) {
-    if (!t || typeof t.chosen !== "string" || !known.has(t.chosen)) continue;
-    if (!Array.isArray(t.tokens) || t.tokens.length === 0) continue;
+    if (traceDropReason(t, known) !== null) continue;
     const tokens = [...t.tokens].filter((x) => typeof x === "string").sort();
-    if (tokens.length === 0) continue;
     const key = entryKey(tokens, t.chosen);
     const prev = byKey.get(key);
     if (prev) prev.weight += 1;

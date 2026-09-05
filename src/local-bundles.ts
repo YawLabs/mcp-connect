@@ -40,13 +40,17 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
+// The cross-process write lock reuses the auto-upgrade lock primitive (O_EXCL
+// sidecar, ownership-checked release, stale steal by rename) instead of
+// growing a second copy here. See the write-path header for what it buys.
+import { acquireUpgradeLock } from "./auto-upgrade.js";
 import { parseJsonc } from "./jsonc.js";
 import { log } from "./logger.js";
-import { CONFIG_DIRNAME, findProjectConfigDir, userConfigDir } from "./paths.js";
+import { findProjectConfigDir, userConfigDir } from "./paths.js";
 import {
   hashTrustContent,
   isTrustBypassEnabled,
@@ -66,9 +70,9 @@ export const BUNDLES_FILENAME = "bundles.json";
  *  (back-compat is permissive); newer files trigger a warning. */
 export const CURRENT_BUNDLES_SCHEMA_VERSION = 1;
 
-/** The on-disk shape. Mirrors ConnectConfig but with `version` instead
- *  of `configVersion` (the latter is a server-generated ETag we derive
- *  here from a content hash). */
+/** The on-disk shape. Mirrors ConnectConfig but with `version` (a schema
+ *  version the file may carry) instead of `configVersion`, which is never
+ *  stored: the loader derives it from a content hash (see hashContent). */
 export interface LocalBundlesFile {
   version?: number;
   servers: Array<Partial<UpstreamServerConfig>>;
@@ -354,10 +358,11 @@ export function previewBundlesContent(path: string, rawBytes: Buffer): BundlePre
   return { ok: true, servers, warnings };
 }
 
-/** Deterministic content-derived configVersion. We use this in lieu of
- *  the backend's ETag so downstream "did the config change since last
- *  poll" checks work the same way in local mode (always equal, since
- *  the file is read once at startup). */
+/** Deterministic content-derived configVersion. Nothing polls for a change
+ *  any more -- the hosted backend whose ETag this once stood in for is gone.
+ *  Its one remaining reader is server.ts, which folds it into a cache key so
+ *  two loads of a byte-identical server list share an entry and any edit to
+ *  the list misses. Same servers in, same version out, on every machine. */
 function hashContent(servers: UpstreamServerConfig[]): string {
   const h = createHash("sha256");
   h.update(JSON.stringify(servers));
@@ -419,7 +424,12 @@ export async function probeProjectTrust(
   const bypassed = isTrustBypassEnabled(env);
   const storePath = trustStorePath(home);
 
-  const projectDir = await findProjectConfigDir(cwd, home).catch(() => null);
+  // `env` goes into the walk too: outside $HOME its ownership gate answers
+  // from the env's ALLOW_UNOWNED opt-in (win32 has no uid to compare), and
+  // reading process.env there instead of the env this probe was told to run
+  // under made an injected opt-in a silent no-op for the project-dir half
+  // while the trust half (isTrustBypassEnabled above) honoured it.
+  const projectDir = await findProjectConfigDir(cwd, home, env).catch(() => null);
   const path = projectDir ? localBundlesPath(projectDir) : null;
   if (path === null) {
     return {
@@ -597,7 +607,7 @@ export async function loadLocalBundles(
   const home = opts.home ?? homedir();
   const warnings: string[] = [];
 
-  const globalPath = localBundlesPath(join(home, CONFIG_DIRNAME));
+  const globalPath = localBundlesPath(userConfigDir(home));
 
   // Consent gate. An unapproved project file is dropped BEFORE it is parsed
   // (so it contributes no servers and no schema diagnostics) and does NOT
@@ -731,23 +741,83 @@ export async function loadLocalBundles(
 // next tool-driven WRITE. (Per-server unknown fields inside a server object
 // ARE preserved -- readRawUserBundles round-trips the raw server entries.)
 //
-// In-process serializer: concurrent upsert/remove calls on the same file
-// would race -- both would read the same on-disk snapshot, both would
-// produce a different modified copy, and the loser's write would silently
-// overwrite the winner's. Gate both functions through a shared promise chain
-// (same pattern as saveState in persistence.ts) so they execute one at a
-// time within a single process.
+// Two serializers, one per scope. Both exist because a read-modify-write
+// that overlaps another's silently drops the loser's change: both read the
+// same on-disk snapshot, both write a different modified copy, and the
+// second write erases the first's entry (and any stored --env value on it).
+// atomicWriteFile only ever prevented TORN files, never lost updates.
 //
-// KNOWN LIMITATION: the chain serializes within ONE process only. Two
-// concurrent yaw-mcp PROCESSES (two terminals running `yaw-mcp add`, or the
-// CLI racing the Yaw Terminal app's own bundles.json writer) still race
-// last-write-wins across the read-modify-write window -- the atomic write
-// protects against torn/partial files, not lost updates. Cross-process
-// locking (lockfile / O_EXCL sidecar with stale-lock recovery) is
-// deliberately out of scope for now: the collision window is one small
-// read+write and the practical rate is low. If lost writes are ever
-// observed, add a lockfile around doUpsertUserBundle / doRemoveUserBundle.
+//   1. In-process promise chain (bundleWriteChain): concurrent upsert/remove
+//      calls inside ONE process run one at a time. Same pattern as saveState
+//      in persistence.ts.
+//
+//   2. Cross-process lockfile (withBundlesLock): two yaw-mcp PROCESSES -- two
+//      terminals running `yaw-mcp add`, or the CLI racing the Yaw Terminal
+//      app's own bundles.json writer -- take an O_EXCL sidecar
+//      (BUNDLES_LOCK_NAME, next to bundles.json) across the whole
+//      read-modify-write, so neither can read a snapshot the other is about
+//      to replace.
+//
+// GUARANTEED: two writers that both take the lock never lose each other's
+// update. NOT guaranteed: a writer that does not take it (an app build that
+// predates BUNDLES_LOCK_NAME, a hand edit in a text editor) is still
+// last-write-wins against a locked one; a lock this process cannot CREATE
+// (EACCES on the dir) does not block the write, which then fails on its own
+// with its own message; and a lock left behind by a crashed holder is
+// honoured until it is provably stale (acquireUpgradeLock steals it after its
+// UPGRADE_LOCK_STALE_MS) or the user deletes it -- a writer that waits
+// BUNDLES_LOCK_WAIT_MS on one gives up with a message naming the file rather
+// than writing around it.
 let bundleWriteChain: Promise<void> = Promise.resolve();
+
+/** Sidecar the cross-process write lock is taken on, inside the user config
+ *  dir next to bundles.json. Exported by NAME so the other writer of that
+ *  file (the Yaw Terminal app) can take the same lock. */
+export const BUNDLES_LOCK_NAME = `${BUNDLES_FILENAME}.lock`;
+
+/** How long a writer waits for another process to let go before giving up.
+ *  A holder keeps the lock for one read plus one atomic write -- milliseconds
+ *  -- so a lock still held after this long belongs to a crashed or wedged
+ *  process, and the bound is what keeps `add` from hanging on it. Exported so
+ *  the test pinning the give-up path derives its clock from the constant. */
+export const BUNDLES_LOCK_WAIT_MS = 5_000;
+const BUNDLES_LOCK_POLL_MS = 20;
+
+/** Run `fn` holding the cross-process bundles.json lock. Polls while a live
+ *  holder has it; throws once the wait is exhausted. Writing AROUND a held
+ *  lock is exactly the lost update the lock exists to prevent, so the give-up
+ *  path is an error that names the file, never a silent unlocked write. A
+ *  lock whose holder PROCESS is gone is stolen on the first take
+ *  (acquireUpgradeLock probes the recorded pid), so a crashed Yaw Terminal or
+ *  `serve` never blocks an add/remove; what reaches the give-up path is a
+ *  live-but-stuck holder, and "delete that lock file" is advice for that. */
+async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  const dir = userConfigDir(home);
+  // O_EXCL cannot create the sidecar in a dir that does not exist yet, and
+  // acquireUpgradeLock reads that ENOENT as "no lock possible, proceed" --
+  // which would leave the very first write on a fresh machine unlocked. Born
+  // 0o700, the same mode atomicWriteFile births it with for the write below.
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const lockPath = join(dir, BUNDLES_LOCK_NAME);
+  const deadline = Date.now() + BUNDLES_LOCK_WAIT_MS;
+  let release = acquireUpgradeLock(dir, BUNDLES_LOCK_NAME);
+  while (release === null) {
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `${localBundlesPath(dir)} is locked by another yaw-mcp process (${lockPath}). Retry in a moment; if no yaw-mcp or Yaw Terminal is running, delete that lock file.`,
+      );
+    }
+    // Global setTimeout rather than timers/promises so a fake-timer test can
+    // drive the wait to its deadline without sleeping through it for real.
+    await new Promise<void>((resolve) => setTimeout(resolve, BUNDLES_LOCK_POLL_MS));
+    release = acquireUpgradeLock(dir, BUNDLES_LOCK_NAME);
+  }
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 /**
  * Derive a namespace from a server's DISPLAY NAME. This MUST stay
@@ -775,14 +845,23 @@ export function deriveNamespace(name: string): string {
  * round-trips fields validateEntry would otherwise drop. Returns a fresh
  * skeleton when the file is absent; THROWS when present-but-malformed so a
  * write never clobbers a file the user hand-edited into an invalid state.
+ *
+ * Non-fatal diagnostics -- an invalid `defaultRuntime` the rewrite is about
+ * to drop -- go into `warnings` for the caller to hand back to the CLI, which
+ * prints them as `warning: ...`, the same channel the loader's warnings take.
+ * They used to be log()ged at warn instead, which put a raw JSON envelope on
+ * stderr right above the "Updated ..." line: the exact shape the loader's
+ * untrusted-file path avoids, for the same reason.
  */
-async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
+async function readRawUserBundles(home: string, warnings: string[]): Promise<LocalBundlesFile> {
   const path = localBundlesPath(userConfigDir(home));
-  if (!existsSync(path)) {
-    return { version: CURRENT_BUNDLES_SCHEMA_VERSION, servers: [] };
-  }
-  const warnings: string[] = [];
   const r = await readBundlesAt(path, warnings);
+  // readBundlesAt already tells absent (exists:false) from present-but-broken,
+  // so it is the only existence check. A separate existsSync() beforehand
+  // raced it: a file removed between the two calls read as "present" with no
+  // warning, and fell into the "could not be parsed" branch below with an
+  // empty detail.
+  if (!r.exists) return { version: CURRENT_BUNDLES_SCHEMA_VERSION, servers: [] };
   if (!r.file) {
     // Branch on the warning content to give the user the most actionable
     // message: a read error (EPERM / EACCES) hints at permissions; a directory
@@ -808,12 +887,10 @@ async function readRawUserBundles(home: string): Promise<LocalBundlesFile> {
     const detail = warnings.length > 0 ? ` (${warningText})` : "";
     throw new Error(`${path} could not be parsed -- fix the JSON${detail} before adding servers.`);
   }
-  // Surface non-fatal read warnings on the write path too: an invalid
-  // `defaultRuntime` value (a typo like "omm") is dropped by readBundlesAt,
-  // and the rewrite below would silently delete the key from the file --
-  // the user should see WHY before it vanishes.
+  // DEBUG, not warn: the same facts are in `warnings`, which the caller
+  // prints in prose (see the doc above).
   for (const w of warnings) {
-    log("warn", "bundles.json warning (write path)", { warning: w });
+    log("debug", "bundles.json warning (write path)", { warning: w });
   }
   // Round-trip defaultRuntime so an add/remove never drops the user's
   // config-level runtime knob (validateEntry-style coercion already ran in
@@ -865,6 +942,13 @@ function envStrings(raw: unknown): Record<string, string> | undefined {
  *      `"isActive": false` is a deliberate hand-edit, and there is no `enable`
  *      verb for `add` to be the accidental inverse of. An explicit `false`
  *      still disables.
+ *   4. An incoming STDIO launch (command + transport "stdio") replaces the
+ *      WHOLE launch shape: a stored `url` is dropped rather than carried
+ *      along as a stale remote endpoint beside the new command. The one
+ *      exception to rule 1 -- `url` belongs to the launch being replaced, not
+ *      to state the user put there separately, and the entry it used to
+ *      describe (a hand-added remote server) is reported through
+ *      launchChanged so the swap is never silent.
  */
 function mergeServerEntry(
   existing: Partial<UpstreamServerConfig>,
@@ -877,6 +961,9 @@ function mergeServerEntry(
     merged[k] = v;
   }
   if (base.isActive === false && incoming.isActive !== false) merged.isActive = false;
+  if (typeof incoming.command === "string" && incoming.transport === "stdio" && incoming.url === undefined) {
+    delete merged.url;
+  }
 
   const storedEnv = envStrings(base.env);
   const incomingEnv = envStrings((incoming as Record<string, unknown>).env);
@@ -906,6 +993,100 @@ function mergeServerEntry(
   return merged as Partial<UpstreamServerConfig>;
 }
 
+/** The launch shape of an entry, as DATA: the command + args of a stdio
+ *  server, or the url of a remote one -- whichever the loader would actually
+ *  use (command wins when both are present, matching every renderer).
+ *  Reported rather than rendered because rendering for a terminal is the
+ *  CLI's job: bundles.json is a file a repo can ship or a badge can write, so
+ *  the stored half needs the same control-byte neutering the CLI applies to
+ *  every other field it prints from that file -- and that helper lives in
+ *  trust-cmd, which imports this module. Empty when the entry has neither. */
+export interface LaunchShape {
+  command?: string;
+  args?: string[];
+  url?: string;
+}
+
+/** A launch swap an upsert performed (or, from previewUpsertUserBundle,
+ *  would perform) on a slug-less stored entry. See the upsertUserBundle doc. */
+export interface LaunchChange {
+  from: LaunchShape;
+  to: LaunchShape;
+}
+
+function launchShapeOf(entry: Record<string, unknown>): LaunchShape {
+  if (typeof entry.command === "string" && entry.command.length > 0) {
+    const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
+    return { command: entry.command, args };
+  }
+  return typeof entry.url === "string" && entry.url.length > 0 ? { url: entry.url } : {};
+}
+
+function sameLaunch(a: LaunchShape, b: LaunchShape): boolean {
+  return a.command === b.command && a.url === b.url && JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []);
+}
+
+/** A namespace collision between two different catalog slugs, as data. The
+ *  stored half comes straight out of bundles.json (a hand-editable file), so
+ *  a terminal caller renders it through its control-byte neutering -- see
+ *  formatBundleCollision's `safe` parameter. */
+export interface BundleCollision {
+  /** The catalog slug being added. */
+  slug: string;
+  /** The namespace both servers derive. */
+  namespace: string;
+  /** The stored entry's display name, or its slug when it has no name. */
+  storedLabel: string;
+  /** The slug the stored entry was added as -- the `remove` target. */
+  storedSlug: string;
+}
+
+/** The one spelling of the collision refusal. `safe` is applied to every
+ *  interpolated value so a caller printing to a terminal can neuter control
+ *  bytes without re-spelling the sentence; the default is verbatim, for the
+ *  Error message and for callers that are not terminals. */
+export function formatBundleCollision(c: BundleCollision, safe: (s: string) => string = (s) => s): string {
+  return (
+    `can't add catalog server "${safe(c.slug)}": namespace "${safe(c.namespace)}" is already used by ` +
+    `"${safe(c.storedLabel)}" (added as "${safe(c.storedSlug)}"). Remove it first with \`yaw-mcp remove ${safe(c.storedSlug)}\`.`
+  );
+}
+
+/** Thrown by upsertUserBundle on a cross-slug collision. Carries the
+ *  structured collision so a terminal caller can re-render it neutered;
+ *  `message` is the verbatim formatBundleCollision text. */
+export class BundleCollisionError extends Error {
+  readonly collision: BundleCollision;
+  /** Read diagnostics collected before the refusal (a malformed entry the
+   *  loader skipped, an invalid defaultRuntime). The dry run prints these;
+   *  the real run's refusal used to drop them on the floor, so the two
+   *  disagreed on exactly the path where the user is about to edit the file
+   *  by hand. */
+  readonly warnings: readonly string[];
+  constructor(collision: BundleCollision, warnings: readonly string[] = []) {
+    super(formatBundleCollision(collision));
+    this.name = "BundleCollisionError";
+    this.collision = collision;
+    this.warnings = warnings;
+  }
+}
+
+export interface UpsertUserBundleResult {
+  path: string;
+  replaced: boolean;
+  entry: Partial<UpstreamServerConfig>;
+  launchChanged?: LaunchChange;
+  /** Non-fatal read diagnostics (see readRawUserBundles); print as `warning: ...`. */
+  warnings: string[];
+}
+
+export interface RemoveUserBundleResult {
+  path: string;
+  removed: boolean;
+  /** Non-fatal read diagnostics (see readRawUserBundles); print as `warning: ...`. */
+  warnings: string[];
+}
+
 /**
  * Insert or update a server entry in the user-global bundles.json. The
  * lookup is TWO-PASS, namespace first and display name only as a fallback
@@ -932,30 +1113,27 @@ function mergeServerEntry(
  * drifted" and "different server with the same display name" are
  * indistinguishable without the slug, and refusing would break the
  * deliberate re-add-to-refresh flow. So it MERGES (gaining the slug
- * stamp) -- but the merge reports a launchChanged note whenever the
- * command/args it replaced differ, so a swap is never silent; there is
- * also no stored slug to orphan, so `remove <namespace>` keeps working
- * either way.
+ * stamp) -- but the merge reports a launchChanged note whenever the launch
+ * shape it replaced differs (command/args, or the url of a hand-added remote
+ * entry -- see launchShapeOf), so a swap is never silent; there is also no
+ * stored slug to orphan, so `remove <namespace>` keeps working either way.
  *
  * An existing entry is otherwise UPDATED, not overwritten: see
  * mergeServerEntry for exactly what survives. Atomic write.
  *
  * Returns the path written, whether an existing entry was updated (vs a
- * fresh add), and the entry AS WRITTEN -- callers that report what landed
- * on disk (`add --json`, the ambient-env note, the kept-namespace note)
- * must describe the merged result, not the pre-merge input they handed in.
+ * fresh add), the entry AS WRITTEN -- callers that report what landed on
+ * disk (`add --json`, the ambient-env note, the kept-namespace note) must
+ * describe the merged result, not the pre-merge input they handed in -- and
+ * the non-fatal `warnings` the read raised (see readRawUserBundles).
  *
- * Serialized via bundleWriteChain so concurrent calls don't lose writes.
+ * Serialized via bundleWriteChain (in-process) and withBundlesLock (cross-
+ * process) so concurrent calls don't lose writes.
  */
 export function upsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
   opts: { home?: string } = {},
-): Promise<{
-  path: string;
-  replaced: boolean;
-  entry: Partial<UpstreamServerConfig>;
-  launchChanged?: { from: string; to: string };
-}> {
+): Promise<UpsertUserBundleResult> {
   const result = bundleWriteChain.then(() => doUpsertUserBundle(entry, opts));
   bundleWriteChain = result.then(
     () => undefined,
@@ -974,10 +1152,10 @@ function resolveUpsertTarget(
 ): {
   idx: number;
   matchedByNamespace: boolean;
-  refusal: string | null;
+  refusal: BundleCollision | null;
   namespace?: string;
   id?: string;
-  launchChanged?: { from: string; to: string };
+  launchChanged?: LaunchChange;
 } {
   const incoming = entry as Record<string, unknown>;
   // Two-pass lookup, namespace first -- see the upsertUserBundle doc.
@@ -992,27 +1170,30 @@ function resolveUpsertTarget(
   // match paths: a name-fallback hit on an entry that carries a different
   // slug is the same "different server, same display name" case.
   if (typeof stored.slug === "string" && typeof incoming.slug === "string" && stored.slug !== incoming.slug) {
-    const storedLabel = typeof stored.name === "string" ? stored.name : stored.slug;
-    const storedNs = typeof stored.namespace === "string" ? stored.namespace : entry.namespace;
     return {
       idx,
       matchedByNamespace,
-      refusal:
-        `can't add catalog server "${incoming.slug}": namespace "${storedNs}" is already used by ` +
-        `"${storedLabel}" (added as "${stored.slug}"). Remove it first with \`yaw-mcp remove ${stored.slug}\`.`,
+      refusal: {
+        slug: incoming.slug,
+        namespace: typeof stored.namespace === "string" ? stored.namespace : (entry.namespace ?? ""),
+        storedLabel: typeof stored.name === "string" ? stored.name : stored.slug,
+        storedSlug: stored.slug,
+      },
     };
   }
   // Slug-less stored entry: merges on either match path, but a launch swap
   // must be LOUD -- see the upsertUserBundle doc for why this cannot refuse.
   // The name-fallback path needs it MORE than the namespace path: a
-  // name-only match is the weaker identity signal.
-  let launchChanged: { from: string; to: string } | undefined;
+  // name-only match is the weaker identity signal. Compared as launch SHAPES
+  // (launchShapeOf), so a stored url-only remote entry -- the documented way
+  // to hand-add a remote server -- counts as a change too: joining only
+  // command/args rendered it as "" and a "nothing stored" guard then
+  // swallowed the note, while the merge carried the stale url along.
+  let launchChanged: LaunchChange | undefined;
   if (typeof stored.slug !== "string" && typeof incoming.command === "string") {
-    const renderLaunch = (cmd: unknown, args: unknown): string =>
-      [cmd, ...(Array.isArray(args) ? args : [])].filter((x) => typeof x === "string").join(" ");
-    const from = renderLaunch(stored.command, stored.args);
-    const to = renderLaunch(incoming.command, incoming.args);
-    if (from !== to && from.length > 0) launchChanged = { from, to };
+    const from = launchShapeOf(stored);
+    const to = launchShapeOf(incoming);
+    if (!sameLaunch(from, to)) launchChanged = { from, to };
   }
   if (matchedByNamespace) return { idx, matchedByNamespace, refusal: null, launchChanged };
   // Name-fallback match: keep the stored namespace and id (see doc).
@@ -1061,13 +1242,16 @@ export async function previewUpsertUserBundle(
   opts: { home?: string } = {},
 ): Promise<{
   replaced: boolean;
-  refusal: string | null;
+  refusal: BundleCollision | null;
   namespace: string | undefined;
   entry: Partial<UpstreamServerConfig>;
-  launchChanged?: { from: string; to: string };
+  launchChanged?: LaunchChange;
+  /** Same read diagnostics the real run would surface (see readRawUserBundles). */
+  warnings: string[];
 }> {
   const home = opts.home ?? homedir();
-  const file = await readRawUserBundles(home);
+  const warnings: string[] = [];
+  const file = await readRawUserBundles(home, warnings);
   const target = resolveUpsertTarget(file.servers, entry);
   return {
     replaced: target.idx >= 0,
@@ -1075,61 +1259,62 @@ export async function previewUpsertUserBundle(
     namespace: target.namespace ?? entry.namespace,
     entry: mergedUpsertEntry(file.servers, entry, target),
     launchChanged: target.launchChanged,
+    warnings,
   };
 }
 
 async function doUpsertUserBundle(
   entry: Partial<UpstreamServerConfig>,
   opts: { home?: string },
-): Promise<{
-  path: string;
-  replaced: boolean;
-  entry: Partial<UpstreamServerConfig>;
-  launchChanged?: { from: string; to: string };
-}> {
+): Promise<UpsertUserBundleResult> {
   const home = opts.home ?? homedir();
   const path = localBundlesPath(userConfigDir(home));
-  const file = await readRawUserBundles(home);
-  const target = resolveUpsertTarget(file.servers, entry);
-  if (target.refusal) throw new Error(target.refusal);
-  const idx = target.idx;
-  const replaced = idx >= 0;
-  // The fold itself lives in mergedUpsertEntry so `add --dry-run` runs the
-  // identical merge -- see previewUpsertUserBundle.
-  const written = mergedUpsertEntry(file.servers, entry, target);
-  if (replaced) file.servers[idx] = written;
-  else file.servers.push(written);
-  // `file.version` is written back exactly as readRawUserBundles produced it:
-  // it already preserves a newer on-disk version rather than downgrading it,
-  // and already stamps CURRENT for the absent-file and version-less cases. A
-  // `?? CURRENT` here used to look like the defaulting step, but it could
-  // never fire -- both of that function's returns carry a number.
-  //
-  // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
-  // (matching secrets-vault): bundles.json can carry per-server `--env`
-  // secrets, so its parent dir must not be group/other-listable.
-  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
-  if (process.platform !== "win32") {
-    try {
-      await chmod(path, 0o600);
-    } catch {
-      // chmod not supported on this filesystem; not fatal.
+  // The read is INSIDE the lock: a snapshot taken before acquiring it is the
+  // stale one the lock exists to keep from being written back.
+  return withBundlesLock(home, async () => {
+    const warnings: string[] = [];
+    const file = await readRawUserBundles(home, warnings);
+    const target = resolveUpsertTarget(file.servers, entry);
+    if (target.refusal) throw new BundleCollisionError(target.refusal, warnings);
+    const idx = target.idx;
+    const replaced = idx >= 0;
+    // The fold itself lives in mergedUpsertEntry so `add --dry-run` runs the
+    // identical merge -- see previewUpsertUserBundle.
+    const written = mergedUpsertEntry(file.servers, entry, target);
+    if (replaced) file.servers[idx] = written;
+    else file.servers.push(written);
+    // `file.version` is written back exactly as readRawUserBundles produced
+    // it: it already preserves a newer on-disk version rather than
+    // downgrading it, and already stamps CURRENT for the absent-file and
+    // version-less cases. A `?? CURRENT` here used to look like the
+    // defaulting step, but it could never fire -- both of that function's
+    // returns carry a number.
+    //
+    // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
+    // (matching secrets-vault): bundles.json can carry per-server `--env`
+    // secrets, so its parent dir must not be group/other-listable.
+    await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
+    if (process.platform !== "win32") {
+      try {
+        await chmod(path, 0o600);
+      } catch {
+        // chmod not supported on this filesystem; not fatal.
+      }
     }
-  }
-  return { path, replaced, entry: written, launchChanged: target.launchChanged };
+    return { path, replaced, entry: written, launchChanged: target.launchChanged, warnings };
+  });
 }
 
 /**
  * Remove a server entry (by namespace) from the user-global bundles.json.
  * No-op (removed:false) when the file or the namespace is absent. Atomic
- * write when a removal actually happens.
+ * write when a removal actually happens. `warnings` carries the read's
+ * non-fatal diagnostics (see readRawUserBundles).
  *
- * Serialized via bundleWriteChain so concurrent calls don't lose writes.
+ * Serialized via bundleWriteChain (in-process) and withBundlesLock (cross-
+ * process) so concurrent calls don't lose writes.
  */
-export function removeUserBundle(
-  namespace: string,
-  opts: { home?: string } = {},
-): Promise<{ path: string; removed: boolean }> {
+export function removeUserBundle(namespace: string, opts: { home?: string } = {}): Promise<RemoveUserBundleResult> {
   const result = bundleWriteChain.then(() => doRemoveUserBundle(namespace, opts));
   bundleWriteChain = result.then(
     () => undefined,
@@ -1138,33 +1323,37 @@ export function removeUserBundle(
   return result;
 }
 
-async function doRemoveUserBundle(
-  namespace: string,
-  opts: { home?: string },
-): Promise<{ path: string; removed: boolean }> {
+async function doRemoveUserBundle(namespace: string, opts: { home?: string }): Promise<RemoveUserBundleResult> {
   const home = opts.home ?? homedir();
   const path = localBundlesPath(userConfigDir(home));
-  if (!existsSync(path)) return { path, removed: false };
-  const file = await readRawUserBundles(home);
-  const before = file.servers.length;
-  file.servers = file.servers.filter((s) => s?.namespace !== namespace);
-  if (file.servers.length === before) return { path, removed: false };
-  // `file.version` round-trips from readRawUserBundles, which already preserves
-  // a newer on-disk version and defaults a version-less file to CURRENT -- see
-  // the same note in doUpsertUserBundle.
-  //
-  // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
-  // (matching secrets-vault): bundles.json can carry per-server `--env`
-  // secrets, so its parent dir must not be group/other-listable.
-  await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
-  if (process.platform !== "win32") {
-    try {
-      await chmod(path, 0o600);
-    } catch {
-      // chmod not supported on this filesystem; not fatal.
+  // Early-out BEFORE the lock: taking it creates ~/.yaw-mcp/ (see
+  // withBundlesLock), and a no-op remove on a machine that has no bundles.json
+  // must not leave a config dir behind as its only effect. Absence is
+  // re-checked by the read inside the lock either way.
+  if (!existsSync(path)) return { path, removed: false, warnings: [] };
+  return withBundlesLock(home, async () => {
+    const warnings: string[] = [];
+    const file = await readRawUserBundles(home, warnings);
+    const before = file.servers.length;
+    file.servers = file.servers.filter((s) => s?.namespace !== namespace);
+    if (file.servers.length === before) return { path, removed: false, warnings };
+    // `file.version` round-trips from readRawUserBundles, which already
+    // preserves a newer on-disk version and defaults a version-less file to
+    // CURRENT -- see the same note in doUpsertUserBundle.
+    //
+    // dirMode 0o700 so a freshly-created ~/.yaw-mcp/ is born owner-only
+    // (matching secrets-vault): bundles.json can carry per-server `--env`
+    // secrets, so its parent dir must not be group/other-listable.
+    await atomicWriteFile(path, `${JSON.stringify(file, null, 2)}\n`, "utf8", 0o600, 0o700);
+    if (process.platform !== "win32") {
+      try {
+        await chmod(path, 0o600);
+      } catch {
+        // chmod not supported on this filesystem; not fatal.
+      }
     }
-  }
-  return { path, removed: true };
+    return { path, removed: true, warnings };
+  });
 }
 
 /**

@@ -1,6 +1,8 @@
-// What probeOam SAYS about a binary it could not use: the DEBUG diagnostic for
-// an oam whose --version says nothing parsable, and the warn for an OAM_BIN
-// naming a path that does not exist.
+// What oam-spawn SAYS at debug level about the things it declines: probeOam's
+// diagnostic for an oam whose --version says nothing parsable (and its warn
+// for an OAM_BIN naming a path that does not exist), and rewriteForOam's line
+// for an npx launch it leaves on npx -- the one place the broker used to copy
+// a server's whole argv into the log.
 //
 // Its own file for the same reason oam-pin-notice-debug.test.ts has one: the
 // level has to be raised before oam-spawn's import graph is built, and a
@@ -17,7 +19,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 const priorLogLevel = process.env.LOG_LEVEL;
 process.env.LOG_LEVEL = "debug";
 
-const { MIN_OAM_VERSION, probeOam, resetOamBinCache, winNormalize } = await import("../oam-spawn.js");
+const { MIN_OAM_VERSION, probeOam, resetOamBinCache, rewriteForOam, winNormalize } = await import("../oam-spawn.js");
 
 // Put it back: vitest gives each FILE a fresh module registry, not a fresh
 // process.env, so a worker reused for a later file would otherwise inherit
@@ -143,5 +145,28 @@ describe("probeOam ENOENT: absence vs a stale OAM_BIN", () => {
     expect(probe?.failureDetail).toBeNull();
     // Nothing at all, at debug level -- not merely nothing about OAM_BIN.
     expect(lines, "an absent oam is not an event worth a log line").toEqual([]);
+  });
+});
+
+describe("rewriteForOam flag diagnostic", () => {
+  it("names the flag and the argv length, never the argv, when an npx flag keeps a server on npx", async () => {
+    // Everything after the flag belongs to the SERVER, and a server's args are
+    // where a token rides. The logger does no redaction, and LOG_LEVEL=debug
+    // is exactly what support asks a user to turn on before sending the
+    // client's log files over -- this line used to copy the whole command
+    // line, secret included, into them.
+    const args = ["-y", "--package=some-mcp", "some-mcp", "--token", "hunter2-not-for-logs"];
+    const lines = await captureLines(() =>
+      rewriteForOam("npx", args, { oamBin: "oam", resolveEntry: () => "/pkgs/some-mcp/index.js" }),
+    );
+
+    const note = lines.find((l) => String(l.msg ?? "").includes("carries flags yaw-mcp does not parse"));
+    expect(note, "the stay-on-npx decision said nothing at debug").toBeDefined();
+    expect(note?.level).toBe("debug");
+    // What a reader needs to see why oam was skipped: the flag, and how much
+    // argv there was. Not the argv.
+    expect(note?.flag).toBe("--package=some-mcp");
+    expect(note?.argc).toBe(args.length);
+    expect(JSON.stringify(note)).not.toContain("hunter2-not-for-logs");
   });
 });

@@ -87,7 +87,7 @@ describe("formatHealthWarning", () => {
   });
 
   it("hides low-sample error rates to avoid over-fitting to one flake", () => {
-    // 2/2 is 100% fail — but below the 3-call observation floor. Silent.
+    // 2/2 is 100% fail -- but below the 3-call observation floor. Silent.
     expect(formatHealthWarning({ totalCalls: 2, errorCount: 2, totalLatencyMs: 5 }, undefined)).toBeNull();
   });
 
@@ -109,7 +109,7 @@ describe("formatHealthWarning", () => {
     expect(formatHealthWarning({ totalCalls: 100, errorCount: 1, totalLatencyMs: 5 }, undefined)).toBeNull();
   });
 
-  it("warns when the recent error rate clears 30%", () => {
+  it("appends the last error message once the rate clears WARN_RATE_FLOOR", () => {
     const w = formatHealthWarning(
       { totalCalls: 10, errorCount: 3, totalLatencyMs: 5, lastErrorMessage: "503 Service Unavailable" },
       undefined,
@@ -341,8 +341,111 @@ describe("formatHealthWarning -- credential scrubbing", () => {
     expect(scrubForWarning("MYSQL_PASSWORD: swordfish")).toBe("MYSQL_PASSWORD: <redacted>");
     expect(scrubForWarning("X-Api-Key: abcdefghijkl")).toBe("X-Api-Key: <redacted>");
     expect(scrubForWarning("API_KEY = supersecret")).toBe("API_KEY = <redacted>");
-    expect(scrubForWarning("api_key:\tabcdef")).toBe("api_key:\t<redacted>");
-    expect(scrubForWarning("token:   hunterxx")).toBe("token:   <redacted>");
+    // The separator's whitespace comes out collapsed to one space: the scrubber
+    // normalizes whitespace before the patterns run (see the newline-split
+    // cases below), so a tab or a run of spaces is not preserved verbatim.
+    expect(scrubForWarning("api_key:\tabcdef")).toBe("api_key: <redacted>");
+    expect(scrubForWarning("token:   hunterxx")).toBe("token: <redacted>");
+  });
+
+  it("redacts a pair whose key and value are split by a newline", () => {
+    // Rule 2's separator admits only spaces and tabs, so a value that sat on
+    // the NEXT line escaped it -- and the whitespace collapse that used to run
+    // AFTER the scrub then joined the two halves into a clear-text
+    // "NAME: value" line in discover() output. The collapse now runs inside
+    // scrubForWarning, before the patterns, so the export is safe on its own.
+    expect(scrubForWarning("GITHUB_TOKEN:\nabc123def456")).toBe("GITHUB_TOKEN: <redacted>");
+    expect(scrubForWarning("GITHUB_TOKEN:\r\n  abc123def456")).toBe("GITHUB_TOKEN: <redacted>");
+    expect(scrubForWarning("GITHUB_TOKEN:\nabc123def456")).not.toContain("abc123def456");
+  });
+
+  it("redacts a pretty-printed JSON body, not just a compact one", () => {
+    // server.ts stores result.content[0].text verbatim as lastErrorMessage, and
+    // an upstream that echoes its request body pretty-printed puts the key,
+    // the colon and the value on three separate lines.
+    const body = '{\n  "token":\n    "abc123secret"\n}';
+    expect(scrubForWarning(body)).toBe('{ "token": "<redacted>" }');
+    expect(scrubForWarning(body)).not.toContain("abc123secret");
+  });
+
+  it("keeps a newline-split value out of BOTH warning lines", () => {
+    // The two production paths into truncateForWarning: the per-call error
+    // rate line (health.lastErrorMessage) and the activation-failure line
+    // (upstream stderr tail). Both used to emit the value in the clear.
+    const now = 1_000_000;
+    const split = "GITHUB_TOKEN:\nabc123def456";
+    const pretty = '{\n  "token":\n    "abc123secret"\n}';
+    for (const msg of [split, pretty]) {
+      const viaRate = formatHealthWarning(
+        { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: msg },
+        undefined,
+      );
+      expect(viaRate).toContain("5 of 10 calls failed");
+      expect(viaRate).not.toContain("abc123");
+      expect(viaRate).toContain("<redacted>");
+      const viaActivation = formatHealthWarning(undefined, { at: now - 60_000, message: msg }, now);
+      expect(viaActivation).toContain("last activation failed");
+      expect(viaActivation).not.toContain("abc123");
+      expect(viaActivation).toContain("<redacted>");
+    }
+    expect(
+      formatHealthWarning({ totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: split }, undefined),
+    ).toBe("warn: 5 of 10 calls failed: GITHUB_TOKEN: <redacted>");
+    expect(formatHealthWarning(undefined, { at: now - 60_000, message: pretty }, now)).toBe(
+      'warn: last activation failed 1m ago: { "token": "<redacted>" }',
+    );
+  });
+
+  it("leaves an ordinary diagnostic alone when a scheme word is just an English word", () => {
+    // Rule 1's scheme list is mostly ordinary English (key, token, basic,
+    // digest), and it used to take ANY 8+ letter word after one of them as the
+    // credential: "API key required" -> "API <redacted>", which throws away the
+    // one word the model can act on. The blob now has to LOOK like a
+    // credential -- a digit, or 16+ chars -- which no English word after those
+    // schemes does.
+    for (const line of [
+      "API key required",
+      "api-key required",
+      "basic authentication failed",
+      "digest mismatch",
+      "token authentication required",
+      "invalid token supplied",
+    ]) {
+      expect(scrubForWarning(line)).toBe(line);
+    }
+    const w = formatHealthWarning(
+      { totalCalls: 10, errorCount: 5, totalLatencyMs: 5, lastErrorMessage: "API key required" },
+      undefined,
+    );
+    expect(w).toBe("warn: 5 of 10 calls failed: API key required");
+  });
+
+  it("drops the shape gate in header position: any blob after `Authorization: Basic` is a credential", () => {
+    // The shape gate exists for PROSE ("basic authentication failed"). Right
+    // after `Authorization:` the word after the scheme is a credential by
+    // construction, so a short letters-only Basic blob -- which the gate let
+    // through and HEAD redacted -- is redacted there regardless of shape,
+    // while the same blob in prose stays the accepted miss.
+    expect(scrubForWarning("Authorization: Basic dXNlcjpwYXNz")).toBe("Authorization: <redacted>");
+    expect(scrubForWarning("authorization:basic dXNlcjpwYXNz -- 401")).toBe("authorization:<redacted> -- 401");
+    expect(scrubForWarning("401 invalid credentials for basic dXNlcjpwYXNz")).toBe(
+      "401 invalid credentials for basic dXNlcjpwYXNz",
+    );
+  });
+
+  it("still redacts a credential-shaped blob after a bare-word scheme", () => {
+    // The shape gate must not reopen the scheme-word leak rule 1 exists for.
+    expect(scrubForWarning("Authorization: Token abc123def456")).toBe("Authorization: <redacted>");
+    expect(scrubForWarning("key abcdefghijklmnopqrstuvwx")).toBe("<redacted>");
+    expect(scrubForWarning("token 12345678")).toBe("<redacted>");
+    expect(scrubForWarning("Basic YWxhZGRpbjpvcGVuc2VzYW1l")).toBe("<redacted>");
+    // bearer and hmac are scheme names, not prose, so they stay unanchored: a
+    // short all-letter bearer token is still caught.
+    expect(scrubForWarning("Bearer abcdefghij")).toBe("<redacted>");
+    expect(scrubForWarning("HMAC abcdefghij")).toBe("<redacted>");
+    // A short, letters-only Basic blob is below the shape gate, but in its
+    // natural header position rule 2 still redacts the whole clause.
+    expect(scrubForWarning("Authorization: Basic dXNlcjpwYXNz")).toBe("Authorization: <redacted>");
   });
 
   it("redacts a quoted value in either quote style, body only", () => {

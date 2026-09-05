@@ -3,19 +3,19 @@ import type { ConnectionHealth } from "./types.js";
 // Health-aware ranking penalty. Takes a raw ranker score and scales it
 // by a [0.5, 1.0] factor derived from observed reliability so dispatch
 // prefers servers that have been working in this session over servers
-// that have been flaking. Pure client-side — no backend dependency.
+// that have been flaking. Pure client-side -- no backend dependency.
 //
 // We only ever *shrink* the score; we never boost above the raw value.
 // The idea is "all else equal, prefer the one that works," not "a very
 // healthy obscure match beats a marginally healthy exact match."
 //
-// Thresholds are tuned by intuition — when we have usage data the values
+// Thresholds are tuned by intuition -- when we have usage data the values
 // should be revisited. Current defaults:
-//   - Need ≥3 observations before error rate matters (noise floor).
-//   - 0% errors  → factor 1.00 (no penalty)
-//   - 30% errors → factor 0.70
-//   - 50%+ errors → factor 0.50 (floor — never drop below)
-//   - Activation failure within ACTIVATION_FAILURE_TTL_MS → factor 0.50
+//   - Need >=3 observations before error rate matters (noise floor).
+//   - 0% errors  -> factor 1.00 (no penalty)
+//   - 30% errors -> factor 0.70
+//   - 50%+ errors -> factor 0.50 (floor -- never drop below)
+//   - Activation failure within ACTIVATION_FAILURE_TTL_MS -> factor 0.50
 export const ACTIVATION_FAILURE_TTL_MS = 5 * 60 * 1000;
 const OBSERVATION_FLOOR = 3;
 const MIN_FACTOR = 0.5;
@@ -60,7 +60,7 @@ export function activationFailureFactor(failure: ActivationFailure | undefined, 
   return MIN_FACTOR;
 }
 
-// Combine signals by taking the strictest penalty — worst observed
+// Combine signals by taking the strictest penalty -- worst observed
 // reliability wins, because both signals are evidence of real failure.
 export function healthFactor(
   health: ConnectionHealth | undefined,
@@ -72,12 +72,12 @@ export function healthFactor(
 
 // Render a short human-readable warning when a server is looking shaky,
 // so discover() can point the LLM at healthier alternatives. Returns
-// null when there is nothing to warn about — the caller should not
+// null when there is nothing to warn about -- the caller should not
 // print a line at all in that case. Activation failures take precedence
 // over per-call error rates because they mean the server is currently
 // unusable, not merely unreliable. Both signals are session-local.
 //
-// We deliberately hide low-sample error rates (<3 calls) — flagging a
+// We deliberately hide low-sample error rates (<3 calls) -- flagging a
 // server as unhealthy after a single flaky call would train the model
 // to skip perfectly-fine servers just because the first call 500'd. Above
 // the floor we surface a MEANINGFUL rate (>= WARN_RATE_FLOOR) -- a lower gate
@@ -197,7 +197,33 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
   // Scheme list is not just bearer/basic: any other scheme fell through to
   // rule 2, which then captured the SCHEME WORD as the value and left the
   // token itself in the clear ("Authorization: Token abc123def456").
-  { re: /\b(?:bearer|basic|token|apikey|api-key|digest|key|hmac)\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: () => REDACTED },
+  //
+  // Most of those schemes are also ordinary English, and an unanchored rule
+  // took ANY 8+ letter word after one of them as the credential: "API key
+  // required" -> "API <redacted>", "basic authentication failed" ->
+  // "<redacted> failed", "digest mismatch" -> "<redacted>". That throws away
+  // the one word the model can act on, which is the over-scrubbing the header
+  // below calls as bad a regression as a leak. So for the bare-word schemes
+  // the blob has to LOOK like a credential -- carry a digit, or run 16+ chars
+  // -- which no English word following "key" / "token" / "basic" / "digest"
+  // does, while a real token nearly always does. `bearer` and `hmac` are
+  // scheme names, not prose, so they stay unanchored and a short all-letter
+  // bearer token is still caught. A short letters-only blob after a bare-word
+  // scheme in PROSE is the accepted miss -- but in header position, right
+  // after `Authorization:` (or any `-Authorization:` header spelling), the
+  // word after the scheme is a credential by construction, so there the shape
+  // gate is dropped and any 8+ char blob is redacted (rule 2 covers the same
+  // spot only when the header name survives as a NAME: pair; anchoring here
+  // does not depend on it).
+  {
+    re: /\bauthorization\s*:\s*(?:basic|token|apikey|api-key|digest|key)\s+[A-Za-z0-9._~+/=-]{8,}|\b(?:bearer|hmac)\s+[A-Za-z0-9._~+/=-]{8,}|\b(?:basic|token|apikey|api-key|digest|key)\s+(?=[A-Za-z0-9._~+/=-]{16}|[A-Za-z._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{8,}/gi,
+    replace: (m: string) => {
+      // Keep the header NAME legible when the anchored alternative matched:
+      // `Authorization: <redacted>` tells the reader which header it was.
+      const head = /^authorization\s*:\s*/i.exec(m);
+      return head ? `${head[0]}${REDACTED}` : REDACTED;
+    },
+  },
   // 2. A secret-ish key followed by = or : and a value -- a query string, a
   //    JSON body, a header dump, or a Python repr ({'token': 'abc'}).
   //
@@ -212,10 +238,12 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
   //
   //    Prefixed NON-secrets stay readable, because the name has to both END the
   //    prefixed run and be followed by = or : -- "SSH_AUTH_SOCK=/tmp/..." has
-  //    `_SOCK` sitting after `AUTH`, so no alternative matches. The VALUE and
-  //    the SEPARATOR are gated too: prose there is a diagnostic, not a
-  //    credential, so the whole match is handed back untouched (see
-  //    ABSENCE_VALUE / PROSE_VALUE / PROSE_SEPARATOR above).
+  //    `_SOCK` sitting after `AUTH`, so no alternative matches. Once the name
+  //    DOES match, the callback redacts WHOLE (see the header above): a quoted
+  //    value loses its body, a compact NAME=v loses its one token, and a
+  //    whitespace-separated value loses the rest of the clause. The only
+  //    thing handed back untouched is a first value token on ABSENCE_VALUE,
+  //    so "GITHUB_TOKEN: not set" still reads as the diagnostic it is.
   //
   //    Everything the callback needs is inside the match, so this stays a
   //    single linear pass. An earlier revision looked ahead at the rest of the
@@ -278,14 +306,28 @@ const SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replace: (match: string, ...g
  *  vendor-prefixed keys), so the excerpt that IS load-bearing for the model
  *  ("502 bad gateway", "spawn ENOENT npx") survives while the value next to a
  *  credential-shaped name does not. Anything it misses is still bounded by
- *  the 120-char truncation below. */
+ *  the 120-char truncation below.
+ *
+ *  Whitespace is collapsed to single spaces HERE, before the patterns run,
+ *  and the result is one line. That is not cosmetic: rule 2's separator
+ *  admits only spaces and tabs, so a key and value split by a newline
+ *  ("GITHUB_TOKEN:\nabc123def456", or a pretty-printed JSON body with the
+ *  key, colon and value on three lines) matched nothing -- and when the
+ *  collapse ran AFTER the scrub, in truncateForWarning, it joined the two
+ *  halves into a clear-text "NAME: value" line in discover() output. Doing
+ *  it first means the patterns see the same one-line text the reader will,
+ *  and the export is safe on its own rather than only via truncateForWarning.
+ *  The one behavior change: a line break no longer ends a whole-clause tail
+ *  by accident, so the text after it is redacted too. That is the header's
+ *  hiding-beats-inverting trade, and the surviving tail never reached the
+ *  output as its own line anyway. */
 export function scrubForWarning(msg: string): string {
-  let out = msg;
+  let out = msg.replace(/\s+/g, " ");
   for (const { re, replace } of SECRET_PATTERNS) out = out.replace(re, replace);
   return out;
 }
 
-// Keep warning strings short — discover() output goes to the LLM's
+// Keep warning strings short -- discover() output goes to the LLM's
 // context window and every error message line we append is tokens the
 // caller pays. 120 chars is two lines of typical terminal width and
 // usually enough for a stack-trace top-level or an HTTP status.
@@ -297,8 +339,10 @@ export function scrubForWarning(msg: string): string {
 // `token=<redacted>`, while a long API key collapses to those same 10 chars.
 // The ordering does not depend on which way it goes -- what matters is that
 // the cut is applied to the FINAL text, so whatever the substitution did to
-// the length is already accounted for by the time we measure.)
+// the length is already accounted for by the time we measure.) The whitespace
+// collapse lives in scrubForWarning for the reason given there; only the trim
+// and the cut are left to do here.
 function truncateForWarning(msg: string): string {
-  const clean = scrubForWarning(msg).replace(/\s+/g, " ").trim();
+  const clean = scrubForWarning(msg).trim();
   return clean.length > 120 ? `${clean.slice(0, 117)}...` : clean;
 }

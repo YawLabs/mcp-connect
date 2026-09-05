@@ -14,13 +14,15 @@ import {
   DOCTOR_ENV_VARS,
   DOCTOR_USAGE,
   formatRelativeAge,
+  isForeignAbsoluteLaunch,
   oamRunEntryPath,
   parseDoctorArgs,
+  probeClientsAsync,
   registrySkipCheck,
   runDoctor as runDoctorUnstubbed,
   scanShellHistoryForShadows,
 } from "../doctor-cmd.js";
-import { ENTRY_NAME } from "../install-targets.js";
+import { claudeCodeProjectKey, ENTRY_NAME } from "../install-targets.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 
@@ -79,10 +81,12 @@ describe("runDoctor — exit codes", () => {
     expect(cap.text()).toMatch(/All good/);
   });
 
+  // Warning-producing fixtures pass `err` so the always-on stderr stream does
+  // not leak `warning: ...` lines onto the vitest runner's output.
   it("exits 2 whenever a warning exists (newer schema)", async () => {
     writeYawMcpConfig(synthHome, "config.json", { version: 999, servers: ["github"] });
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     expect(r.exitCode).toBe(2);
     expect(cap.text()).toMatch(/Warnings above need attention/);
   });
@@ -94,7 +98,7 @@ describe("runDoctor — exit codes", () => {
   it("exits 2 on a warning even though nothing resembling a token exists", async () => {
     writeYawMcpConfig(synthHome, "config.json", { version: 999 });
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     expect(r.exitCode).toBe(2);
   });
 
@@ -102,7 +106,7 @@ describe("runDoctor — exit codes", () => {
     mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(join(synthHome, ".yaw-mcp", "config.json"), "{ not json at all");
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     expect(r.exitCode).toBe(2);
   });
 });
@@ -170,11 +174,30 @@ describe("runDoctor — client detection", () => {
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: gone, args: ["run", "x.js"] } } }),
     );
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errs.push(s),
+    });
     const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(client?.launchCommandMissing).toBe(gone);
     expect(cap.text()).toContain("launch command does not exist");
     expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+    // A client that cannot start yaw-mcp is a WARNING: it drives the exit
+    // code, the WARNINGS block and the stderr stream, not just a CLIENTS
+    // line. This state used to print "All good. yaw-mcp should start
+    // cleanly." two sections below the line saying the client cannot start.
+    expect(r.exitCode).toBe(2);
+    expect(cap.text()).toContain("Warnings above need attention");
+    expect(cap.text()).not.toContain("All good");
+    const warning = r.snapshot.config.warnings.find((w) => w.includes("launch command does not exist"));
+    expect(warning).toContain(join(synthHome, ".claude.json"));
+    expect(warning).toContain("Claude Code (user)");
+    expect(errs.join("")).toContain(`warning: ${warning}`);
   });
 
   // A BARE oam command is the shape older installs wrote, and the absolute-path
@@ -190,13 +213,16 @@ describe("runDoctor — client detection", () => {
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "oam", args: ["run", "--no-check", entryFile] } } }),
     );
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(client?.launchOamNotAbsolute).toBe("oam");
     expect(client?.launchOamEntryMissing).toBeNull();
     expect(cap.text()).toContain("resolves against the client's PATH");
     // Must NOT read as OK -- an entry that cannot launch is not a healthy one.
     expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+    // And not as healthy overall: exit 2, like every other cannot-launch state.
+    expect(r.exitCode).toBe(2);
+    expect(cap.text()).not.toContain("All good");
   });
 
   it("flags an oam entry file that no longer exists", async () => {
@@ -208,11 +234,13 @@ describe("runDoctor — client detection", () => {
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamBin, args: ["run", "--no-check", gone] } } }),
     );
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(client?.launchOamEntryMissing).toBe(gone);
     expect(cap.text()).toContain("oam cannot fetch it on demand");
     expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+    expect(r.exitCode).toBe(2);
+    expect(cap.text()).not.toContain("All good");
   });
 
   it("reports a fully resolvable oam entry as OK", async () => {
@@ -256,8 +284,12 @@ describe("runDoctor — client detection", () => {
     const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(client?.launchRuntime).toBe("oam");
     expect(client?.launchOamEntryMissing).toBeNull();
+    // The wrapped oam is ABSOLUTE, so the bare-oam check (which now reads the
+    // unwrapped token -- see the wrapper tests below) must stay quiet.
+    expect(client?.launchOamNotAbsolute).toBeNull();
     expect(cap.text()).not.toContain("entry file does not exist");
     expect(cap.text()).toContain("runs on oam");
+    expect(r.exitCode).toBe(0);
   });
 
   it("still flags a missing entry file through a cmd wrapper", async () => {
@@ -273,10 +305,55 @@ describe("runDoctor — client detection", () => {
       }),
     );
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(client?.launchOamEntryMissing).toBe(gone);
     expect(cap.text()).toContain("oam cannot fetch it on demand");
+  });
+
+  // The bare-oam check used to inspect `command` alone, so a bare `oam`
+  // reached THROUGH a wrapper -- which isOamLaunch accepts, and which the
+  // client resolves against its own PATH exactly like the un-wrapped bare
+  // form -- was reported "OK (runs on oam)". Claude Desktop launched from
+  // Explorer cannot find oam either way, and the broker never starts.
+  it("flags a bare oam reached through a cmd wrapper, not just a bare `command`", async () => {
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: "cmd", args: ["/d", "/s", "/c", "oam", "run", "--no-check", entryFile] },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchOamNotAbsolute).toBe("oam");
+    // The entry file exists -- only the oam token is the problem.
+    expect(client?.launchOamEntryMissing).toBeNull();
+    expect(cap.text()).toContain("resolves against the client's PATH");
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("flags a bare oam inside an `sh -c` payload", async () => {
+    const entryFile = join(synthHome, "broker.js");
+    writeFileSync(entryFile, "");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: "sh", args: ["-c", `oam run --no-check ${entryFile}`] } },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchOamNotAbsolute).toBe("oam");
+    expect(cap.text()).not.toMatch(/Claude Code \(user\): OK/);
   });
 
   it("reads the entry file out of an `sh -c` payload", async () => {
@@ -294,7 +371,7 @@ describe("runDoctor — client detection", () => {
       }),
     );
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(client?.launchRuntime).toBe("oam");
     expect(client?.launchOamEntryMissing).toBe(gone);
@@ -335,7 +412,7 @@ describe("runDoctor — client detection", () => {
       }),
     );
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     const userScope = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(userScope?.launchCommandMissing).toBe(gone);
     expect(userScope?.hasLegacyEntry).toBe(true);
@@ -360,6 +437,10 @@ describe("runDoctor — client detection", () => {
       r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchCommandMissing,
     ).toBeNull();
     expect(cap.text()).toMatch(/Claude Code \(user\): OK/);
+    // The healthy default must not become a warning now that cannot-launch
+    // states are folded into the exit code.
+    expect(r.exitCode).toBe(0);
+    expect(r.snapshot.config.warnings).toEqual([]);
   });
 
   it("reports Claude Code as configured when a yaw-mcp entry exists in ~/.claude.json", async () => {
@@ -402,9 +483,13 @@ describe("runDoctor — client detection", () => {
       env: {},
       os: "linux",
       out: cap.out,
+      err: () => {},
     });
     expect(r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.malformed).toBe(true);
     expect(cap.text()).toMatch(/JSON is malformed/);
+    // Malformed is a cannot-launch state: exit 2, not "All good".
+    expect(r.exitCode).toBe(2);
+    expect(cap.text()).toContain("Warnings above need attention");
   });
 
   it("does not call a config malformed just because an arg is not a string", async () => {
@@ -418,7 +503,9 @@ describe("runDoctor — client detection", () => {
       JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "cmd", args: ["/c", 5, null, "oam"] } } }),
     );
     const cap = captureOut();
-    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    // `err`: the filtered argv is `cmd /c oam`, a bare oam through a wrapper,
+    // which is (correctly) a warning -- but not what this test is about.
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     const entry = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
     expect(entry?.malformed).toBe(false);
     // And the entry is still SEEN -- the throw used to lose it entirely.
@@ -481,6 +568,8 @@ describe("runDoctor — client detection", () => {
     expect(userScope?.hasMcpEntry).toBe(false);
     expect(userScope?.hasLegacyEntry).toBe(true);
     expect(cap.text()).toMatch(/legacy "mcp\.hosting" entry present .* run `yaw-mcp install claude-code`/);
+    // A lone legacy entry is a migration hint, not a cannot-launch state.
+    expect(r.exitCode).toBe(0);
   });
 
   it("under CLAUDE_CONFIG_DIR, probes <DIR>/.claude.json — not the home file", async () => {
@@ -576,6 +665,23 @@ describe("scanShellHistoryForShadows", () => {
     const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: zsh } });
     expect(hits.find((h) => h.cli === "npm")?.count).toBe(2);
   });
+
+  it.skipIf(process.platform === "linux")(
+    "counts a file once when HISTFILE names it in a different CASE (win32 / darwin)",
+    () => {
+      // Same double-count, one spelling away: the dedupe keyed on byte-exact
+      // resolve() output, but NTFS and APFS/HFS+ are case-insensitive, so a
+      // HISTFILE of ~/.ZSH_HISTORY is the same file as the hardcoded
+      // ~/.zsh_history entry. paths.ts already owns the case-fold rule
+      // (normalizeForCompare); the dedupe now keys on it. Same mixed fixture
+      // as the test above, same "2 means deduped on the format-aware entry".
+      const zsh = join(synthHome, ".zsh_history");
+      writeFileSync(zsh, [": 1700000000:0;npm audit", "npm search lodash"].join("\n"));
+      const variant = join(synthHome, ".ZSH_HISTORY");
+      const hits = scanShellHistoryForShadows({ home: synthHome, env: { HISTFILE: variant } });
+      expect(hits.find((h) => h.cli === "npm")?.count).toBe(2);
+    },
+  );
 
   it("strips leading env-var assignments and sudo", () => {
     writeFileSync(
@@ -806,12 +912,16 @@ describe("runDoctor — RELIABILITY section", () => {
   it("surfaces flaky namespaces sorted worst-rate first, capped at 5", async () => {
     const now = Date.now();
     mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    // SIX namespaces below 80%, so the cap of five actually bites: the fixture
+    // used to hold four, and the "capped at 5" in the name was never exercised.
     const learning: Record<string, { dispatched: number; succeeded: number; lastUsedAt: number }> = {
       solid: { dispatched: 10, succeeded: 10, lastUsedAt: now },
       mild: { dispatched: 10, succeeded: 7, lastUsedAt: now - 60_000 }, // 70%
       severe: { dispatched: 5, succeeded: 1, lastUsedAt: now - 120_000 }, // 20%
       dead: { dispatched: 4, succeeded: 0, lastUsedAt: now - 180_000 }, // 0%
       zzz: { dispatched: 6, succeeded: 3, lastUsedAt: now }, // 50%
+      worse: { dispatched: 10, succeeded: 3, lastUsedAt: now - 30_000 }, // 30%
+      bad: { dispatched: 5, succeeded: 2, lastUsedAt: now - 45_000 }, // 40%
     };
     writeFileSync(
       join(synthHome, ".yaw-mcp", STATE_FILENAME),
@@ -830,15 +940,19 @@ describe("runDoctor — RELIABILITY section", () => {
     expect(txt).toMatch(/RELIABILITY \(dormant, <80% success\)/);
     // Healthy entries must not appear.
     expect(txt).not.toMatch(/ {2}solid /);
-    // Ordering: dead (0%) < severe (20%) < zzz (50%) < mild (70%).
+    // Ordering: dead (0%) < severe (20%) < worse (30%) < bad (40%) < zzz (50%).
     const deadIdx = txt.indexOf("dead --");
     const severeIdx = txt.indexOf("severe --");
+    const worseIdx = txt.indexOf("worse --");
+    const badIdx = txt.indexOf("bad --");
     const zzzIdx = txt.indexOf("zzz --");
-    const mildIdx = txt.indexOf("mild --");
     expect(deadIdx).toBeGreaterThan(-1);
     expect(deadIdx).toBeLessThan(severeIdx);
-    expect(severeIdx).toBeLessThan(zzzIdx);
-    expect(zzzIdx).toBeLessThan(mildIdx);
+    expect(severeIdx).toBeLessThan(worseIdx);
+    expect(worseIdx).toBeLessThan(badIdx);
+    expect(badIdx).toBeLessThan(zzzIdx);
+    // The cap: the sixth-worst (mild, 70%) is the one dropped.
+    expect(txt).not.toMatch(/ {2}mild --/);
     // Format carries call counts + rate + relative age.
     expect(txt).toMatch(/dead -- 4 calls, 0% success, last used/);
   });
@@ -938,7 +1052,6 @@ describe("runDoctor — env table lockstep with `yaw-mcp --help`", () => {
     "YAW_MCP_TRUST_PROJECT", // reported by the project-trust gate
     "YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS", // reported by the project-trust gate
     "YAW_MCP_CATALOG_URL", // endpoint override, not a behavior toggle
-    "YAW_MCP_BASE_URL", // endpoint override, not a behavior toggle
     "YAW_MCP_VAULT_PASSPHRASE", // a credential -- SECRET VAULT reports it as a boolean
     "YAW_MCP_VAULT_PASSPHRASE_NEW", // a credential, same reason
   ]);
@@ -1199,6 +1312,7 @@ describe("runDoctor — --json", () => {
       env: {},
       os: "linux",
       out: cap.out,
+      err: () => {},
       json: true,
       skipRegistryCheck: true,
     });
@@ -1467,6 +1581,7 @@ describe("runDoctor — --json", () => {
       env: {},
       os: "linux",
       out: capJson.out,
+      err: () => {},
       json: true,
       skipRegistryCheck: true,
       now: () => fixedNow,
@@ -1487,9 +1602,9 @@ describe("runDoctor — --json", () => {
     // Non-zero warnings drive the exit-2 gate, so this is no longer "All good".
     expect(rj.exitCode).toBe(2);
 
-    // Text path: the TRIALS section renders the SAME line, and the state
+    // Text path: the same warning string reaches WARNINGS, and the state
     // gates exit 2 identically -- the two surfaces used to disagree (text
-    // printed the line, exited 0, and said "All good").
+    // printed the line under TRIALS only, exited 0, and said "All good").
     writeFileSync(join(trialsRoot, "foo.json"), JSON.stringify(marker));
     const capText = captureOut();
     const errLines: string[] = [];
@@ -1505,7 +1620,12 @@ describe("runDoctor — --json", () => {
     });
     const text = rt.lines.join("\n");
     expect(text).toContain("TRIALS (yaw-mcp try)");
+    // The detail prints ONCE, under WARNINGS, like the trust and bundle
+    // warnings; TRIALS carries the count and points there. It used to print
+    // the same line in both places.
+    expect(text).toContain("1 expired trial could not be swept -- see WARNINGS");
     expect(text).toContain(`! ${jsonWarning}`);
+    expect(text.split(String(jsonWarning)).length - 1).toBe(1);
     expect(text).toContain("Warnings above need attention");
     expect(text).not.toContain("All good");
     expect(rt.exitCode).toBe(2);
@@ -2008,6 +2128,54 @@ describe("runDoctor — OAM RUNTIME section", () => {
     });
 
     expect(cap.text()).not.toContain("(latest ");
+  });
+
+  it("a sidecarRegistryFetch that REJECTS reads as 'unknown', not as a doctor crash", async () => {
+    // Same contract as registryFetch (null = unknown), and registryFetch's
+    // rejection is absorbed inside fetchLatestVersion. This probe ran bare
+    // inside a Promise.all, so a rejecting hook rejected runDoctor itself --
+    // the diagnostic dying on the one check that needs the network.
+    writeLocalBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "npx", args: ["-y", "@yawlabs/fetch-mcp@latest"] }],
+    });
+    const pkgDir = join(synthHome, ".yaw-mcp", "sidecars", "node_modules", "@yawlabs", "fetch-mcp");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "@yawlabs/fetch-mcp", version: "0.3.6" }));
+    const rejecting = async (): Promise<string | null> => {
+      throw new Error("ENOTFOUND registry.npmjs.org");
+    };
+
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      oamProbe: oamOk,
+      sidecarRegistryFetch: rejecting,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/@yawlabs\/fetch-mcp\s+0\.3\.6/);
+    expect(cap.text()).not.toContain("(latest ");
+
+    const capJson = captureOut();
+    const rj = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: capJson.out,
+      json: true,
+      skipRegistryCheck: true,
+      oamProbe: oamOk,
+      sidecarRegistryFetch: rejecting,
+    });
+    const parsed = JSON.parse(rj.lines[0]);
+    expect(parsed.oamRuntime.managed.packages).toEqual([
+      { pkg: "@yawlabs/fetch-mcp", version: "0.3.6", latest: null, stale: false },
+    ]);
   });
 
   it("warns when the managed tree was filled on a different platform/arch", async () => {
@@ -2801,7 +2969,7 @@ describe("runDoctor -- legacy-entry hint on every cannot-launch state", () => {
       }),
     );
     const cap = captureOut();
-    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     expect(cap.text()).toContain("oam cannot fetch it on demand");
     expect(cap.text()).toContain('legacy "mcp.hosting" entry also present');
   });
@@ -2819,7 +2987,7 @@ describe("runDoctor -- legacy-entry hint on every cannot-launch state", () => {
       }),
     );
     const cap = captureOut();
-    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
     expect(cap.text()).toContain("resolves against the client's PATH");
     expect(cap.text()).toContain('legacy "mcp.hosting" entry also present');
   });
@@ -3015,6 +3183,90 @@ describe("runDoctor — SECRET VAULT", () => {
     expect(txt).not.toContain("hunter2-do-not-leak");
   });
 
+  it("reports the vault's schema version, and tells a v1 vault's owner that rotate is the upgrade", async () => {
+    // A vault created before v2 stays v1 forever: setSecret preserves the
+    // on-disk version, only `secrets rotate` restamps it. Its entries are
+    // therefore never bound to their names (a blob swap between two names
+    // still decrypts), and until this line NO surface told the user -- the
+    // vault works, so nobody runs rotate on it. v1 vaults carry no `kdf`
+    // (they were all written under the pinned legacy parameters).
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(
+      join(synthHome, ".yaw-mcp", "secrets.json"),
+      JSON.stringify({ version: 1, salt: SALT_B64, entries: { gh: { iv: "x", ciphertext: "y", authTag: "z" } } }),
+    );
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("schema:     v1 -- entries are NOT bound to their names until");
+    expect(txt).toContain("`yaw-mcp secrets rotate` rewrites the file as v2");
+
+    // A current vault gets the bare version line and no rotate nudge.
+    writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
+    const cap2 = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap2.out });
+    expect(cap2.text()).toContain("schema:     v2\n");
+    expect(cap2.text()).not.toContain("secrets rotate");
+  });
+
+  it("carries the schema version in --json as an additive field", async () => {
+    writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.vault).toMatchObject({ exists: true, schemaVersion: 2 });
+  });
+
+  it("names a MALFORMED ref the spawn is refused over, on both surfaces, even with no vault", async () => {
+    // `${secret:gh token}` fails the strict name regex, so resolveServerEnv
+    // refuses the spawn -- and the vault section, which scanned with that
+    // same strict regex, said "no server env references ${secret:NAME}" about
+    // the very ref that was refused (or hid the section entirely when no
+    // vault existed). The bounded display form is what prints: never the raw
+    // env value.
+    writeYawMcpConfig(synthHome, "bundles.json", {
+      version: 1,
+      servers: [
+        {
+          id: "gh-id",
+          name: "GitHub",
+          namespace: "gh",
+          type: "local",
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-github"],
+          env: { GITHUB_PERSONAL_ACCESS_TOKEN: "${secret:gh token}" },
+        },
+      ],
+    });
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    const txt = cap.text();
+    expect(txt).toContain("SECRET VAULT");
+    expect(txt).toContain("malformed:  refs the spawn is REFUSED over");
+    expect(txt).toContain("gh: <malformed ref> ${secret:gh token}");
+
+    const cap2 = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap2.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.vault.malformed).toEqual([{ namespace: "gh", refs: ["<malformed ref> ${secret:gh token}"] }]);
+  });
+
   it("names the servers whose env references the vault", async () => {
     writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
     writeBundlesWithRef();
@@ -3172,5 +3424,506 @@ describe("runDoctor — SECRET VAULT", () => {
     const parsed = JSON.parse(r.lines[0]);
     expect(parsed.env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
     expect(r.lines[0]).not.toContain("hunter2-do-not-leak");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cannot-launch client states drive the exit code. The exit code and
+// DIAGNOSIS derive from config.warnings alone, and the CLIENTS section never
+// fed it -- so a malformed ~/.claude.json, or an entry whose launch command
+// no longer exists, printed "the client cannot start yaw-mcp" under CLIENTS
+// and then "All good. yaw-mcp should start cleanly." under DIAGNOSIS, exit
+// 0, on both surfaces. Yaw Terminal reads `doctor --json` .diagnosis and
+// .warnings and showed All good. The text-path pins live on the individual
+// client-detection tests above; these cover --json and the two-surface
+// agreement.
+// ---------------------------------------------------------------------------
+
+describe("runDoctor -- cannot-launch client states are warnings on both surfaces", () => {
+  it("--json: a malformed client config reaches .warnings and .diagnosis", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), "{ broken");
+    const cap = captureOut();
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errs.push(s),
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]) as {
+      warnings: string[];
+      diagnosis: { exitCode: number; summary: string };
+      clients: Array<{ clientId: string; scope: string; malformed: boolean }>;
+    };
+    expect(r.exitCode).toBe(2);
+    expect(parsed.diagnosis).toEqual({ exitCode: 2, summary: "Warnings need attention." });
+    // ONE warning for the one broken file, even though Claude Code's user
+    // and local scopes both read ~/.claude.json: a file-level state is folded
+    // once per file, naming every scope it hits (see clientLaunchWarnings).
+    expect(parsed.warnings).toHaveLength(1);
+    // House `<path>: <message>` shape, naming the client the path belongs to.
+    expect(parsed.warnings[0]).toContain(join(synthHome, ".claude.json"));
+    expect(parsed.warnings[0]).toContain("Claude Code (user, local)");
+    expect(parsed.warnings[0]).toContain("JSON is malformed");
+    // The per-client fields are untouched -- the fold ADDS a warning, it does
+    // not rename or move anything a consumer already reads; both scopes still
+    // report the file malformed on their own rows.
+    expect(parsed.clients.find((c) => c.clientId === "claude-code" && c.scope === "user")?.malformed).toBe(true);
+    expect(parsed.clients.find((c) => c.clientId === "claude-code" && c.scope === "local")?.malformed).toBe(true);
+    // And the always-on stderr stream carries it like every other warning.
+    expect(errs.join("")).toContain(`warning: ${parsed.warnings[0]}`);
+  });
+
+  it("--json: a rotted launch command reaches .warnings", async () => {
+    const gone = join(synthHome, "definitely", "not", "here", "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: gone, args: ["run", "x.js"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]) as { warnings: string[]; diagnosis: { exitCode: number } };
+    expect(parsed.diagnosis.exitCode).toBe(2);
+    expect(parsed.warnings.some((w) => w.includes(gone) && w.includes("cannot start yaw-mcp"))).toBe(true);
+  });
+
+  it("text and --json fold the same warnings in the same order (trust -> bundle -> trials -> clients)", async () => {
+    // A broken bundles.json AND a broken client config: the bundle warning
+    // folds before the client one on both paths, and the two lists must be
+    // identical -- same helper, same position -- or a consumer of one surface
+    // sees a different report from the other.
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", "bundles.json"), '{ "version": 1, "servers": [ ');
+    writeFileSync(join(synthHome, ".claude.json"), "{ broken");
+    const text = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+    });
+    const json = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: () => {},
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(json.lines[0]) as { warnings: string[] };
+    expect(text.snapshot.config.warnings).toHaveLength(2);
+    expect(text.snapshot.config.warnings[0]).toContain("invalid JSON");
+    expect(text.snapshot.config.warnings[1]).toContain("JSON is malformed");
+    expect(parsed.warnings).toEqual(text.snapshot.config.warnings);
+    expect(text.exitCode).toBe(2);
+    expect(json.exitCode).toBe(2);
+  });
+
+  it("stays exit 0 for a configured-looking file that simply lacks the entry", async () => {
+    // "present, no entry" is a client the user never installed to -- ordinary,
+    // not a cannot-launch state -- and must not drag a healthy machine to 2.
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: { other: { command: "x" } } }));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out });
+    expect(cap.text()).toContain(`present, no "${ENTRY_NAME}" entry`);
+    expect(r.exitCode).toBe(0);
+    expect(r.snapshot.config.warnings).toEqual([]);
+  });
+
+  // Claude Code's user and local scopes probe the SAME ~/.claude.json, so a
+  // per-probe fold said "exists but JSON is malformed" about the one file
+  // twice, differing only in the scope label. The fold groups by (file,
+  // client, status) and lists the scopes on one line; CLIENTS keeps its one
+  // line per scope, because those rows ARE per scope.
+  it("folds a file-level state ONCE per file, listing every scope that reads it", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), "{ broken");
+    const cap = captureOut();
+    const errs: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errs.push(s),
+    });
+    expect(r.snapshot.config.warnings).toHaveLength(1);
+    expect(r.snapshot.config.warnings[0]).toContain(`${join(synthHome, ".claude.json")}: Claude Code (user, local) `);
+    // The stderr stream carries the one line once, too.
+    expect(errs.filter((s) => s.includes("JSON is malformed"))).toHaveLength(1);
+    // CLIENTS is unchanged: one row per scope, each saying malformed.
+    expect(cap.text()).toMatch(/Claude Code \(user\): exists but JSON is malformed/);
+    expect(cap.text()).toMatch(/Claude Code \(local\): exists but JSON is malformed/);
+  });
+
+  it("keeps entry-level states one per scope -- each scope has its own entry and its own install command", async () => {
+    // user AND local entries in the one file, both naming a rotted command:
+    // two distinct entries, two distinct fixes, two warnings. The status
+    // strings differ on the install command, so the group key differs.
+    const gone = join(synthHome, "definitely", "not", "here", "oam");
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: { [ENTRY_NAME]: { command: gone, args: ["run", "x.js"] } },
+        // Keyed the way Claude Code keys it (forward slashes on Windows), or
+        // the local probe never finds the container.
+        projects: {
+          [claudeCodeProjectKey(synthCwd)]: { mcpServers: { [ENTRY_NAME]: { command: gone, args: ["run", "x.js"] } } },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const warnings = r.snapshot.config.warnings.filter((w) => w.includes("launch command does not exist"));
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain("Claude Code (user) ");
+    expect(warnings[0]).toContain("rerun `yaw-mcp install claude-code`");
+    expect(warnings[1]).toContain("Claude Code (local) ");
+    expect(warnings[1]).toContain("rerun `yaw-mcp install claude-code --scope local`");
+    expect(r.exitCode).toBe(2);
+  });
+});
+
+describe("runDoctor -- a client config that cannot be READ is not 'malformed'", () => {
+  // The probes wrapped the read and the classification in one catch that
+  // assigned MALFORMED. classifyProbeContent catches its own parse failures,
+  // so that outer catch only ever saw READ errors -- and reported a directory
+  // at ~/.claude.json (EISDIR), or a transient win32 EBUSY, as "exists but
+  // JSON is malformed -- fix or rerun `yaw-mcp install`": a syntax error to
+  // fix that does not exist.
+  it("reports the read error, keeps malformed false, and still exits 2", async () => {
+    mkdirSync(join(synthHome, ".claude.json"));
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.exists).toBe(true);
+    expect(client?.malformed).toBe(false);
+    expect(client?.unreadable).toMatch(/EISDIR/);
+    expect(cap.text()).toContain("could not be read (EISDIR");
+    expect(cap.text()).not.toContain("JSON is malformed");
+    // Doctor cannot vouch for a file it cannot read: exit 2, and the WARNINGS
+    // line names the path.
+    expect(r.exitCode).toBe(2);
+    expect(
+      r.snapshot.config.warnings.some(
+        (w) => w.includes(join(synthHome, ".claude.json")) && w.includes("could not be read"),
+      ),
+    ).toBe(true);
+  });
+
+  it("mirrors `unreadable` into --json as its own field, present on every slot", async () => {
+    mkdirSync(join(synthHome, ".claude.json"));
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]) as {
+      clients: Array<{ clientId: string; scope: string; malformed: boolean; unreadable: string | null }>;
+    };
+    const client = parsed.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.malformed).toBe(false);
+    expect(client?.unreadable).toMatch(/EISDIR/);
+    // Every other slot carries the key too (as null), so a consumer never
+    // branches on its absence.
+    expect(parsed.clients.every((c) => "unreadable" in c)).toBe(true);
+  });
+
+  it("probeClientsAsync (install --list, try) takes the same read-vs-parse split", async () => {
+    mkdirSync(join(synthHome, ".claude.json"));
+    const clients = await probeClientsAsync({ home: synthHome, os: "linux", cwd: synthCwd });
+    const client = clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.malformed).toBe(false);
+    expect(client?.unreadable).toMatch(/EISDIR/);
+  });
+});
+
+describe("runDoctor -- state.json whose top-level value is an array", () => {
+  // `typeof [] === "object"`, so a top-level array passed the object check
+  // and fell through to the version test, which reported "schema mismatch
+  // (file is v?)" for a file that is simply not a state file.
+  it("is corrupt on the text path", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", STATE_FILENAME), "[]");
+    const cap = captureOut();
+    await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, skipRegistryCheck: true });
+    expect(cap.text()).toContain("status: corrupt");
+    expect(cap.text()).toContain("top-level value is not an object");
+    expect(cap.text()).not.toContain("schema mismatch");
+  });
+
+  it("is malformed on the --json path", async () => {
+    mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
+    writeFileSync(join(synthHome, ".yaw-mcp", STATE_FILENAME), "[]");
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      json: true,
+      skipRegistryCheck: true,
+    });
+    const parsed = JSON.parse(r.lines[0]);
+    expect(parsed.state.status).toBe("malformed");
+    expect(parsed.state.detail).toBe("top-level value is not an object");
+  });
+});
+
+describe("isForeignAbsoluteLaunch", () => {
+  it("is a drive-letter path seen from POSIX", () => {
+    expect(isForeignAbsoluteLaunch(String.raw`C:\Users\me\.oam\bin\oam.exe`, "linux")).toBe(true);
+    expect(isForeignAbsoluteLaunch("C:/Users/me/.oam/bin/oam.exe", "darwin")).toBe(true);
+  });
+
+  it("is native on win32, and never a POSIX path or a bare name", () => {
+    expect(isForeignAbsoluteLaunch(String.raw`C:\Users\me\.oam\bin\oam.exe`, "win32")).toBe(false);
+    expect(isForeignAbsoluteLaunch("/usr/local/bin/oam", "linux")).toBe(false);
+    expect(isForeignAbsoluteLaunch("oam", "linux")).toBe(false);
+    expect(isForeignAbsoluteLaunch("cmd", "linux")).toBe(false);
+  });
+});
+
+describe("runDoctor -- a launch path written for another OS", () => {
+  // WSL reading a Windows profile: `C:\...\oam.exe` is fully absolute on the
+  // OS the entry is for, but posix isAbsolute calls it relative, so the
+  // bare-oam check flagged it with advice about PATH lookup.
+  //
+  // `platform` is injected rather than read off the runner: the probe's path
+  // semantics used to be bound to process.platform, so the two POSIX cases
+  // ran only on a POSIX runner and the win32 case only on win32 -- and with
+  // no CI by policy, the maintainer's Windows box never executed the foreign
+  // wiring in classifyProbeContent or the render branch at all. Every case
+  // now runs everywhere.
+  it("is reported as unverifiable, not as a bare oam", async () => {
+    const oamExe = String.raw`C:\Users\me\.oam\bin\oam.exe`;
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: { command: oamExe, args: ["run", "--no-check", String.raw`C:\nm\@yawlabs\mcp\dist\index.js`] },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      platform: "linux",
+      out: cap.out,
+    });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchRuntime).toBe("oam");
+    expect(client?.launchForeignPath).toBe(oamExe);
+    expect(client?.launchOamNotAbsolute).toBeNull();
+    expect(client?.launchCommandMissing).toBeNull();
+    expect(cap.text()).toContain("launch path is for another OS");
+    expect(cap.text()).not.toContain("resolves against the client's PATH");
+    // Not broken -- just not checkable from here.
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("sees through a cmd wrapper to the foreign oam", async () => {
+    const oamExe = String.raw`C:\Users\me\.oam\bin\oam.exe`;
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          [ENTRY_NAME]: {
+            command: "cmd",
+            args: ["/d", "/s", "/c", oamExe, "run", "--no-check", String.raw`C:\nm\index.js`],
+          },
+        },
+      }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      platform: "linux",
+      out: cap.out,
+    });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchForeignPath).toBe(oamExe);
+    expect(client?.launchOamNotAbsolute).toBeNull();
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("on win32 a drive-letter path is native and takes the ordinary checks", async () => {
+    // Absolute under win32 semantics and absent from every disk, so the
+    // missing-command check fires whatever the runner is.
+    const gone = String.raw`C:\definitely\not\here\oam.exe`;
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: gone, args: ["run", "--no-check", "x.js"] } } }),
+    );
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      platform: "win32",
+      out: cap.out,
+      err: () => {},
+    });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchForeignPath).toBeNull();
+    expect(client?.launchCommandMissing).toBe(gone);
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("the same platform seam reaches probeClientsAsync (install --list, try)", async () => {
+    const oamExe = String.raw`C:\Users\me\.oam\bin\oam.exe`;
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: oamExe, args: ["run", "--no-check", "x.js"] } } }),
+    );
+    const posix = await probeClientsAsync({ home: synthHome, os: "linux", cwd: synthCwd, platform: "linux" });
+    expect(posix.find((c) => c.clientId === "claude-code" && c.scope === "user")?.launchForeignPath).toBe(oamExe);
+    const native = await probeClientsAsync({ home: synthHome, os: "linux", cwd: synthCwd, platform: "win32" });
+    const client = native.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.launchForeignPath).toBeNull();
+    expect(client?.launchCommandMissing).toBe(oamExe);
+  });
+});
+
+describe("runDoctor -- a TRANSIENT client-config read (EBUSY / EAGAIN)", () => {
+  // Yaw Terminal polls `doctor --json`. On win32 an AV scanner or the search
+  // indexer holding ~/.claude.json for a moment makes the read fail EBUSY;
+  // folding every unreadable probe into exit 2 flipped that poll's diagnosis
+  // to "Warnings need attention" for a file that is perfectly fine and reads
+  // cleanly a second later. The CLIENTS line still says what happened; the
+  // exit code and the WARNINGS block do not move.
+  //
+  // Injected through the read seam: nothing a test can arrange holds a handle
+  // at just the right moment, and the errno is what the gate keys on.
+  const failingRead =
+    (code: string): ((path: string) => string) =>
+    (path) => {
+      throw Object.assign(new Error(`${code}: resource busy or locked, open '${path}'`), { code });
+    };
+
+  it("prints the CLIENTS line, raises no warning, and exits 0 on EBUSY", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: {} }));
+    const cap = captureOut();
+    const errLines: string[] = [];
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: (s) => errLines.push(s),
+      readClientConfig: failingRead("EBUSY"),
+    });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.exists).toBe(true);
+    expect(client?.malformed).toBe(false);
+    expect(client?.unreadable).toMatch(/EBUSY/);
+    expect(client?.unreadableCode).toBe("EBUSY");
+    // Reported where it happened, without the permissions advice -- there is
+    // nothing to check.
+    expect(cap.text()).toContain("could not be read just now (EBUSY");
+    expect(cap.text()).not.toContain("check the file and its permissions");
+    expect(r.snapshot.config.warnings).toEqual([]);
+    expect(errLines).toEqual([]);
+    expect(r.exitCode).toBe(0);
+    expect(cap.text()).toMatch(/All good/);
+  });
+
+  it("stays exit 0 on --json too, with the errno mirrored on every slot", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: {} }));
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      json: true,
+      skipRegistryCheck: true,
+      readClientConfig: failingRead("EBUSY"),
+    });
+    const parsed = JSON.parse(r.lines[0]) as {
+      warnings: string[];
+      diagnosis: { exitCode: number };
+      clients: Array<{ clientId: string; scope: string; unreadable: string | null; unreadableCode: string | null }>;
+    };
+    const client = parsed.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.unreadable).toMatch(/EBUSY/);
+    expect(client?.unreadableCode).toBe("EBUSY");
+    // Additive field, present (as null) on every other slot so a consumer
+    // never branches on its absence.
+    expect(parsed.clients.every((c) => "unreadableCode" in c)).toBe(true);
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.diagnosis.exitCode).toBe(0);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("still exits 2 on a read failure that is a state of the file (EACCES)", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: {} }));
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+      readClientConfig: failingRead("EACCES"),
+    });
+    const client = r.snapshot.clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.unreadableCode).toBe("EACCES");
+    expect(cap.text()).toContain("could not be read (EACCES");
+    expect(cap.text()).toContain("check the file and its permissions");
+    expect(
+      r.snapshot.config.warnings.some(
+        (w) => w.includes(join(synthHome, ".claude.json")) && w.includes("could not be read (EACCES"),
+      ),
+    ).toBe(true);
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("carries the errno through probeClientsAsync (install --list, try) as well", async () => {
+    writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: {} }));
+    const clients = await probeClientsAsync({
+      home: synthHome,
+      os: "linux",
+      cwd: synthCwd,
+      readClientConfig: failingRead("EAGAIN"),
+    });
+    const client = clients.find((c) => c.clientId === "claude-code" && c.scope === "user");
+    expect(client?.unreadable).toMatch(/EAGAIN/);
+    expect(client?.unreadableCode).toBe("EAGAIN");
+    expect(client?.malformed).toBe(false);
   });
 });

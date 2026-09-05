@@ -1,9 +1,22 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BUNDLES_FILENAME,
+  BUNDLES_LOCK_NAME,
+  BUNDLES_LOCK_WAIT_MS,
   loadLocalBundles,
   localBundlesPath,
   NAMESPACE_RE,
@@ -13,7 +26,7 @@ import {
   removeUserBundle,
   upsertUserBundle,
 } from "../local-bundles.js";
-import { CONFIG_DIRNAME } from "../paths.js";
+import { ALLOW_UNOWNED_ENV, CONFIG_DIRNAME } from "../paths.js";
 // The consent gate itself is covered in trust.test.ts; here it only has to be
 // SATISFIED, so the project-precedence cases keep testing precedence.
 import { grantTrust } from "../trust.js";
@@ -688,16 +701,20 @@ describe("an UNAPPROVED unreadable project file cannot blank out user-global", (
 
   it("YAW_MCP_TRUST_PROJECT=1 still commits to an unreadable project file", async () => {
     // The escape hatch means "treat this checkout as approved" -- a strictly
-    // larger grant than the path record, so it keeps the pre-gate behaviour.
+    // larger grant than the path record, so it keeps the pre-gate behaviour:
+    // the loader COMMITS to the unreadable project file (config null, path =
+    // the project file, a read warning) instead of substituting user-global.
+    // Staged with the injected ENOTDIR, not commitYawMcpAsFile: Windows
+    // reports that on-disk shape as ENOENT, so on the one machine that runs
+    // this suite the case used to assert the fallthrough branch and the
+    // behaviour in its name was never exercised anywhere.
     writeBundles(synthHome, GLOBAL);
-    commitYawMcpAsFile(synthCwd);
+    writeBundles(synthCwd, { version: 1, servers: [{ namespace: "project", name: "Project", command: "npx" }] });
+    failReadsOf(projectBundlesPath(synthCwd), "ENOTDIR");
     const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd, env: { YAW_MCP_TRUST_PROJECT: "1" } });
-    if (process.platform === "win32") {
-      // ENOENT-shaped there (see commitYawMcpAsFile) -- nothing to commit to.
-      expect(r.config?.servers.map((s) => s.namespace)).toEqual(["global"]);
-    } else {
-      expect(r.config).toBeNull();
-    }
+    expect(r.config).toBeNull();
+    expect(r.path).toBe(projectBundlesPath(synthCwd));
+    expect(r.warnings.some((w) => w.includes(projectBundlesPath(synthCwd)) && w.includes("could not read"))).toBe(true);
   });
 });
 
@@ -1004,7 +1021,9 @@ describe("write path births ~/.yaw-mcp/ owner-only (0o700)", () => {
     const atomic = await import("../atomic-write.js");
     const spy = vi.spyOn(atomic, "atomicWriteFile");
     // synthHome has no .yaw-mcp/ yet (nothing pre-created it this test), so
-    // doUpsertUserBundle -> atomicWriteFile creates it fresh at dirMode 0o700.
+    // the write path births it: withBundlesLock's mkdir first (0o700, so the
+    // lock sidecar has somewhere to live), and atomicWriteFile is still ASKED
+    // for the same 0o700 so the two creators cannot drift apart.
     expect(existsSync(join(synthHome, CONFIG_DIRNAME))).toBe(false);
     await upsertUserBundle(
       { namespace: "github", name: "GitHub", command: "npx", args: [], isActive: true },
@@ -1032,5 +1051,222 @@ describe("write path births ~/.yaw-mcp/ owner-only (0o700)", () => {
     const call = spy.mock.calls.find((c) => c[0] === userBundlesPath());
     expect(call, "the user bundles file was never rewritten").toBeDefined();
     expect(call?.[4]).toBe(0o700);
+  });
+});
+
+// readRawUserBundles used to run a sync existsSync() and THEN the real read.
+// A file removed between the two (a concurrent `remove`, an `rm`, the app
+// replacing it by rename) was "present" by the first and ENOENT by the
+// second -- and ENOENT is the one read outcome that adds no warning, so the
+// write path fell into "could not be parsed -- fix the JSON" with an EMPTY
+// detail, blaming the syntax of a file that no longer existed. The read
+// already tells absent from present-but-broken; it is now the only check.
+describe("a bundles.json that vanishes before the read is absent, not unparseable", () => {
+  it("previewUpsertUserBundle previews a fresh add instead of throwing a parse failure", async () => {
+    const path = localBundlesPath(join(synthHome, CONFIG_DIRNAME));
+    writeBundles(synthHome, { version: 1, servers: [{ namespace: "gone", name: "Gone", command: "npx" }] });
+    // existsSync() says present; the read says ENOENT.
+    failReadsOf(path, "ENOENT");
+    const preview = await previewUpsertUserBundle(
+      { namespace: "fresh", name: "Fresh", command: "npx", isActive: true },
+      { home: synthHome },
+    );
+    expect(preview.replaced).toBe(false);
+    expect(preview.warnings).toEqual([]);
+  });
+});
+
+describe("probeProjectTrust threads its env into the project-dir walk", () => {
+  it("honours the outside-$HOME ownership opt-in from the INJECTED env, not process.env", async () => {
+    // A cwd that is NOT under synthHome: the walk is unbounded there, so the
+    // candidate goes through the ownership gate -- which on win32 has no uid
+    // to compare and answers from env[ALLOW_UNOWNED_ENV] alone. The walk used
+    // to be handed no env and read the real process's, so an opt-in an
+    // embedded or test caller injected was honoured by the trust half of the
+    // probe and ignored by the project-dir half. process.env is scrubbed of
+    // the key for the duration so the injected env is the only place it can
+    // come from. (On POSIX the uid match passes the gate either way, so the
+    // assertion holds on every platform and discriminates on win32.)
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "yaw-mcp-outside-")));
+    const saved = process.env[ALLOW_UNOWNED_ENV];
+    delete process.env[ALLOW_UNOWNED_ENV];
+    try {
+      writeBundles(outside, { version: 1, servers: [{ namespace: "outside", name: "Outside", command: "npx" }] });
+      const probe = await probeProjectTrust({ cwd: outside, home: synthHome, env: { [ALLOW_UNOWNED_ENV]: "1" } });
+      expect(probe.path).toBe(projectBundlesPath(outside));
+      // ...and the loader, which runs the same probe, loads the same file.
+      const r = await loadLocalBundles({
+        cwd: outside,
+        home: synthHome,
+        env: { [ALLOW_UNOWNED_ENV]: "1", YAW_MCP_TRUST_PROJECT: "1" },
+      });
+      expect(r.path).toBe(projectBundlesPath(outside));
+      expect(r.config?.servers.map((s) => s.namespace)).toEqual(["outside"]);
+    } finally {
+      if (saved === undefined) delete process.env[ALLOW_UNOWNED_ENV];
+      else process.env[ALLOW_UNOWNED_ENV] = saved;
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+// The cross-process write lock (withBundlesLock). The in-process chain above
+// cannot see a SECOND yaw-mcp process -- two terminals running `add`, or the
+// CLI racing the Yaw Terminal app's own writer -- and without the lock both
+// read the same snapshot and the second write silently erased the first's
+// entry (and any stored --env value on it). "Another process" is staged as
+// the O_EXCL sidecar such a process leaves behind: written with a FOREIGN
+// pid, so the SUT's ownership-checked release can never mistake it for its
+// own and unlink it.
+describe("cross-process bundles.json lock", () => {
+  const entry = { namespace: "held", name: "Held", command: "npx", args: [], isActive: true };
+  const configDir = (): string => join(synthHome, CONFIG_DIRNAME);
+  const lockPath = (): string => join(configDir(), BUNDLES_LOCK_NAME);
+  const bundlesPath = (): string => localBundlesPath(configDir());
+  const namespacesOnDisk = (): string[] =>
+    (JSON.parse(readFileSync(bundlesPath(), "utf8")) as { servers: Array<{ namespace: string }> }).servers.map(
+      (s) => s.namespace,
+    );
+
+  /** What a live writer in another process leaves at the lock path. The pid
+   *  on file has to belong to a RUNNING process: acquireUpgradeLock probes
+   *  it with kill(pid, 0) and steals a lock whose holder is gone, so a made-up
+   *  pid would read as a crashed holder and be taken at once. This process
+   *  stands in for the foreign holder -- it is alive, and acquireUpgradeLock
+   *  only trusts its own pid on the RELEASE path, not on the held path. */
+  const FOREIGN_HOLDER = `${process.pid}\n`;
+  function holdForeignLock(): void {
+    mkdirSync(configDir(), { recursive: true });
+    writeFileSync(lockPath(), FOREIGN_HOLDER, { flag: "wx" });
+  }
+
+  /** Settle-tracking that handles a rejection too, so a failing case reports
+   *  through its assertions rather than as an unhandled rejection. */
+  function track(p: Promise<unknown>): () => boolean {
+    let done = false;
+    const mark = (): void => {
+      done = true;
+    };
+    p.then(mark, mark);
+    return () => done;
+  }
+
+  it("upsertUserBundle waits for a lock another process holds, writes once it is released, and lets go", async () => {
+    holdForeignLock();
+    const pending = upsertUserBundle(entry, { home: synthHome });
+    const settled = track(pending);
+    // Several poll intervals in: still waiting, and nothing written around the lock.
+    await new Promise((r) => setTimeout(r, 120));
+    expect(settled()).toBe(false);
+    expect(existsSync(bundlesPath())).toBe(false);
+    unlinkSync(lockPath());
+    const res = await pending;
+    expect(res.replaced).toBe(false);
+    expect(namespacesOnDisk()).toEqual(["held"]);
+    // Released after the write: no sidecar left for the next writer to wait on.
+    expect(existsSync(lockPath())).toBe(false);
+  });
+
+  it("removeUserBundle waits on the same lock", async () => {
+    writeBundles(synthHome, { version: 1, servers: [{ namespace: "held", name: "Held", command: "npx" }] });
+    holdForeignLock();
+    const pending = removeUserBundle("held", { home: synthHome });
+    const settled = track(pending);
+    await new Promise((r) => setTimeout(r, 120));
+    expect(settled()).toBe(false);
+    expect(namespacesOnDisk()).toEqual(["held"]);
+    unlinkSync(lockPath());
+    const res = await pending;
+    expect(res.removed).toBe(true);
+    expect(namespacesOnDisk()).toEqual([]);
+    expect(existsSync(lockPath())).toBe(false);
+  });
+
+  it("gives up after BUNDLES_LOCK_WAIT_MS naming the lock file, and writes NOTHING around a live lock", async () => {
+    // The lock is taken BEFORE the clock is faked, so its real mtime sits at
+    // or before the fake "now" and the primitive reads it as live throughout.
+    holdForeignLock();
+    // Only the clock and setTimeout are faked: withBundlesLock's mkdir and
+    // the poll that follows it need the real event loop (setImmediate stays
+    // real) to schedule the first poll at all -- advancing before it exists
+    // would only move the clock past a deadline nothing had measured yet.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const pending = upsertUserBundle(entry, { home: synthHome });
+      const outcome = pending.then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+      while (vi.getTimerCount() === 0) await new Promise<void>((r) => setImmediate(r));
+      await vi.advanceTimersByTimeAsync(BUNDLES_LOCK_WAIT_MS + 100);
+      const err = await outcome;
+      expect(err?.message).toMatch(/is locked by another yaw-mcp process/);
+      expect(err?.message).toContain(lockPath());
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(existsSync(bundlesPath())).toBe(false);
+    // Honoured, never stolen: the live holder's lock is exactly as it was.
+    expect(readFileSync(lockPath(), "utf8")).toBe(FOREIGN_HOLDER);
+  });
+
+  it("steals a lock a crashed holder left behind instead of waiting on it", async () => {
+    holdForeignLock();
+    // Provably stale: a holder keeps the lock for one read plus one write, so
+    // a day-old mtime is past any live window. A day rather than the
+    // primitive's own UPGRADE_LOCK_STALE_MS (private to auto-upgrade): it
+    // stays stale for any bound that constant could plausibly grow to.
+    const dayAgo = (Date.now() - 24 * 60 * 60 * 1000) / 1000;
+    utimesSync(lockPath(), dayAgo, dayAgo);
+    const res = await upsertUserBundle(entry, { home: synthHome });
+    expect(res.replaced).toBe(false);
+    expect(namespacesOnDisk()).toEqual(["held"]);
+    // The steal renames the stale file to a private name and unlinks it, and
+    // the write's own lock is released: nothing lock-shaped survives.
+    expect(readdirSync(configDir()).filter((f) => f.startsWith(BUNDLES_LOCK_NAME))).toEqual([]);
+  });
+
+  it("steals a FRESH lock whose holder process is gone, without waiting out the window", async () => {
+    // The shape a killed Yaw Terminal / serve leaves: live mtime, dead pid.
+    // Waiting on it meant every add/remove was refused for the full stale
+    // window ("locked by another yaw-mcp process") when nothing held it.
+    mkdirSync(configDir(), { recursive: true });
+    writeFileSync(lockPath(), `${2 ** 31 - 2}\n`, { flag: "wx" });
+    const started = Date.now();
+    const res = await upsertUserBundle(entry, { home: synthHome });
+    // Well inside BUNDLES_LOCK_WAIT_MS: the steal happened on the first take,
+    // not after the give-up deadline.
+    expect(Date.now() - started).toBeLessThan(BUNDLES_LOCK_WAIT_MS);
+    expect(res.replaced).toBe(false);
+    expect(namespacesOnDisk()).toEqual(["held"]);
+    // The steal renames the stale file to a private name and unlinks it, and
+    // the write's own lock is released: nothing lock-shaped survives.
+    expect(readdirSync(configDir()).filter((f) => f.startsWith(BUNDLES_LOCK_NAME))).toEqual([]);
+  });
+
+  it("takes the lock before the very FIRST write on a fresh machine, creating the dir it lives in", async () => {
+    // O_EXCL cannot create a sidecar in a dir that does not exist, and the
+    // lock primitive reads that ENOENT as "no lock possible, proceed" -- so
+    // without the mkdir the one write that births ~/.yaw-mcp/ ran unlocked.
+    expect(existsSync(configDir())).toBe(false);
+    const atomic = await import("../atomic-write.js");
+    const original = atomic.atomicWriteFile;
+    let lockHeldDuringWrite: boolean | undefined;
+    vi.spyOn(atomic, "atomicWriteFile").mockImplementation((...args) => {
+      lockHeldDuringWrite = existsSync(lockPath());
+      return original(...args);
+    });
+    await upsertUserBundle(entry, { home: synthHome });
+    expect(lockHeldDuringWrite).toBe(true);
+    expect(existsSync(lockPath())).toBe(false);
+  });
+
+  it("a no-op remove on a machine with no bundles.json leaves no config dir behind", async () => {
+    // Taking the lock creates ~/.yaw-mcp/ (above); a remove with nothing to
+    // remove early-outs BEFORE it, so its only effect is not a new directory.
+    expect(existsSync(configDir())).toBe(false);
+    const res = await removeUserBundle("nothing", { home: synthHome });
+    expect(res.removed).toBe(false);
+    expect(existsSync(configDir())).toBe(false);
   });
 });

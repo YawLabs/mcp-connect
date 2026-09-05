@@ -35,6 +35,21 @@ describe("appendAuditEvent + readAuditLog", () => {
     expect(await readAuditLog({}, home)).toEqual([]);
   });
 
+  it("readAuditLog THROWS for a log that exists but cannot be read, naming the path and errno", async () => {
+    // ENOENT is the only "no trail yet" signal. A directory at the log path
+    // makes readFile fail with EISDIR -- the "exists but unreadable" shape
+    // (EACCES, EIO are the same class). Returning [] here told `secrets
+    // audit` to print "no events recorded yet" about a trail sitting right
+    // there; reads are not fail-open the way the spawn-time writes are.
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(auditLogPath(home), { recursive: true });
+    const err = await readAuditLog({}, home).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("could not read the audit log");
+    expect((err as Error).message).toContain(auditLogPath(home));
+    expect((err as Error).message).toContain("EISDIR");
+  });
+
   it("filters by secret name", async () => {
     await appendAuditEvent({ server: "gh", secret: "alpha", event: "injected" }, home);
     await appendAuditEvent({ server: "gh", secret: "beta", event: "injected" }, home);

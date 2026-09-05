@@ -34,10 +34,12 @@ describe("normalizeToolName", () => {
   });
 
   it("preserves underscore-containing namespaces", () => {
-    // "mcp_hosting" is itself a namespace. The tool "create_issue" should
-    // not have its leading "mcp_" mistaken for a namespace prefix.
-    expect(normalizeToolName("mcp_hosting", "mcp_hosting_create_issue")).toBe("create_issue");
-    expect(normalizeToolName("mcp_hosting", "create_issue")).toBe("create_issue");
+    // "google_maps" is what a user gets by naming the catalog's google-maps
+    // server that way in bundles.json (NAMESPACE_RE allows "_"). The tool
+    // "search_places" must not have its leading "google_" mistaken for a
+    // namespace prefix, and neither half of the namespace is a boundary.
+    expect(normalizeToolName("google_maps", "google_maps_search_places")).toBe("search_places");
+    expect(normalizeToolName("google_maps", "search_places")).toBe("search_places");
   });
 
   it("returns unchanged when prefix matches without a name tail", () => {

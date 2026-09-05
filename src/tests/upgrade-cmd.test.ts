@@ -1,36 +1,86 @@
+import type { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { quoteArgForDisplay, quoteShellArgIfNeeded } from "../auto-upgrade.js";
-import { MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
+import { compareVersions, MIN_OAM_VERSION, type OamProbe } from "../oam-spawn.js";
 import {
   buildUpgradePlan,
   detectInstallMethod,
   detectSea,
   fetchLatestVersion,
+  GLOBAL_UPGRADE_METHODS,
+  globalUpgradeCommandLineForTool,
+  type InstallMethod,
   killProcessTree,
   localInstallRoot,
   npmGlobalPrefix,
+  type ProbeSpawn,
   parseUpgradeArgs,
   REGISTRY_FETCH_TIMEOUT_MS,
   refineInstallMethod,
+  runningPackageDir,
   runUpgrade,
+  UPGRADE_COMMANDS,
+  UPGRADE_PACKAGE_SPEC,
+  upgradeCommandLine,
+  upgradeSpawnSpec,
 } from "../upgrade-cmd.js";
+
+/** Recorder for the mocked child_process.spawn. Two arms of the module reach
+ *  a real spawn -- runUpgrade's defaultSpawn (when no spawnImpl is injected)
+ *  and npmGlobalPrefix (which short-circuits under vitest unless a ProbeSpawn
+ *  is injected) -- and the OPTIONS they spawn with are the contract under
+ *  test. `vi.hoisted` so the object exists before the hoisted factory below
+ *  closes over it. Every other test injects its spawn, so nothing else in
+ *  this file reaches the mock. */
+const cp = vi.hoisted(() => ({
+  calls: [] as Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }>,
+  children: [] as EventEmitter[],
+}));
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const { EventEmitter: EE } = await import("node:events");
+  return {
+    ...actual,
+    spawn: (cmd: string, args: string[], opts: Record<string, unknown>) => {
+      cp.calls.push({ cmd, args: [...args], opts: { ...opts } });
+      const child = new EE();
+      cp.children.push(child);
+      return child;
+    },
+  };
+});
+
+/** A version strictly ABOVE the oam floor, for the at/above-floor fixtures.
+ *  Derived from the constant, not spelled: MIN_OAM_VERSION tracks the latest
+ *  oam release and moves often, and a literal "above" version silently turns
+ *  into a below-floor one at the next bump. */
+const bumpPatch = (v: string): string => {
+  const parts = v.split(".");
+  parts[parts.length - 1] = String(Number(parts[parts.length - 1]) + 1);
+  return parts.join(".");
+};
+/** A version strictly BELOW the floor. A literal on purpose (the below-min
+ *  cases assert on the printed value), pinned against the constant by the
+ *  fixture-sanity test in the runUpgrade suite. */
+const BELOW_FLOOR_OAM = "0.8.2";
 
 /** An oam probe answer for runUpgrade's advisory floor line. The note reads
  *  only `version` and `belowMin`, but the hook takes oam-spawn's real OamProbe
  *  -- the same object the un-injected path gets back from probeOam -- so a
- *  fixture here cannot quietly drift from production's shape. */
-const oamProbe =
-  (belowMin: boolean, version: string | null = "0.8.2") =>
-  async (): Promise<OamProbe> => ({
-    // bin/binPath are null exactly when the version is below the floor: that
-    // IS the below-min outcome (fall back to node), not an extra condition.
-    bin: belowMin ? null : "oam",
-    binPath: belowMin ? null : "/usr/local/bin/oam",
-    version,
-    belowMin,
-    failure: null,
-    failureDetail: null,
-  });
+ *  fixture here cannot quietly drift from production's shape. `version` is
+ *  required: a fixture must not state a version-vs-floor relationship by
+ *  omission. */
+const oamProbe = (belowMin: boolean, version: string | null) => async (): Promise<OamProbe> => ({
+  // bin/binPath are null exactly when the version is below the floor: that
+  // IS the below-min outcome (fall back to node), not an extra condition.
+  bin: belowMin ? null : "oam",
+  binPath: belowMin ? null : "/usr/local/bin/oam",
+  version,
+  belowMin,
+  failure: null,
+  failureDetail: null,
+});
 
 function captureIO(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
   const out: string[] = [];
@@ -312,6 +362,28 @@ describe("detectInstallMethod", () => {
       expect(detectInstallMethod("/opt/custom/yaw-mcp-launcher.js", resolves({}))).toBe("unknown");
     });
 
+    it("resolves a literal `local-node-modules` only when resolveWhen says so (the background upgrader's npm-link case)", () => {
+      // The CLI default resolves `unknown` only, for the pnpm reason above. The
+      // background upgrader widens it to local-node-modules: an `npm link`ed
+      // project tree or a staged shim is a literal local-node-modules whose
+      // realpath is the global install actually running. It used to carry its
+      // own copy of this realpath pass for that one difference.
+      const linked = "/proj/app/node_modules/@yawlabs/mcp/dist/index.js";
+      const realpath = vi.fn(resolves({ [linked]: "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js" }));
+      expect(detectInstallMethod(linked, realpath)).toBe("local-node-modules");
+      expect(realpath).not.toHaveBeenCalled();
+      expect(detectInstallMethod(linked, realpath, ["unknown", "local-node-modules"])).toBe("global-npm");
+      // A marker match outside resolveWhen is still never second-guessed.
+      expect(
+        detectInstallMethod("/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js", realpath, [
+          "unknown",
+          "local-node-modules",
+        ]),
+      ).toBe("pnpm-global");
+      // ...and a genuine project tree, whose realpath is itself, keeps its answer.
+      expect(detectInstallMethod(linked, (p) => p, ["unknown", "local-node-modules"])).toBe("local-node-modules");
+    });
+
     it("spares the resolved global shim any `npm prefix -g` refinement", async () => {
       // The refinement probe is a multi-second subprocess and the whole point of
       // resolving the shim is that this install no longer needs it.
@@ -407,6 +479,49 @@ describe("npmGlobalPrefix", () => {
     // prefix inject their own probe (opts.npmPrefix / deps.npmPrefixImpl).
     expect(process.env.VITEST).toBeTruthy();
     expect(await npmGlobalPrefix()).toBeNull();
+  });
+
+  it("spawns `npm prefix -g` with yaw-mcp's own secrets STRIPPED from the child env", async () => {
+    // Even a read-only probe is an npm invocation running with whatever env it
+    // inherits, and the passphrase README tells the user to park in yaw-mcp's
+    // env block must not ride along. The VITEST short-circuit keeps the real
+    // spawn unreachable, so the spawn itself is injected -- the only way to
+    // see its options.
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE", "hunter2");
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE_NEW", "hunter3");
+    vi.stubEnv("YAW_MCP_TOKEN", "mcp_pat_stale");
+    try {
+      const seen: Array<Parameters<ProbeSpawn>> = [];
+      const probeSpawn: ProbeSpawn = (cmd, args, opts) => {
+        seen.push([cmd, args, opts]);
+        return {
+          pid: 4321,
+          kill: () => true,
+          stdout: {
+            on: (_event, listener) => setImmediate(() => listener("/opt/node\n")),
+          },
+          on: (event, listener) => {
+            // After the stdout chunk above: one tick later.
+            if (event === "close") setImmediate(() => setImmediate(() => listener(0)));
+          },
+        };
+      };
+      expect(await npmGlobalPrefix(probeSpawn)).toBe("/opt/node");
+      expect(seen).toHaveLength(1);
+      const [cmd, args, opts] = seen[0];
+      expect(cmd).toBe("npm");
+      expect(args).toEqual(["prefix", "-g"]);
+      expect(opts.env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+      expect(opts.env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE_NEW");
+      expect(opts.env).not.toHaveProperty("YAW_MCP_TOKEN");
+      // A strip, not a blank env: npm still has to be found on PATH. The copy
+      // keeps process.env's own spelling of the key (`Path` on Windows).
+      const pathKey = Object.keys(opts.env).find((k) => k.toUpperCase() === "PATH");
+      expect(pathKey).toBeDefined();
+      expect(opts.env[pathKey as string]).toBe(process.env.PATH);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
@@ -534,6 +649,50 @@ describe("localInstallRoot", () => {
   });
 });
 
+describe("runningPackageDir -- the copy that is RUNNING, as opposed to the tree npm runs in", () => {
+  const NESTED = "/proj/node_modules/foo/node_modules/@yawlabs/mcp/dist/index.js";
+
+  it("takes the LAST node_modules/@yawlabs/mcp segment of a nested install (localInstallRoot takes the FIRST)", () => {
+    // The two legitimately differ for a nested copy: npm must run in /proj,
+    // but /proj is not where the running bytes live -- which is exactly the
+    // mismatch the post-`--run` check reports.
+    expect(runningPackageDir(NESTED)).toBe("/proj/node_modules/foo/node_modules/@yawlabs/mcp");
+    expect(localInstallRoot(NESTED)).toBe("/proj");
+  });
+
+  it("keeps Windows drive letters and backslashes intact", () => {
+    expect(runningPackageDir("C:\\Users\\u\\node_modules\\@yawlabs\\mcp\\dist\\index.js")).toBe(
+      "C:\\Users\\u\\node_modules\\@yawlabs\\mcp",
+    );
+  });
+
+  it("prefers the LITERAL path over its realpath (pnpm repoints the link; the old store dir keeps the old version)", () => {
+    const realpath = vi.fn(
+      () => "/home/u/.local/share/pnpm/.pnpm/@yawlabs+mcp@0.40.0/node_modules/@yawlabs/mcp/dist/index.js",
+    );
+    expect(
+      runningPackageDir("/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp/dist/index.js", realpath),
+    ).toBe("/home/u/.local/share/pnpm/global/5/node_modules/@yawlabs/mcp");
+    expect(realpath).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the realpath for a bin shim, whose literal path carries no node_modules segment", () => {
+    expect(
+      runningPackageDir("/usr/local/bin/yaw-mcp", () => "/usr/local/lib/node_modules/@yawlabs/mcp/dist/index.js"),
+    ).toBe("/usr/local/lib/node_modules/@yawlabs/mcp");
+  });
+
+  it("returns null when neither form carries the segment, or the path cannot be resolved", () => {
+    expect(runningPackageDir("/opt/custom/launcher.js", () => "/opt/custom/real.js")).toBeNull();
+    expect(
+      runningPackageDir("/opt/custom/launcher.js", () => {
+        throw new Error("ENOENT");
+      }),
+    ).toBeNull();
+    expect(runningPackageDir(undefined)).toBeNull();
+  });
+});
+
 describe("buildUpgradePlan", () => {
   it("flags stale=true when current < latest", () => {
     const plan = buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "global-npm" });
@@ -616,6 +775,103 @@ describe("buildUpgradePlan", () => {
   });
 });
 
+describe("UPGRADE_COMMANDS -- the one whitelist every spawn surface derives from", () => {
+  // This used to be spelled in four places (buildUpgradePlan's switch,
+  // runUpgrade's runSpec, auto-upgrade's globalSpec and its failure hint), so a
+  // change to the package spec or a new tool had to land in all four or they
+  // drifted. These pin that every surface now reads the one table.
+  const SPAWNABLE = ["global-npm", "pnpm-global", "bun-global", "local-node-modules"] as const;
+  const MANUAL = ["npx", "bundled-app", "dev-checkout", "binary", "unknown"] as const;
+
+  it("every spawnable entry ends in the @latest package spec, so a stale copy always moves to the newest publish", () => {
+    expect(UPGRADE_PACKAGE_SPEC).toBe("@yawlabs/mcp@latest");
+    for (const m of Object.keys(UPGRADE_COMMANDS) as InstallMethod[]) {
+      const entry = UPGRADE_COMMANDS[m];
+      if (entry === null) continue;
+      expect(entry.args[entry.args.length - 1], m).toBe(UPGRADE_PACKAGE_SPEC);
+    }
+    for (const m of SPAWNABLE) expect(UPGRADE_COMMANDS[m], m).not.toBeNull();
+    for (const m of MANUAL) expect(UPGRADE_COMMANDS[m], m).toBeNull();
+  });
+
+  it("names exactly the global methods the background upgrader may act on", () => {
+    expect(GLOBAL_UPGRADE_METHODS).toEqual(["global-npm", "pnpm-global", "bun-global"]);
+  });
+
+  it("upgradeSpawnSpec inserts --prefix ahead of the package spec for global-npm only", () => {
+    expect(upgradeSpawnSpec("global-npm", "/opt/node")).toEqual({
+      cmd: "npm",
+      args: ["install", "-g", "--prefix", "/opt/node", "@yawlabs/mcp@latest"],
+    });
+    expect(upgradeSpawnSpec("global-npm")).toEqual({ cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] });
+    // `pnpm add -g --prefix` is not a real flag: the arg is ignored, not passed.
+    expect(upgradeSpawnSpec("pnpm-global", "/opt/node")).toEqual({
+      cmd: "pnpm",
+      args: ["add", "-g", "@yawlabs/mcp@latest"],
+    });
+    expect(upgradeSpawnSpec("bun-global", "/opt/node")).toEqual({
+      cmd: "bun",
+      args: ["add", "-g", "@yawlabs/mcp@latest"],
+    });
+    expect(upgradeSpawnSpec("local-node-modules", "/opt/node")).toEqual({
+      cmd: "npm",
+      args: ["install", "@yawlabs/mcp@latest"],
+    });
+    for (const m of MANUAL) expect(upgradeSpawnSpec(m, "/opt/node"), m).toBeNull();
+  });
+
+  it("hands out a fresh args array each call, so a caller may push onto it without editing the table", () => {
+    upgradeSpawnSpec("global-npm")?.args.push("--dry-run");
+    expect(upgradeSpawnSpec("global-npm")?.args).toEqual(["install", "-g", "@yawlabs/mcp@latest"]);
+    expect(UPGRADE_COMMANDS["global-npm"]?.args).toEqual(["install", "-g", "@yawlabs/mcp@latest"]);
+  });
+
+  it("buildUpgradePlan's command IS the table's line for every spawnable method, and the global line for unknown", () => {
+    for (const m of SPAWNABLE) {
+      expect(buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: m }).command, m).toBe(
+        upgradeCommandLine(m),
+      );
+    }
+    expect(buildUpgradePlan({ current: "0.40.0", latest: "0.45.0", method: "unknown" }).command).toBe(
+      upgradeCommandLine("global-npm"),
+    );
+    for (const m of ["npx", "bundled-app", "binary"] as const) expect(upgradeCommandLine(m), m).toBeNull();
+  });
+
+  it("derives the --prefix suggestion (printed and --json) from the table too", async () => {
+    // The prefixed global-npm form was the one hand-spelled copy left after
+    // UPGRADE_COMMANDS became the single source: a change to the package spec
+    // would have moved the spawn and left the printed suggestion behind.
+    const io = captureIO();
+    const prefix = "/opt/node";
+    await runUpgrade({
+      currentVersion: "0.40.0",
+      argvPath: `${prefix}/lib/node_modules/@yawlabs/mcp/dist/index.js`,
+      fetchLatest: async () => "0.45.0",
+      oamProbe: oamProbe(false, "0.13.1"),
+      platform: "linux",
+      runningPrefix: () => prefix,
+      json: true,
+      out: io.push,
+      err: io.pushErr,
+    });
+    const doc = JSON.parse(io.out.join("\n")) as { command: string };
+    const spec = upgradeSpawnSpec("global-npm", prefix);
+    expect(spec).not.toBeNull();
+    expect(doc.command).toBe([spec?.cmd, ...(spec?.args ?? [])].join(" "));
+    expect(doc.command).toContain(UPGRADE_PACKAGE_SPEC);
+  });
+
+  it("resolves auto-upgrade's failure hint by TOOL to the global line, never the local one", () => {
+    // The background spawn's failure callback is handed the tool, not the
+    // method, and npm owns two entries -- the hint must be the `-g` one.
+    expect(globalUpgradeCommandLineForTool("npm")).toBe("npm install -g @yawlabs/mcp@latest");
+    expect(globalUpgradeCommandLineForTool("pnpm")).toBe("pnpm add -g @yawlabs/mcp@latest");
+    expect(globalUpgradeCommandLineForTool("bun")).toBe("bun add -g @yawlabs/mcp@latest");
+    expect(globalUpgradeCommandLineForTool("yarn")).toBeNull();
+  });
+});
+
 describe("runUpgrade", () => {
   it("prints Current/Latest and flags already-up-to-date", async () => {
     const io = captureIO();
@@ -682,6 +938,157 @@ describe("runUpgrade", () => {
     expect(spawned).toHaveLength(1);
     expect(spawned[0]).toEqual({ cmd: "npm", args: ["install", "-g", "@yawlabs/mcp@latest"] });
     expect(io.out.join("\n")).toContain("OK: Upgraded @yawlabs/mcp to 0.45.0");
+  });
+
+  it("with --run and no injected spawn, the real spawn gets yaw-mcp's own secrets STRIPPED from its env", async () => {
+    // README tells the user to park YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own
+    // env block because "yaw-mcp strips its own secrets from every child env".
+    // `upgrade --run` spawns `npm install -g` with stdio inherited and used to
+    // hand it process.env whole -- and npm runs every dependency's
+    // pre/postinstall with that env.
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE", "hunter2");
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE_NEW", "hunter3");
+    vi.stubEnv("YAW_MCP_TOKEN", "mcp_pat_stale");
+    cp.calls.length = 0;
+    cp.children.length = 0;
+    try {
+      const io = captureIO();
+      const pending = runUpgrade({
+        run: true,
+        isSea: () => false,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => null,
+        oamProbe: oamProbe(false, MIN_OAM_VERSION),
+        // No spawnImpl: defaultSpawn runs, against the mocked child_process.
+        out: io.push,
+        err: io.pushErr,
+      });
+      // Let runUpgrade reach the spawn, then settle the child.
+      for (let i = 0; i < 100 && cp.calls.length === 0; i++) {
+        await new Promise<void>((r) => setImmediate(r));
+      }
+      expect(cp.calls).toHaveLength(1);
+      cp.children[0].emit("close", 0);
+      expect((await pending).exitCode).toBe(0);
+
+      const { cmd, args, opts } = cp.calls[0];
+      expect(cmd).toBe("npm");
+      expect(args).toEqual(["install", "-g", "@yawlabs/mcp@latest"]);
+      expect(opts).toMatchObject({ stdio: "inherit", shell: process.platform === "win32" });
+      const env = opts.env as NodeJS.ProcessEnv | undefined;
+      // An absent `env` option means "inherit process.env" -- the leaking shape.
+      expect(env).toBeDefined();
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE_NEW");
+      expect(env).not.toHaveProperty("YAW_MCP_TOKEN");
+      // A strip, not a blank env: npm still has to be found on PATH. The copy
+      // keeps process.env's own spelling of the key (`Path` on Windows).
+      const pathKey = Object.keys(env ?? {}).find((k) => k.toUpperCase() === "PATH");
+      expect(pathKey).toBeDefined();
+      expect(env?.[pathKey as string]).toBe(process.env.PATH);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  // After a `--run` whose child exited 0, the RUNNING copy's package.json is
+  // re-read. localInstallRoot's FIRST-segment rule is kept on purpose (it is
+  // what makes pnpm's `.pnpm/<pkg>/node_modules/@yawlabs/mcp` layout resolve to
+  // the right root), so a copy nested under another package's node_modules
+  // gets `npm install` in the top-level tree: npm adds a NEW top-level
+  // dependency, exits 0, and the nested copy the client spawns stays put.
+  // "OK: Upgraded" on its own was the silent wrong-tree upgrade the --prefix
+  // machinery exists to prevent; the check makes it visible.
+  describe("post --run verification of the running copy", () => {
+    const NESTED = "/proj/node_modules/foo/node_modules/@yawlabs/mcp/dist/index.js";
+    const NESTED_PKG_DIR = "/proj/node_modules/foo/node_modules/@yawlabs/mcp";
+
+    async function runNested(installedVersion: (pkgDir: string) => string | null, childExit = 0) {
+      const io = captureIO();
+      const spawned: Array<{ cmd: string; args: string[]; cwd?: string }> = [];
+      const installed = vi.fn(installedVersion);
+      const r = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: NESTED,
+        fetchLatest: async () => "0.45.0",
+        spawnImpl: async (cmd, args, cwd) => {
+          spawned.push({ cmd, args, cwd });
+          return childExit;
+        },
+        installedVersion: installed,
+        out: io.push,
+        err: io.pushErr,
+      });
+      return { io, spawned, installed, r };
+    }
+
+    it("warns on stderr, naming the nested directory, when the copy that ran is still on the old version", async () => {
+      const { io, spawned, installed, r } = await runNested(() => "0.40.0");
+      // The spawn itself is unchanged: first-segment root, no refusal.
+      expect(spawned).toEqual([{ cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: "/proj" }]);
+      // The check reads the LAST segment's package dir -- the copy that ran --
+      // not the tree npm ran in.
+      expect(installed).toHaveBeenCalledWith(NESTED_PKG_DIR);
+      // Advisory only: the child did succeed, and scripts branch on 0..3.
+      expect(r.exitCode).toBe(0);
+      expect(io.out.join("\n")).toContain("OK: Upgraded @yawlabs/mcp to 0.45.0");
+      const err = io.err.join("\n");
+      expect(err).toContain("WARNING");
+      expect(err).toContain("still reports 0.40.0, not 0.45.0");
+      expect(err).toContain(NESTED_PKG_DIR);
+      expect(err).toContain("different tree");
+    });
+
+    it("stays quiet when the running copy is NEWER than the pre-install fetch (dist-tag moved mid-run)", async () => {
+      // `latest` is fetched before the child runs and `@latest` resolves at
+      // install time, so a release cut between the two leaves the running copy
+      // AHEAD of the fetched value. Strict inequality called that the
+      // wrong-tree case; only an OLDER running copy is.
+      const { io, r } = await runNested(() => "0.46.0");
+      expect(r.exitCode).toBe(0);
+      expect(io.err.join("\n")).not.toContain("WARNING");
+    });
+
+    it("stays quiet when the running copy now reports the new version", async () => {
+      const { io, r } = await runNested(() => "0.45.0");
+      expect(r.exitCode).toBe(0);
+      expect(io.err).toEqual([]);
+    });
+
+    it("stays quiet when the running copy's version cannot be read -- unverifiable is not wrong", async () => {
+      const { io, installed, r } = await runNested(() => null);
+      expect(installed).toHaveBeenCalledTimes(1);
+      expect(r.exitCode).toBe(0);
+      expect(io.err).toEqual([]);
+    });
+
+    it("does not consult the running copy at all when the child failed", async () => {
+      const { installed, r } = await runNested(() => "0.40.0", 1);
+      expect(r.exitCode).toBe(3);
+      expect(installed).not.toHaveBeenCalled();
+    });
+
+    it("checks a global install too -- the tree a bare `npm install -g` may have missed", async () => {
+      const io = captureIO();
+      const installed = vi.fn(() => "0.40.0");
+      const r = await runUpgrade({
+        run: true,
+        currentVersion: "0.40.0",
+        argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
+        fetchLatest: async () => "0.45.0",
+        runningPrefix: async () => null,
+        spawnImpl: async () => 0,
+        installedVersion: installed,
+        out: io.push,
+        err: io.pushErr,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(installed).toHaveBeenCalledWith("/usr/lib/node_modules/@yawlabs/mcp");
+      expect(io.err.join("\n")).toContain("/usr/lib/node_modules/@yawlabs/mcp");
+    });
   });
 
   // --prefix pinning for global-npm: without it, `npm install -g` writes into
@@ -1424,7 +1831,7 @@ describe("runUpgrade", () => {
       currentVersion: "0.45.0",
       argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
-      oamProbe: oamProbe(true, "0.8.2"),
+      oamProbe: oamProbe(true, BELOW_FLOOR_OAM),
       out: io.push,
       err: io.pushErr,
     });
@@ -1432,7 +1839,7 @@ describe("runUpgrade", () => {
     expect(r.exitCode).toBe(0);
     const out = io.out.join("\n");
     expect(out).toContain("nothing to do");
-    expect(out).toContain("v0.8.2");
+    expect(out).toContain(`v${BELOW_FLOOR_OAM}`);
     expect(out).toContain("oam self-update");
     expect(out).toContain("run on node instead of oam");
     // The floor the note NAMES has to be the floor the spawn path enforces.
@@ -1442,13 +1849,21 @@ describe("runUpgrade", () => {
     expect(out).toContain(`below the v${MIN_OAM_VERSION} floor`);
   });
 
+  it("fixture sanity: the below-floor literal IS below MIN_OAM_VERSION, and the derived above-floor version IS above it", () => {
+    // The SUT reads only belowMin, so a fixture whose version contradicts the
+    // floor stays green while stating a relationship that is false -- and reads
+    // as a bug to whoever bumps the floor next. Pin the fixtures to the constant.
+    expect(compareVersions(BELOW_FLOOR_OAM, MIN_OAM_VERSION)).toBeLessThan(0);
+    expect(compareVersions(bumpPatch(MIN_OAM_VERSION), MIN_OAM_VERSION)).toBeGreaterThan(0);
+  });
+
   it("says nothing about oam when it is absent or already at/above the floor", async () => {
     const io = captureIO();
     await runUpgrade({
       currentVersion: "0.40.0",
       argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
-      oamProbe: oamProbe(false, "0.8.3"),
+      oamProbe: oamProbe(false, bumpPatch(MIN_OAM_VERSION)),
       out: io.push,
       err: io.pushErr,
     });
@@ -1469,7 +1884,7 @@ describe("runUpgrade", () => {
       currentVersion: "0.40.0",
       argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => "0.45.0",
-      oamProbe: oamProbe(true, "0.8.2"),
+      oamProbe: oamProbe(true, BELOW_FLOOR_OAM),
       out: io.push,
       err: io.pushErr,
     });
@@ -1521,7 +1936,7 @@ describe("runUpgrade", () => {
       currentVersion: "0.40.0",
       argvPath: "/usr/lib/node_modules/@yawlabs/mcp/dist/index.js",
       fetchLatest: async () => null,
-      oamProbe: oamProbe(true, "0.8.2"),
+      oamProbe: oamProbe(true, BELOW_FLOOR_OAM),
       out: io.push,
       err: io.pushErr,
     });

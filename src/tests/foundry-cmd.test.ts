@@ -7,7 +7,7 @@ import { DEFAULT_OUT, defaultLoadServers, FOUNDRY_USAGE, parseFoundryArgs, runFo
 import { DEFAULT_CORPUS_CAP } from "../foundry-corpus.js";
 import { localBundlesPath } from "../local-bundles.js";
 import { userConfigDir } from "../paths.js";
-import { statePath } from "../persistence.js";
+import { STATE_SCHEMA_VERSION, statePath } from "../persistence.js";
 import type { RankableServer } from "../relevance.js";
 
 const SERVERS: RankableServer[] = [
@@ -165,6 +165,35 @@ describe("runFoundryExport", () => {
     expect(r.exitCode).toBe(1);
   });
 
+  it("names both drop reasons in the zero-entries message, not just the catalog mismatch", async () => {
+    // buildCorpusFromTraces also drops every trace with an empty token bag
+    // (the header lists both causes), but the message blamed the catalog
+    // alone -- a harvest of empty bags read as "none of the chosen servers
+    // are in the local catalog".
+    const errs: string[] = [];
+    const r = await runFoundryExport({
+      out: join(dir, "c.json"),
+      cap: 500,
+      json: false,
+      readTraces: () =>
+        [
+          JSON.stringify({ tokens: ["a", "b"], chosen: "unknown" }),
+          JSON.stringify({ tokens: [], chosen: "github" }),
+          JSON.stringify({ tokens: [], chosen: "slack" }),
+        ].join("\n"),
+      loadServers: async () => SERVERS,
+      write: () => {},
+      writeErr: (s) => {
+        errs.push(s);
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    const msg = errs.join("");
+    expect(msg).toContain("3 traces but 0 usable entries");
+    expect(msg).toContain("1 chose a server that is not in the local catalog (2 servers)");
+    expect(msg).toContain("2 carried no tokens");
+  });
+
   it("reads the harvest off disk when no readTraces hook is injected", async () => {
     // The PRODUCTION path. Every other case here injects readTraces, so the
     // readFileSync fallback -- the only thing a maintainer actually runs --
@@ -261,7 +290,9 @@ describe("defaultLoadServers", () => {
     writeFileSync(
       statePath(userConfigDir(home)),
       JSON.stringify({
-        version: 2,
+        // Derived, not retyped: a schema bump would otherwise turn this into
+        // a version-mismatch test that still reads as "hydrates the tools".
+        version: STATE_SCHEMA_VERSION,
         savedAt: Date.now(),
         learning: {},
         packHistory: [],

@@ -43,17 +43,23 @@
 //     ANON_ID_PLACEHOLDER literal, and doctor's `postTryEvent` option. It
 //     had become an injection point that existed only to be injected: the
 //     default implementation was a no-op, so every test that passed one was
-//     overriding nothing with nothing. `--base` is still PARSED (an existing
-//     script passing it keeps working) but `try-cleanup` and the expiry GC
-//     no longer read it -- there is nothing left to address.
+//     overriding nothing with nothing. `--base` and $YAW_MCP_BASE_URL went
+//     with it: the value was parsed, threaded into the catalog seam and
+//     ignored there, so the flag was a no-op that --help still described as
+//     a base URL. It was accepted-and-ignored for one release (v0.79.x) and
+//     is now rejected as an unknown flag like any other.
+//   - A project-scope target (VS Code's .vscode/mcp.json is the only one
+//     `try` can reach) is commit-to-share config, and the trial entry carries
+//     its secret INLINE. Writing a plaintext credential into a file that
+//     `git add -A` sweeps up is refused unless --yes is passed; see step 5b.
 
 import { existsSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
-import { resolveCatalogSlug } from "./catalog.js";
-import { probeClientsAsync } from "./doctor-cmd.js";
+import { CATALOG_SLUG_RE, resolveCatalogSlug } from "./catalog.js";
+import { probeClientsAsync, probeUsable } from "./doctor-cmd.js";
 import { mergeClientConfig } from "./install-cmd.js";
 import {
   buildLaunchEntry,
@@ -85,12 +91,13 @@ export const TRY_USAGE = `Usage: yaw-mcp try <slug> [flags]
                        Required env vars not supplied here AND not in your
                        shell's env block the trial with an explainer.
   --dry-run            Print what would happen without writing anything.
-  --base <url>         Accepted and ignored (default: $YAW_MCP_BASE_URL or
-                       https://yaw.sh/mcp). Nothing addresses it any more:
-                       the catalog is read locally and no trial event is
-                       reported anywhere. Still parsed so an existing script
-                       passing it keeps working. Point the catalog somewhere
-                       else with $YAW_MCP_CATALOG_URL.`;
+  --yes, -y            Confirm writing an inline secret into a PROJECT-scope
+                       config (vscode's .vscode/mcp.json -- a per-project
+                       file that is routinely committed). Without it, a trial
+                       whose entry carries a secret refuses that target and
+                       says why; user-scope clients never need it.
+
+  Point the catalog somewhere else with $YAW_MCP_CATALOG_URL.`;
 
 export const TRY_CLEANUP_USAGE = `Usage: yaw-mcp try-cleanup <slug>
 
@@ -151,7 +158,10 @@ export interface TryCommandOptions {
   ttl?: string;
   envOverrides?: Record<string, string>;
   dryRun?: boolean;
-  baseUrl?: string;
+  /** `--yes`: write an inline secret into a project-scope (commit-to-share)
+   *  config anyway. Without it runTry refuses that combination -- see the
+   *  step-5b gate. Irrelevant to user-scope targets and secret-free trials. */
+  yes?: boolean;
   /** Override for tests. */
   home?: string;
   cwd?: string;
@@ -168,7 +178,7 @@ export interface TryCommandOptions {
    *  `catalogUrl` carries runTry's resolved $YAW_MCP_CATALOG_URL override
    *  (undefined when unset or empty) so the seam never has to read
    *  process.env behind the caller's injected `env`. */
-  fetchExplore?: (baseUrl: string, slug: string, catalogUrl?: string) => Promise<ExploreServerResponse>;
+  fetchExplore?: (slug: string, catalogUrl?: string) => Promise<ExploreServerResponse>;
   out?: (s: string) => void;
   err?: (s: string) => void;
   /** Override for tests; defaults to Date.now(). */
@@ -177,9 +187,6 @@ export interface TryCommandOptions {
 
 export interface TryCleanupOptions {
   slug?: string;
-  /** Parsed from `--base` and then ignored -- see the header note. Kept so
-   *  the flag stays accepted for scripts that still pass it. */
-  baseUrl?: string;
   home?: string;
   os?: InstallOS;
   out?: (s: string) => void;
@@ -194,8 +201,12 @@ export interface TryCommandResult {
   marker?: TrialMarker;
 }
 
-const DEFAULT_BASE_URL = "https://yaw.sh/mcp";
 const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1h
+
+// Slug shape `try` and `try-cleanup` accept is CATALOG_SLUG_RE from catalog.ts
+// -- the module that owns the slug set -- shared with `add` so the three
+// sites cannot drift. It also keeps the entry name and marker filename free
+// of shell-special characters.
 
 /** Parse argv slice for `yaw-mcp try`. Exported for tests. */
 export function parseTryArgs(
@@ -246,15 +257,12 @@ export function parseTryArgs(
       case "--dry-run":
         opts.dryRun = true;
         break;
-      case "--base": {
-        const v = next();
-        // Reject a following flag (e.g. `try slug --base --dry-run`, which
-        // would otherwise set baseUrl="--dry-run" and silently drop the
-        // dry-run flag). A URL never starts with "--".
-        if (!v || v.startsWith("--")) return { ok: false, error: "--base requires a URL" };
-        opts.baseUrl = v;
+      // -y / --yes is the spelling `trust` and `remove` accept for the same
+      // job (confirming a write the command would otherwise refuse).
+      case "-y":
+      case "--yes":
+        opts.yes = true;
         break;
-      }
       case "-h":
       case "--help":
         return { ok: false, error: TRY_USAGE, help: true };
@@ -284,15 +292,6 @@ export function parseTryCleanupArgs(
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") return { ok: false, error: TRY_CLEANUP_USAGE, help: true };
-    if (a === "--base") {
-      const v = argv[++i];
-      // Reject a following flag (e.g. `try-cleanup slug --base --help`, which
-      // would otherwise set baseUrl="--help" and swallow the flag). A URL
-      // never starts with "--". Mirrors parseTryArgs.
-      if (!v || v.startsWith("--")) return { ok: false, error: "--base requires a URL" };
-      opts.baseUrl = v;
-      continue;
-    }
     if (a.startsWith("--")) return { ok: false, error: `Unknown flag: ${a}\n${TRY_CLEANUP_USAGE}` };
     // Reject a bare "-" with a clear arg-parse error rather than deferring
     // to the slug regex's generic "invalid slug" message.
@@ -465,18 +464,13 @@ async function peelTrialEntry(marker: TrialMarker, dryRun = false): Promise<"rem
 // Resolve the launch shape from the SAME static catalog the website and the
 // Yaw Terminal app read (catalog.ts), so `try <slug>` accepts the exact slug
 // set the catalog shows. (The old /api/explore/:slug endpoint was never
-// deployed -- this is the path that actually works.) `baseUrl` is ignored
-// here and survives only as an injection seam for tests.
+// deployed -- this is the path that actually works.)
 //
 // `catalogUrl` is PASSED IN rather than read from process.env here: runTry
 // resolves every other env lookup through its injectable `opts.env`, and a
 // lone process.env read inside the seam means an embedded caller (or a test)
 // that supplies `env` is silently overridden by the ambient environment.
-async function defaultFetchExplore(
-  _baseUrl: string,
-  slug: string,
-  catalogUrl?: string,
-): Promise<ExploreServerResponse> {
+async function defaultFetchExplore(slug: string, catalogUrl?: string): Promise<ExploreServerResponse> {
   const resolved = await resolveCatalogSlug(slug, { catalogUrl });
   const out: ExploreServerResponse = {
     slug: resolved.slug,
@@ -492,10 +486,17 @@ async function defaultFetchExplore(
 /** Auto-detect which AI client to install the trial into. Probes in the
  *  same order as `yaw-mcp install --list` (claude-code -> claude-desktop ->
  *  cursor -> vscode, per INSTALL_TARGETS -- one slot per client AND scope),
- *  picking the first slot whose config file already EXISTS and parses.
- *  Failing that it takes the first client merely AVAILABLE on this OS, which
- *  is always claude-code (the most likely target) since that is first in
- *  INSTALL_TARGETS and ships on every InstallOS.
+ *  picking the first slot whose config file already EXISTS and could be read
+ *  and parsed (probeUsable). Failing that it takes the first client merely
+ *  AVAILABLE on this OS, which is always claude-code (the most likely target)
+ *  since that is first in INSTALL_TARGETS and ships on every InstallOS.
+ *
+ *  Readability is part of the gate, not just parseability: the probe reports
+ *  a read failure (a directory at ~/.claude.json, EACCES) as `unreadable`,
+ *  NOT `malformed`, and filtering on malformed alone picked such a file as
+ *  "the client in use" -- after which runTry aborted on the same read the
+ *  probe had just watched fail, while a readable ~/.cursor/mcp.json sat one
+ *  slot further along.
  *
  *  There is no writability probe: availability is decided by OS, not by
  *  whether the config directory can be written. A client whose directory is
@@ -515,10 +516,11 @@ async function autoDetectClient(opts: {
     claudeConfigDir: opts.claudeConfigDir,
     appData: opts.appData,
   });
-  // First: any client whose config file already exists (the user is
-  // actively using it).
+  // First: any client whose config file already exists AND whose contents
+  // doctor could read (the user is actively using it, and `try` will be able
+  // to splice into it).
   for (const p of probes) {
-    if (!p.unavailable && p.exists && !p.malformed) return p.clientId;
+    if (probeUsable(p)) return p.clientId;
   }
   // Second: any client that's available on this OS (config file not
   // yet created -- we'll create it). claude-code is availableOn every
@@ -545,11 +547,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     return { exitCode: 2, written: [] };
   }
   const slug = opts.slug;
-  // Slug validation: lowercase + digits + dashes only, the shape of the ids
-  // in the static catalog this resolves against (catalog.ts) -- identical to
-  // local-add-cmd.ts's SLUG_RE, which gates the same slug set for `add`.
-  // Keeps the entry-name and marker-filename free of shell-special chars.
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) {
+  if (!CATALOG_SLUG_RE.test(slug)) {
     printErr(`yaw-mcp try: invalid slug "${slug}" (lowercase letters, digits, and dashes only).`);
     return { exitCode: 2, written: [] };
   }
@@ -559,7 +557,6 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   const cwd = opts.cwd ?? process.cwd();
   const os = opts.os ?? CURRENT_OS;
   const now = opts.now ? opts.now() : Date.now();
-  const baseUrl = opts.baseUrl ?? env.YAW_MCP_BASE_URL ?? DEFAULT_BASE_URL;
   // The CLI pre-validates --ttl in parseTryArgs, so only programmatic callers
   // can reach this with an unparseable value -- error out rather than
   // silently substituting the 1h default (which would mask the caller's bug).
@@ -590,7 +587,7 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
     env.YAW_MCP_CATALOG_URL !== undefined && env.YAW_MCP_CATALOG_URL.length > 0 ? env.YAW_MCP_CATALOG_URL : undefined;
   let server: ExploreServerResponse;
   try {
-    server = await fetchExplore(baseUrl, slug, catalogUrl);
+    server = await fetchExplore(slug, catalogUrl);
   } catch (e) {
     printErr((e as Error).message);
     return { exitCode: 1, written: [] };
@@ -611,7 +608,9 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // requires extra flags we don't expose in `try` -- trials are
   // user-scoped by design).
   // VS Code has no user scope -- only workspace. Fall back to project
-  // scope when targeting vscode; the user must be inside the workspace.
+  // scope when targeting vscode; the user must be inside the workspace, and
+  // a secret-bearing entry then needs --yes (step 5b), because that file is
+  // commit-to-share config.
   const scope: InstallScope = clientId === "vscode" ? "project" : "user";
   const projectDir = scope === "project" ? resolve(cwd) : undefined;
   let resolved: ReturnType<typeof resolveInstallPath>;
@@ -712,6 +711,40 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
       env: Object.keys(trialEnv).length > 0 ? trialEnv : undefined,
     },
   });
+  // Whether the entry carries inline env: every value in it is a credential
+  // or a knob the user chose to persist. Decides two things -- the
+  // project-scope refusal right below, and the 0600 tightening in step 7.
+  const entryHasSecrets = entry.env !== undefined && Object.keys(entry.env).length > 0;
+
+  // Step 5b: refuse to write a secret into a commit-to-share file without an
+  // explicit --yes. A project-scope target is per-project config the client
+  // expects to be checked in (install-targets.ts labels VS Code's only scope
+  // "Workspace -- commit to share"), and unlike `add` the trial entry carries
+  // its values INLINE (see the divergence note above), so `git add -A` in
+  // that repo publishes the credential. Auto-detect makes this easy to hit
+  // by accident: a repo that ships .vscode/mcp.json is picked whenever no
+  // personal client config exists. The warning prints on stderr either way;
+  // --yes lifts only the refusal. It runs BEFORE the --dry-run return so a
+  // preview never promises a write the real run declines.
+  if (scope === "project" && entryHasSecrets) {
+    const target = INSTALL_TARGETS.find((t) => t.clientId === clientId);
+    const scopeSpec = target?.scopes.find((s) => s.scope === scope);
+    const where = `${target?.label ?? clientId}'s ${scopeSpec?.label ?? scope} config`;
+    const why = scopeSpec?.description ? ` (${scopeSpec.description})` : "";
+    const keys = Object.keys(entry.env ?? {}).join(", ");
+    printErr(
+      `yaw-mcp try: warning -- ${resolved.absolute} is ${where}${why}, and the trial entry writes ${keys} into it in plaintext. Committing that file publishes the value.`,
+    );
+    if (!opts.yes) {
+      const userScoped = INSTALL_TARGETS.filter(
+        (t) => t.availableOn.includes(os) && t.scopes.some((s) => s.scope === "user"),
+      ).map((t) => t.clientId);
+      printErr(
+        `yaw-mcp try: refusing to write it without --yes. Re-run with --yes to accept that (and keep the file out of version control), or target a user-scope client instead: --client ${userScoped.join("|")}`,
+      );
+      return { exitCode: 1, written: [] };
+    }
+  }
 
   const entryName = `${TRIAL_ENTRY_PREFIX}${slug}`;
   const expiresAt = now + ttlMs;
@@ -925,7 +958,6 @@ export async function runTry(opts: TryCommandOptions): Promise<TryCommandResult>
   // 0600 -- it may hold ANOTHER trial's inline secret, or the user may simply
   // have tightened it by hand. Only a genuinely new file lands at the umask
   // default.
-  const entryHasSecrets = entry.env !== undefined && Object.keys(entry.env).length > 0;
   const tightenPerms = entryHasSecrets && (opts.platform ?? process.platform) !== "win32";
   try {
     // Born-0600 on the create path closes the TOCTOU window where a 0644
@@ -1014,7 +1046,7 @@ export async function runTryCleanup(opts: TryCleanupOptions): Promise<TryCommand
     return { exitCode: 2, written: [] };
   }
   const slug = opts.slug;
-  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) {
+  if (!CATALOG_SLUG_RE.test(slug)) {
     printErr(`yaw-mcp try-cleanup: invalid slug "${slug}".`);
     return { exitCode: 2, written: [] };
   }

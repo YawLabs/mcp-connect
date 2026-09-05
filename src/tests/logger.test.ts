@@ -13,7 +13,6 @@ import { log } from "../logger.js";
 
 describe("log() spread-order: envelope fields win over data keys", () => {
   let stderrWrites: string[] = [];
-  let _originalWrite: typeof process.stderr.write;
 
   beforeEach(() => {
     stderrWrites = [];
@@ -22,7 +21,6 @@ describe("log() spread-order: envelope fields win over data keys", () => {
     // tests read back -- two would fail and the warn-level one would pass
     // vacuously. Pin the threshold below every level used here.
     vi.stubEnv("LOG_LEVEL", "debug");
-    _originalWrite = process.stderr.write.bind(process.stderr);
     vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       if (typeof chunk === "string") stderrWrites.push(chunk);
       else if (Buffer.isBuffer(chunk)) stderrWrites.push(chunk.toString("utf8"));

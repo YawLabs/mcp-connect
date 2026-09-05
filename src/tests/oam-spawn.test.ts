@@ -119,6 +119,22 @@ describe("isRegistrySpec", () => {
       expect(isRegistrySpec(bad), bad).toBe(false);
     }
   });
+
+  it("rejects a name npm itself refuses, since each one broke a different consumer", () => {
+    // validate-npm-package-name's rule: every part must survive
+    // encodeURIComponent unchanged. A backslash is a path separator to the
+    // Windows lookup (the traversal the leading-character guard exists to
+    // stop); `#`, `%`, `?` and a space land raw in the registry URL
+    // sidecar-refresh builds from the name. Every one of these passed the old
+    // "anything but a separator" shape.
+    for (const bad of ["foo\\bar", "foo#bar", "foo%bar", "foo?bar", "foo bar", "@sc#ope/x", "@scope/_x"]) {
+      expect(isRegistrySpec(bad), bad).toBe(false);
+    }
+    // ...without losing the punctuation npm does allow.
+    for (const ok of ["some.pkg", "under_score-mcp", "@yaw-labs/x.y~z", "a-b@1.0.0"]) {
+      expect(isRegistrySpec(ok), ok).toBe(true);
+    }
+  });
 });
 
 describe("parseOamVersion", () => {
@@ -1046,6 +1062,46 @@ describe("npmCacheDir", () => {
     }
   });
 
+  it("expands a ${VAR} reference from the environment, as npm's config layer does", () => {
+    // `cache=${XDG_CACHE_HOME}/npm` is how a dotfiles repo writes a relocated
+    // cache, and @npmcli/config's envReplace expands it for every value it
+    // loads from a file. Left literal it named a directory that exists on no
+    // machine, readdirSync threw, and every npx sidecar quietly stayed on npx.
+    // Plain double-quoted strings below, so JS does not interpolate what the
+    // npmrc has to carry verbatim.
+    const dir = join(tmpdir(), "cache-ENVREF");
+    process.env.YAW_MCP_TEST_NPMRC_CACHE = dir;
+    const bare = brokerWithNpmrc("${YAW_MCP_TEST_NPMRC_CACHE}");
+    const inPath = brokerWithNpmrc("${YAW_MCP_TEST_NPMRC_CACHE}/npm");
+    try {
+      expect(npmCacheDir(bare.url)).toBe(dir);
+      expect(npmCacheDir(inPath.url)).toBe(`${dir}/npm`);
+    } finally {
+      delete process.env.YAW_MCP_TEST_NPMRC_CACHE;
+      bare.cleanup();
+      inPath.cleanup();
+    }
+  });
+
+  it("keeps an escaped or unset ${VAR} reference literal, as npm does", () => {
+    // npm's two edge rules, mirrored so a value npm would leave alone is left
+    // alone here too: an odd run of backslashes escapes the reference (one
+    // backslash is consumed, the reference stays), and a name the environment
+    // does not carry stays as written rather than collapsing to "".
+    delete process.env.YAW_MCP_TEST_NPMRC_UNSET;
+    process.env.YAW_MCP_TEST_NPMRC_CACHE = join(tmpdir(), "cache-ENVREF");
+    const unset = brokerWithNpmrc("${YAW_MCP_TEST_NPMRC_UNSET}/npm");
+    const escaped = brokerWithNpmrc("\\${YAW_MCP_TEST_NPMRC_CACHE}");
+    try {
+      expect(npmCacheDir(unset.url)).toBe("${YAW_MCP_TEST_NPMRC_UNSET}/npm");
+      expect(npmCacheDir(escaped.url)).toBe("${YAW_MCP_TEST_NPMRC_CACHE}");
+    } finally {
+      delete process.env.YAW_MCP_TEST_NPMRC_CACHE;
+      unset.cleanup();
+      escaped.cleanup();
+    }
+  });
+
   // Every case below yields a cache dir that does not exist if it is decoded
   // wrong, after which readdirSync throws, npmCacheNpxNodeModules returns [],
   // and every npx sidecar quietly stays on npx -- indistinguishable from "no
@@ -1335,6 +1391,56 @@ describe("resolveNpmEntry", () => {
     const dir = writePkg(npx, "libonly", { name: "libonly", main: "lib/main.js" });
     try {
       expect(resolveNpmEntry("libonly", brokerUrl, null, null)).toBe(join(dir, "lib", "main.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  // The SHAPE of a package.json is as untrusted as its syntax: this reads
+  // every `_npx/<hash>` cache dir on the machine plus the managed tree. A
+  // malformed manifest used to throw a TypeError out of the connect path,
+  // where upstream wraps it as an ActivationError and its one-shot node
+  // respawn never fires (the rewrite was never applied) -- so the server
+  // failed to activate at all where a null would have kept it on npx for
+  // free. Written by hand rather than through writeManifest, which derives
+  // the files to create from a WELL-FORMED bin.
+
+  it("returns null, rather than throwing, for a bin that is not a string", async () => {
+    // `bin: {"x": 1}` reached isAbsolute, which throws ERR_INVALID_ARG_TYPE
+    // on a non-string instead of answering false.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = join(npx, "bbb", "node_modules", "badbin");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "badbin", bin: { x: 1 } }));
+    try {
+      expect(() => resolveNpmEntry("badbin", brokerUrl, null, null)).not.toThrow();
+      expect(resolveNpmEntry("badbin", brokerUrl, null, null)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns null for a manifest that is valid JSON but not a package object", async () => {
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = join(npx, "bbb", "node_modules", "nullpkg");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), "null");
+    try {
+      expect(() => resolveNpmEntry("nullpkg", brokerUrl, null, null)).not.toThrow();
+      expect(resolveNpmEntry("nullpkg", brokerUrl, null, null)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reads only the package's OWN bin keys, never Object.prototype's", async () => {
+    // `bin[unscoped]` on a package named "constructor" used to return Object's
+    // constructor function -- truthy, so it won the tier lookup and then threw
+    // out of isAbsolute. The first declared bin is the right answer.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = writePkg(npx, "constructor", { name: "constructor", bin: { "ctor-cli": "dist/index.js" } });
+    try {
+      expect(resolveNpmEntry("constructor", brokerUrl, null, null)).toBe(join(dir, "dist", "index.js"));
     } finally {
       cleanup();
     }
@@ -1760,11 +1866,13 @@ describe("resolveNpmEntry", () => {
   });
 });
 
-// probeOam runs execFileSync, which blocks the event loop, on the upstream
-// connect path of a single-threaded broker. Without a timeout an oam binary
-// that never returns wedges the whole hub. These pin both halves of the
-// contract: the bound exists, and exceeding it degrades to the same
-// node fallback that an absent oam already produces.
+// probeOam spawns `oam --version` asynchronously and settles on a deadline: the
+// timer resolves the probe whether or not the child ever exits, so a wedged
+// binary on the upstream connect path of a single-threaded broker cannot hold
+// the hub. (It was execFileSync until #91, and a synchronous probe with a
+// `timeout` still hung on an unkillable child -- see spawnVersionProbe.) These
+// pin both halves of the contract: the bound exists, and exceeding it degrades
+// to the same node fallback that an absent oam already produces.
 describe("probeOam timeout", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => resetOamBinCache());
@@ -1778,8 +1886,9 @@ describe("probeOam timeout", () => {
   });
 
   it("falls back to node when the probe times out", async () => {
-    // execFileSync throws ETIMEDOUT when the child exceeds `timeout`; the
-    // catch must produce the same result as "oam is not installed".
+    // The spawn's deadline rejects with `code: "ETIMEDOUT"` -- the shape
+    // execFileSync used to throw, kept so probeOam's catch is unchanged -- and
+    // that catch must produce the same result as "oam is not installed".
     const probe = await probeOam(async () => {
       const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
       err.code = "ETIMEDOUT";
@@ -2042,23 +2151,30 @@ describe("probeOam hardening", () => {
 });
 
 describe("MIN_OAM_VERSION freshness floor", () => {
-  it("is at least 0.13.0 (bump this literal when you bump the floor)", () => {
+  /** The ratchet. ONE literal, and the title is built from it, so the two
+   *  cannot say different numbers -- the title used to name 0.13.0 while the
+   *  body asserted 0.13.1. */
+  const FLOOR = "0.13.1";
+
+  it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
     // POLICY (see the constant's doc): the floor tracks the LATEST oam
     // release, bumped with every release. This literal-floor pin mirrors
     // the UV_VERSION freshness test in uv-bootstrap.test.ts: every other
     // MIN_OAM_VERSION assertion derives its fixture FROM the constant, so
-    // without this a stale floor was invisible to the suite. The contract
-    // is ONE-directional: the constant can never drop below this literal
-    // (a revert fails here); raising the constant without the literal
-    // passes and merely leaves this pin weak, so bump BOTH together.
+    // without this a stale floor was invisible to the suite. That makes this
+    // the ONE deliberate exception to the derive-from-constant rule: a floor
+    // derived from the constant would assert the constant against itself.
+    // The contract is ONE-directional: the constant can never drop below
+    // this literal (a revert fails here); raising the constant without the
+    // literal passes and merely leaves this pin weak, so bump BOTH together.
     // Catching a NEW upstream release still takes the release checklist --
     // a network-dependent freshness gate is deliberately out (see the
     // doctor-cmd stance on network in tests).
-    expect(compareVersions(MIN_OAM_VERSION, "0.13.1")).toBeGreaterThanOrEqual(0);
+    expect(compareVersions(MIN_OAM_VERSION, FLOOR)).toBeGreaterThanOrEqual(0);
   });
 });
 
-describe("resolveOamSpawn — unavailable-oam warning", () => {
+describe("resolveOamSpawn -- unavailable-oam warning", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => {
     resetOamBinCache();

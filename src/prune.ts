@@ -28,6 +28,13 @@
 //
 // Opt-out: set YAW_MCP_PRUNE_RESPONSES=0 to disable entirely and keep
 // the original bytes. In that mode responseBytesPruned == responseBytesRaw.
+//
+// NOT a security control. Nothing here inspects, redacts or truncates a
+// VALUE -- a large file blob, a base64 payload, an instruction-shaped string
+// all reach the model byte-for-byte (a whitespace collapse in text mode is
+// the only edit to content). Token savings is the whole job; any prompt-
+// injection or blob-redaction claim about "response pruning" describes a
+// feature this module does not have.
 
 import { setJsonKey } from "./json-key.js";
 

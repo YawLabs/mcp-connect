@@ -1,6 +1,17 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { CachedGrade } from "../grades-cache.js";
 import { gradesCachePath, readGradesCache, writeGrade } from "../grades-cache.js";
@@ -197,7 +208,7 @@ describe("writeGrade -- concurrent writes (serialization)", () => {
     const entryB: CachedGrade = { grade: "B", score: 80, gradedAt: "2026-06-11T01:00:00.000Z" };
 
     // Fire both writes concurrently without await between them so they both
-    // land on the chain before either read-modify-write starts.
+    // contend for the lock before either read-modify-write starts.
     await Promise.all([writeGrade("ns-a", entryA, synthHome), writeGrade("ns-b", entryB, synthHome)]);
 
     const disk = JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8")) as Record<string, unknown>;
@@ -218,6 +229,93 @@ describe("writeGrade -- concurrent writes (serialization)", () => {
     expect(disk.pre).toEqual(pre);
     expect(disk["new-a"]).toEqual(newA);
     expect(disk["new-b"]).toEqual(newB);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// writeGrade -- the cross-process lock
+// ---------------------------------------------------------------------------
+
+// Every production writeGrade runs in its own one-shot `yaw-mcp audit`
+// process, so the writers that collide on grades.json are PROCESSES, not
+// promises -- and the in-process chain this file used to test could not see a
+// second process at all: both audits loaded the pre-write snapshot and the
+// second rename dropped the first grade. The sidecar lock is what closes that.
+// These cases drive it from the outside, as another process would: a lock
+// file someone else holds, drops, or abandoned.
+describe("writeGrade -- cross-process lock", () => {
+  const lockPath = (home: string): string => `${gradesCachePath(home)}.lock`;
+
+  it("waits for a lock another process holds, then merges onto what that process wrote", async () => {
+    // The other audit holds the lock, publishes ITS grade while ours waits,
+    // then releases. Pre-lock, our write ignored the sidecar, read the empty
+    // cache and published {a} at once; the other process's {b} then landed
+    // second and `a` was gone -- both audits having printed "Cached to".
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(lockPath(synthHome), "other-process\n");
+    const ours = writeGrade("a", VALID_ENTRY, synthHome);
+    await delay(150);
+    // Still waiting: nothing published, and the holder's lock is untouched.
+    expect(existsSync(gradesCachePath(synthHome))).toBe(false);
+    expect(readFileSync(lockPath(synthHome), "utf8")).toBe("other-process\n");
+    const other: CachedGrade = { grade: "B", score: 80, gradedAt: "2026-06-11T01:00:00.000Z" };
+    writeGradesFile(synthHome, JSON.stringify({ b: other }));
+    rmSync(lockPath(synthHome));
+    await ours;
+    const disk = JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8")) as Record<string, unknown>;
+    expect(disk.a).toEqual(VALID_ENTRY);
+    expect(disk.b).toEqual(other);
+    // Released: nothing left behind for the next audit to wait on.
+    expect(existsSync(lockPath(synthHome))).toBe(false);
+  });
+
+  it("steals a lock whose holder is gone (older than the stale age) instead of waiting on it", async () => {
+    // An MCP client tearing the process tree down mid-audit leaves the lock
+    // behind. Its age is the only evidence of abandonment; a lock that could
+    // never be stolen would disable grade caching on this machine for good.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(lockPath(synthHome), "dead-process\n");
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(lockPath(synthHome), past, past);
+    const started = Date.now();
+    await writeGrade("gh", VALID_ENTRY, synthHome, { lockWaitMs: 5_000 });
+    // Stolen at once -- not after sitting out the wait budget.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8")).gh).toEqual(VALID_ENTRY);
+    // Neither the lock nor the renamed stale copy survives the steal.
+    expect(existsSync(lockPath(synthHome))).toBe(false);
+    expect(readdirSync(join(synthHome, CONFIG_DIRNAME)).filter((f) => f.includes(".lock"))).toEqual([]);
+  });
+
+  it("treats a lock dated further ahead of the clock than filesystem skew allows as stale too", async () => {
+    // A clock stepped backwards between two runs leaves a lock no live process
+    // on this clock could have written; honouring it would block every audit
+    // until wall-clock caught up.
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(lockPath(synthHome), "future\n");
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(lockPath(synthHome), future, future);
+    await writeGrade("gh", VALID_ENTRY, synthHome, { lockWaitMs: 5_000 });
+    expect(existsSync(lockPath(synthHome))).toBe(false);
+  });
+
+  it("gives up with a clear error when a live lock outlasts the wait budget, leaving the cache untouched", async () => {
+    // A holder that is alive but slow is not stolen; past the budget the write
+    // is refused rather than raced. audit-cmd reports that as exit 3 (grade
+    // computed, cache not written), which one re-audit repairs.
+    writeGradesFile(synthHome, JSON.stringify({ keep: VALID_ENTRY }));
+    writeFileSync(lockPath(synthHome), "slow-process\n");
+    await expect(writeGrade("gh", VALID_ENTRY, synthHome, { lockWaitMs: 200 })).rejects.toThrow(
+      /locked by another yaw-mcp audit/,
+    );
+    expect(JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8"))).toEqual({ keep: VALID_ENTRY });
+    // The holder's lock is still theirs.
+    expect(readFileSync(lockPath(synthHome), "utf8")).toBe("slow-process\n");
+  });
+
+  it("leaves no lock behind after an ordinary write", async () => {
+    await writeGrade("gh", VALID_ENTRY, synthHome);
+    expect(existsSync(lockPath(synthHome))).toBe(false);
   });
 });
 

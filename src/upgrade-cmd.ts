@@ -28,6 +28,20 @@
 //      can't be auto-upgraded (binary / dev-checkout / unknown)
 //   3  --run attempted the upgrade and the child process failed
 //
+// After a `--run` whose child exited 0, the RUNNING copy is checked too: the
+// package.json of the `@yawlabs/mcp` directory argv[1] was loaded from is
+// re-read (runningPackageDir), and when it still reports the old version --
+// the install landed in a different tree: a global prefix `--prefix` could
+// not pin, or a copy nested under another package's node_modules
+// (`/proj/node_modules/foo/node_modules/@yawlabs/mcp`, where localInstallRoot's
+// FIRST-segment rule installs a new top-level dependency into /proj and the
+// nested copy stays put) -- a WARNING naming that directory goes to stderr.
+// Advisory only: the exit code stays 0, because the child did succeed and
+// the 0..3 contract above is what scripts branch on. The first-segment rule
+// itself is kept on purpose: it is what makes pnpm's
+// `<root>/node_modules/.pnpm/<pkg>/node_modules/@yawlabs/mcp` layout resolve
+// to the correct root, so a nested copy is reported, not refused.
+//
 // OFFLINE — a scripting hazard of the same class as the 1→2 trap below.
 // When the registry can't be reached, staleness is UNKNOWN, and EVERY
 // method — including a stale global-npm — exits 0 after printing
@@ -58,7 +72,9 @@
 // have the shell do the right thing deterministically.
 
 import { spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { compareVersions, MIN_OAM_VERSION, type OamProbe, probeOam } from "./oam-spawn.js";
 
 declare const __VERSION__: string;
@@ -70,8 +86,9 @@ declare const __VERSION__: string;
  *  and its upgrade path is: install from npm, delete the old executable.
  *  Single source of truth for that message so upgrade / auto-upgrade /
  *  doctor all say the same thing. */
-export const BINARY_RETIRED_HINT =
-  "the standalone-binary track was retired in 0.70.3. Install from npm instead -- `npm install -g @yawlabs/mcp@latest` -- then delete this executable.";
+// Built below UPGRADE_COMMANDS (it needs the table) -- see BINARY_RETIRED_HINT
+// after upgradeCommandLine. Declared there rather than here so the command it
+// quotes is the table's global-npm line, never a second spelling of the spec.
 
 export interface UpgradeCommandOptions {
   /** When true, actually spawn the upgrade command. Runnable methods only --
@@ -108,6 +125,10 @@ export interface UpgradeCommandOptions {
   isSea?: () => boolean;
   /** Test hook: replace the `oam --version` probe behind the oam-floor note. */
   oamProbe?: () => OamProbe | Promise<OamProbe>;
+  /** Test hook: replace the post-`--run` read of the running copy's
+   *  package.json version (see defaultInstalledVersion). Null means "could not
+   *  read it", which skips the check rather than warning on a guess. */
+  installedVersion?: (pkgDir: string) => string | null | Promise<string | null>;
 }
 
 export interface UpgradeCommandResult {
@@ -248,23 +269,31 @@ export function parseUpgradeArgs(
  *  unreadable path throws and the literal answer stands, exactly as
  *  comparablePath degrades.
  *
- *  auto-upgrade's background upgrader shares this classifier, so it inherits
- *  the second chance too. That widens the set of installs it will
- *  `npm install -g --prefix` for -- deliberately, and only in the safe
- *  direction: the second pass can turn `unknown` into a marker match, never a
- *  marker match into something else, so a project tree (which classifies
- *  `local-node-modules` on the literal pass and is therefore never resolved)
- *  cannot become the `-g`-into-a-repo false positive the marker comments above
- *  warn about. The paths it newly reaches are genuine globals invoked through
- *  their bin shim -- for which detectRunningInstallPrefix already realpathed
- *  and already had the right `--prefix`; only the classification was missing. */
+ *  `resolveWhen` names the literal answers that get the second pass. The CLI
+ *  default is `unknown` only, for the pnpm reason above. auto-upgrade's
+ *  background upgrader shares this classifier and passes
+ *  `["unknown", "local-node-modules"]`: a `node_modules/@yawlabs/mcp` that is
+ *  a symlink into a global prefix (`npm link`, a bin shim staged into a
+ *  project tree) is a literal `local-node-modules` and would otherwise never
+ *  background-upgrade even though the bytes running belong to the global
+ *  install. (It used to keep its own copy of the realpath pass for that one
+ *  difference, one resolution-rule change away from drifting.) Widening is
+ *  safe in the direction that matters: a resolved path is re-classified by
+ *  the same markers, so a genuine project tree -- whose realpath is itself --
+ *  stays `local-node-modules` and cannot become the `-g`-into-a-repo false
+ *  positive the marker comments above warn about, and a marker match NOT in
+ *  `resolveWhen` (pnpm-global above all) is never second-guessed. The paths
+ *  the second pass newly reaches are genuine globals invoked through their
+ *  bin shim -- for which detectRunningInstallPrefix already realpathed and
+ *  already had the right `--prefix`; only the classification was missing. */
 export function detectInstallMethod(
   argvPath: string | undefined,
   realpath: (p: string) => string = realpathSync,
+  resolveWhen: readonly InstallMethod[] = ["unknown"],
 ): InstallMethod {
   if (!argvPath) return "unknown";
   const literal = classifyEntrypoint(argvPath);
-  if (literal !== "unknown") return literal;
+  if (!resolveWhen.includes(literal)) return literal;
   let resolved: string;
   try {
     resolved = realpath(argvPath);
@@ -349,6 +378,63 @@ export function localInstallRoot(argvPath: string | undefined): string | null {
   return idx > 0 ? argvPath.slice(0, idx) : null;
 }
 
+/** The `@yawlabs/mcp` package directory the RUNNING copy was loaded from --
+ *  the LAST `node_modules/@yawlabs/mcp` segment of argv[1] -- or null when no
+ *  such segment exists even after resolving a bin shim. The post-`--run`
+ *  check reads this directory's package.json to tell whether the copy the
+ *  client spawns actually moved.
+ *
+ *  LAST segment, where localInstallRoot takes the FIRST: that one names the
+ *  tree npm must run in, this one names the copy that is running, and for a
+ *  nested install (`/proj/node_modules/foo/node_modules/@yawlabs/mcp`) the two
+ *  legitimately differ -- which is exactly the mismatch the check reports.
+ *
+ *  The LITERAL path is tried first and the realpath only as a fallback, on
+ *  purpose: pnpm's global entry is a symlink into a versioned store dir, and
+ *  `pnpm add -g` repoints the link rather than rewriting the old target, so
+ *  the resolved path would keep reporting the pre-upgrade version forever
+ *  while the link already serves the new one. npm's bin shim is the other way
+ *  round -- the literal path carries no node_modules segment at all -- which
+ *  is what the fallback is for. `realpath` is injectable for the same reason
+ *  detectInstallMethod's is: unit-test paths exist on no filesystem. */
+export function runningPackageDir(
+  argvPath: string | undefined,
+  realpath: (p: string) => string = realpathSync,
+): string | null {
+  if (!argvPath) return null;
+  const literal = packageDirOf(argvPath);
+  if (literal !== null) return literal;
+  try {
+    return packageDirOf(realpath(argvPath));
+  } catch {
+    return null;
+  }
+}
+
+function packageDirOf(p: string): string | null {
+  const marker = "/node_modules/@yawlabs/mcp/";
+  // Separator normalization preserves length (same trick as localInstallRoot),
+  // so the index found in the normalized string slices the ORIGINAL and keeps
+  // drive letters and backslashes intact.
+  const idx = p.replace(/\\/g, "/").lastIndexOf(marker);
+  return idx === -1 ? null : p.slice(0, idx + marker.length - 1);
+}
+
+/** Version field of `<pkgDir>/package.json`, or null when it cannot be read or
+ *  carries no string version. Auto-skips under vitest (mirrors
+ *  npmGlobalPrefix): the fixtures' argv paths are fictional, and a real
+ *  install that happened to sit at one of them would make the check's outcome
+ *  depend on the machine. Tests inject opts.installedVersion. */
+function defaultInstalledVersion(pkgDir: string): string | null {
+  if (process.env.VITEST) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as { version?: unknown };
+    return typeof parsed.version === "string" ? parsed.version : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Ask npm where its global prefix actually is. Returns null when npm
  *  isn't reachable, exits non-zero, or doesn't answer within 3s — refinement
  *  is then skipped and the path-marker classification stands.
@@ -403,15 +489,32 @@ export function killProcessTree(
   child.kill();
 }
 
-export async function npmGlobalPrefix(): Promise<string | null> {
+/** The subset of child_process.spawn the prefix probe uses. Injectable so a
+ *  test can reach the spawn OPTIONS -- the env strip below -- which the VITEST
+ *  short-circuit otherwise keeps unreachable. */
+export type ProbeSpawn = (
+  cmd: string,
+  args: string[],
+  opts: { shell: boolean; stdio: ["ignore", "pipe", "ignore"]; env: NodeJS.ProcessEnv },
+) => KillableChild & {
+  stdout?: { on(event: "data", listener: (chunk: unknown) => void): unknown } | null;
+  on(event: string, listener: (...args: any[]) => void): unknown;
+};
+
+export async function npmGlobalPrefix(spawnImpl?: ProbeSpawn): Promise<string | null> {
   // Auto-skip under vitest (mirrors doctor-cmd's registry probe) so unit
   // tests never spawn a real npm; tests exercising refinement inject
-  // their own probe via opts.npmPrefix.
-  if (process.env.VITEST) return null;
+  // their own probe via opts.npmPrefix, and a test of THIS function's spawn
+  // injects the spawn itself.
+  if (process.env.VITEST && !spawnImpl) return null;
+  const spawnFn = spawnImpl ?? (spawn as unknown as ProbeSpawn);
   return new Promise((resolve) => {
-    const child = spawn("npm", ["prefix", "-g"], {
+    const child = spawnFn("npm", ["prefix", "-g"], {
       shell: process.platform === "win32",
       stdio: ["ignore", "pipe", "ignore"],
+      // Even a read-only `npm prefix -g` is an npm invocation: yaw-mcp's own
+      // secrets do not ride into it. See internal-secret-env.ts.
+      env: stripInternalSecretsFromEnv(process.env),
     });
     let out = "";
     const timer = setTimeout(() => {
@@ -480,6 +583,82 @@ export async function refineInstallMethod(
   return method;
 }
 
+/** The package spec every whitelisted upgrade installs -- `@latest`, never a
+ *  pinned version, so a stale copy always moves to the newest publish. */
+export const UPGRADE_PACKAGE_SPEC = "@yawlabs/mcp@latest";
+
+/** The ONE whitelisted upgrade command per install method -- the only
+ *  commands `upgrade --run` and the background self-upgrade ever spawn, and
+ *  the text every printed suggestion, --json snapshot and log hint derives
+ *  from. Null means nothing is spawnable for that method: npx and bundled-app
+ *  have nothing to run, and binary / dev-checkout / unknown are manual
+ *  (buildUpgradePlan still prints advice for those; runUpgrade refuses --run).
+ *
+ *  This used to be spelled in four places -- buildUpgradePlan's switch,
+ *  runUpgrade's runSpec, auto-upgrade's globalSpec and its corrective-command
+ *  hint -- so a change to the package spec or a new tool had to land in all
+ *  four or they drifted. Every arg list ends in UPGRADE_PACKAGE_SPEC;
+ *  upgradeSpawnSpec relies on that to place `--prefix`. */
+export const UPGRADE_COMMANDS: Readonly<
+  Record<InstallMethod, Readonly<{ cmd: string; args: readonly string[] }> | null>
+> = {
+  "global-npm": { cmd: "npm", args: ["install", "-g", UPGRADE_PACKAGE_SPEC] },
+  "pnpm-global": { cmd: "pnpm", args: ["add", "-g", UPGRADE_PACKAGE_SPEC] },
+  "bun-global": { cmd: "bun", args: ["add", "-g", UPGRADE_PACKAGE_SPEC] },
+  "local-node-modules": { cmd: "npm", args: ["install", UPGRADE_PACKAGE_SPEC] },
+  npx: null,
+  "bundled-app": null,
+  "dev-checkout": null,
+  binary: null,
+  unknown: null,
+};
+
+/** The global-install methods -- the ones the background self-upgrade may act
+ *  on with the owning tool; everything else it only logs about. */
+export const GLOBAL_UPGRADE_METHODS: readonly InstallMethod[] = ["global-npm", "pnpm-global", "bun-global"];
+
+/** The spawn argv for `method`, or null when nothing is spawnable. For
+ *  global-npm a non-null `prefixArg` inserts `--prefix <prefixArg>` ahead of
+ *  the package spec; the CALLER decides whether that value is the raw path
+ *  (POSIX, no shell) or the shell-quoted form (win32, shell:true) -- see
+ *  quoteShellArgIfNeeded in auto-upgrade.ts. Ignored for every other method:
+ *  `pnpm add -g --prefix` is not a real flag. A fresh array every call, so a
+ *  caller may push onto it without editing the table. */
+export function upgradeSpawnSpec(
+  method: InstallMethod,
+  prefixArg: string | null = null,
+): { cmd: string; args: string[] } | null {
+  const base = UPGRADE_COMMANDS[method];
+  if (base === null) return null;
+  const args = [...base.args];
+  if (method === "global-npm" && prefixArg !== null) args.splice(args.length - 1, 0, "--prefix", prefixArg);
+  return { cmd: base.cmd, args };
+}
+
+/** The printed / pasteable form of the whitelisted command for `method` (no
+ *  `--prefix` -- that is the caller's display-quoting decision), or null when
+ *  there is nothing to spawn. */
+export function upgradeCommandLine(method: InstallMethod): string | null {
+  const spec = upgradeSpawnSpec(method);
+  return spec === null ? null : [spec.cmd, ...spec.args].join(" ");
+}
+
+/** What `upgrade` / `doctor` say to a user running the retired standalone
+ *  binary: its upgrade path is install from npm, delete the old executable.
+ *  Single source of truth for that message so upgrade / auto-upgrade / doctor
+ *  all say the same thing, and the command it quotes is the table's own
+ *  global-npm line rather than a hand-typed copy of the package spec. */
+export const BINARY_RETIRED_HINT = `the standalone-binary track was retired in 0.70.3. Install from npm instead -- \`${upgradeCommandLine("global-npm")}\` -- then delete this executable.`;
+
+/** The manual command for the GLOBAL install that `tool` (npm / pnpm / bun)
+ *  owns, or null for a tool the table does not know. auto-upgrade's failure
+ *  hint: its spawn callback is handed the tool, not the method. Global only,
+ *  so npm resolves to the `-g` line and never to local-node-modules'. */
+export function globalUpgradeCommandLineForTool(tool: string): string | null {
+  const method = GLOBAL_UPGRADE_METHODS.find((m) => UPGRADE_COMMANDS[m]?.cmd === tool);
+  return method === undefined ? null : upgradeCommandLine(method);
+}
+
 /** Assemble the upgrade plan from method + version info. Single source
  *  of truth for both the prose and --json paths. */
 export function buildUpgradePlan(input: {
@@ -497,34 +676,29 @@ export function buildUpgradePlan(input: {
   const stripV = (s: string): string => (s.startsWith("v") ? s.slice(1) : s);
   const stale = latest !== null && current !== "dev" && compareVersions(stripV(current), stripV(latest)) < 0;
 
+  // The spawnable methods print exactly the line --run would execute (from
+  // UPGRADE_COMMANDS); the rest are the advice-only cases.
   let command: string | null;
   switch (method) {
-    case "global-npm":
-      command = "npm install -g @yawlabs/mcp@latest";
-      break;
-    case "pnpm-global":
-      command = "pnpm add -g @yawlabs/mcp@latest";
-      break;
-    case "bun-global":
-      command = "bun add -g @yawlabs/mcp@latest";
-      break;
     case "npx":
       command = null; // npx -y refreshes on its own; nothing to run.
       break;
     case "bundled-app":
       command = null; // ships inside Yaw Terminal; updates with the app.
       break;
-    case "local-node-modules":
-      command = "npm install @yawlabs/mcp@latest";
+    case "binary":
+      command = null; // standalone binary -- replace the executable manually.
       break;
     case "dev-checkout":
       command = "git pull && npm run build";
       break;
-    case "binary":
-      command = null; // standalone binary — replace the executable manually.
+    case "unknown":
+      // Best guess for an unrecognized path: the global install line, as
+      // copy-paste advice only (runUpgrade refuses --run for `unknown`).
+      command = upgradeCommandLine("global-npm");
       break;
     default:
-      command = "npm install -g @yawlabs/mcp@latest";
+      command = upgradeCommandLine(method);
       break;
   }
   return { current, latest, stale, method, command };
@@ -662,7 +836,16 @@ async function defaultRunningPrefix(argvPath: string | undefined): Promise<strin
 
 async function defaultSpawn(cmd: string, args: string[], cwd?: string): Promise<number> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: "inherit", shell: process.platform === "win32", cwd });
+    const child = spawn(cmd, args, {
+      stdio: "inherit",
+      shell: process.platform === "win32",
+      cwd,
+      // yaw-mcp's own secrets stay out of the install: npm runs every
+      // dependency's pre/postinstall with this env, and a passphrase parked
+      // in yaw-mcp's env block (where README says to put it) must not reach
+      // them. See internal-secret-env.ts.
+      env: stripInternalSecretsFromEnv(process.env),
+    });
     child.on("close", (code) => resolve(typeof code === "number" ? code : 1));
     child.on("error", () => resolve(1));
   });
@@ -758,7 +941,12 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
       // and every printed suggestion from ever disagreeing.
       if (spawnForm !== null && displayForm !== null) {
         globalPrefixArg = spawnForm;
-        suggestedCommand = `npm install -g --prefix ${displayForm} @yawlabs/mcp@latest`;
+        // Derived from the same table the spawn argv comes from, so the
+        // printed suggestion and the --json `command` cannot say a different
+        // package spec than `--run` spawns (this was the one hand-spelled
+        // copy left after UPGRADE_COMMANDS became the single source).
+        const spec = upgradeSpawnSpec("global-npm", displayForm);
+        suggestedCommand = spec === null ? null : [spec.cmd, ...spec.args].join(" ");
       }
     }
   }
@@ -803,11 +991,11 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
       }
       print(`  ${suggestedCommand}`);
     } else if (method === "bundled-app") {
-      print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app — nothing to run.");
+      print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app -- nothing to run.");
     } else if (method === "binary") {
       print(`yaw-mcp is a standalone binary; ${BINARY_RETIRED_HINT}`);
     } else {
-      print("Your install uses `npx -y` — just restart the MCP client when you're back online.");
+      print("Your install uses `npx -y` -- just restart the MCP client when you're back online.");
     }
     // The oam floor probe is LOCAL (`oam --version`); an unreachable npm
     // registry says nothing about it. Skipping the note here used to hide the
@@ -831,13 +1019,16 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   }
 
   print("");
+  // ASCII punctuation in every printed line: these go straight to the user's
+  // terminal, where a Unicode dash renders as mojibake under a Windows console
+  // codepage and then travels, mangled, into bug reports.
   if (method === "npx") {
-    print("Your install uses `npx -y` — restart the MCP client and it will fetch the new version.");
+    print("Your install uses `npx -y` -- restart the MCP client and it will fetch the new version.");
     return { exitCode: 0, lines };
   }
 
   if (method === "bundled-app") {
-    print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app —");
+    print("This copy of yaw-mcp ships inside Yaw Terminal and updates with the app --");
     print("there is nothing to run here. Update Yaw Terminal to get the new version.");
     return { exitCode: 0, lines };
   }
@@ -850,7 +1041,7 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
     // refusal must not have to know which non-runnable method it happened to
     // hit.
     const emit = opts.run ? printErr : print;
-    emit("yaw-mcp is running as a standalone binary — manual upgrade required.");
+    emit("yaw-mcp is running as a standalone binary -- manual upgrade required.");
     emit(`There's no package manager to upgrade it, and \`--run\` can't automate this: ${BINARY_RETIRED_HINT}`);
     // 1→2 scripting trap (see the "SCRIPTING TRAP" note in the file header):
     // plain `upgrade` returns 1, but `--run` returns 2 because a binary can
@@ -865,28 +1056,24 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   // their global stores. dev-checkout stays manual — the user owns that
   // tree and the right command depends on their setup. unknown stays
   // manual because we don't know which install we'd be mutating.
+  // One whitelist for every spawn surface: UPGRADE_COMMANDS. The `--prefix`
+  // arg rides in only for global-npm, and only when it survived quoting.
+  const spec = upgradeSpawnSpec(method, globalPrefixArg);
+  // The `installRoot !== null` guard is defensive-dead, kept only so a future
+  // localInstallRoot change cannot produce `cwd: undefined` and silently
+  // install into the process cwd: localInstallRoot returns null exactly when
+  // `/node_modules/` sits at index 0, i.e. a node_modules directory at the
+  // filesystem root, which no real classification produces
+  // (detectInstallMethod only labels a path local-node-modules when there is a
+  // tree above it).
   const runSpec: { cmd: string; args: string[]; cwd?: string } | null =
-    method === "global-npm"
-      ? {
-          cmd: "npm",
-          args: globalPrefixArg
-            ? ["install", "-g", "--prefix", globalPrefixArg, "@yawlabs/mcp@latest"]
-            : ["install", "-g", "@yawlabs/mcp@latest"],
-        }
-      : method === "pnpm-global"
-        ? { cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] }
-        : method === "bun-global"
-          ? { cmd: "bun", args: ["add", "-g", "@yawlabs/mcp@latest"] }
-          : // The `installRoot !== null` arm is defensive-dead, kept only so a
-            // future localInstallRoot change cannot produce `cwd: undefined`
-            // and silently install into the process cwd: localInstallRoot
-            // returns null exactly when `/node_modules/` sits at index 0, i.e.
-            // a node_modules directory at the filesystem root, which no real
-            // classification produces (detectInstallMethod only labels a path
-            // local-node-modules when there is a tree above it).
-            method === "local-node-modules" && installRoot !== null
-            ? { cmd: "npm", args: ["install", "@yawlabs/mcp@latest"], cwd: installRoot }
-            : null;
+    spec === null
+      ? null
+      : method === "local-node-modules"
+        ? installRoot !== null
+          ? { ...spec, cwd: installRoot }
+          : null
+        : spec;
   // Print the line we actually spawn, in its paste-safe display form: once
   // `--prefix` is in the argv, a bare `npm install -g` would promise a
   // different install than --run performs -- and "run it yourself" must
@@ -941,6 +1128,31 @@ export async function runUpgrade(opts: UpgradeCommandOptions = {}): Promise<Upgr
   if (code === 0) {
     print("");
     print(`OK: Upgraded @yawlabs/mcp to ${latest}`);
+    // The child succeeded, but did the RUNNING copy move? Re-read the version
+    // of the package directory argv[1] was loaded from. A copy still on the
+    // old version means the install landed in another tree -- a global prefix
+    // `--prefix` could not pin, or a copy nested under another package's
+    // node_modules, where localInstallRoot's first-segment rule installs a new
+    // top-level dependency and leaves the nested copy alone -- and "OK:
+    // Upgraded" on its own would have been the silent wrong-tree upgrade the
+    // prefix machinery exists to prevent. Advisory: stderr, exit code
+    // unchanged (see the header). Unreadable means unverifiable, and
+    // unverifiable stays quiet rather than crying wolf.
+    const pkgDir = runningPackageDir(argvPath);
+    const running = pkgDir === null ? null : await (opts.installedVersion ?? defaultInstalledVersion)(pkgDir);
+    // OLDER than the fetched latest, not merely different: `latest` was
+    // fetched before the child ran and `@latest` resolves the dist-tag at
+    // install time, so a copy that comes back NEWER than the pre-install fetch
+    // landed exactly where it should and is not the wrong-tree case.
+    const bare = (s: string): string => (s.startsWith("v") ? s.slice(1) : s);
+    if (running !== null && compareVersions(bare(running), bare(latest)) < 0) {
+      printErr("");
+      printErr(`WARNING: the copy this command ran from still reports ${running}, not ${latest}:`);
+      printErr(`  ${pkgDir}`);
+      printErr(
+        "The install landed in a different tree, so your MCP client keeps spawning the old version until that tree is upgraded too (for a copy nested under another package's node_modules, upgrade the package that pins it).",
+      );
+    }
     return { exitCode: 0, lines };
   }
   printErr(`yaw-mcp upgrade: ${runSpec.cmd} exited ${code}. Try running the command yourself:`);

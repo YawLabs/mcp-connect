@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { request } from "undici";
+import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import { cacheDir } from "./paths.js";
 
@@ -37,7 +38,7 @@ import { cacheDir } from "./paths.js";
  *
  * Exported for the test that pins the freshness floor.
  */
-export const UV_VERSION = "0.12.5";
+export const UV_VERSION = "0.12.10";
 const RELEASE_BASE = `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}`;
 
 // glibc vs musl. Node's diagnostic report carries `glibcVersionRuntime` on
@@ -138,6 +139,9 @@ export async function onPath(cmd: string): Promise<boolean> {
         // outright on hosts with no route to github.com.
         shell: process.platform === "win32",
         windowsHide: process.platform === "win32",
+        // uv is a binary yaw-mcp did not write; README promises the vault
+        // passphrase is stripped from every child yaw-mcp starts.
+        env: stripInternalSecretsFromEnv(process.env),
       });
     } catch {
       settle(false);
@@ -356,6 +360,9 @@ export function runCommand(cmd: string, args: string[], timeoutMs: number = UV_E
         stdio: ["ignore", "ignore", "pipe"],
         shell: false,
         windowsHide: process.platform === "win32",
+        // Same rule as the probe above: a child yaw-mcp did not write never
+        // sees yaw-mcp's own secrets.
+        env: stripInternalSecretsFromEnv(process.env),
       });
     } catch (err) {
       reject(err);
@@ -472,7 +479,17 @@ async function resolveUv(): Promise<string> {
   const archiveUrl = `${RELEASE_BASE}/${archiveName}`;
   const shaUrl = `${archiveUrl}.sha256`;
 
-  const [archiveBuf, shaBuf] = await Promise.all([fetchWithRedirects(archiveUrl), fetchWithRedirects(shaUrl)]);
+  // The .sha256 sidecar FIRST, then the archive -- sequential on purpose. A
+  // Promise.all over the two let the tiny sidecar fetch reject first (a 404
+  // right after a UV_VERSION bump outruns Astral's upload; a DNS blip) while
+  // the 18-23 MB archive download carried on into memory with nothing to
+  // cancel it: each fetch arms its own AbortSignal.timeout and nothing aborted
+  // the survivor, so the rejection the caller saw was followed by up to
+  // UV_FETCH_TOTAL_MS of wasted transfer. Sidecar-first costs one extra round
+  // trip (milliseconds against a multi-second download) and makes every
+  // "asset is missing" failure fail before a byte of the archive moves.
+  const shaBuf = await fetchWithRedirects(shaUrl);
+  const archiveBuf = await fetchWithRedirects(archiveUrl);
 
   const expected = shaBuf.toString("utf8").trim().split(/\s+/)[0];
   const actual = createHash("sha256").update(archiveBuf).digest("hex");

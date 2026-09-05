@@ -108,7 +108,35 @@ function rankCold(query: string, corpus: ReturnType<typeof makeCorpus>) {
 }
 
 // Default keeps `npm test` fast; raise for a deeper sweep without editing code.
-const ITERATIONS = Number(process.env.YAW_RELEVANCE_PROPERTY_ITERATIONS ?? 400);
+//
+// Parsed defensively: Number("abc") is NaN and `i < NaN` is false, so a typo'd
+// value used to run every loop below ZERO times and pass all four properties
+// vacuously under a title reading "across NaN randomized corpora". Anything
+// that does not floor to a positive integer falls back to the default.
+function resolveIterations(raw: string | undefined, fallback = 400): number {
+  if (raw === undefined) return fallback;
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n >= 1 ? n : fallback;
+}
+const ITERATIONS = resolveIterations(process.env.YAW_RELEVANCE_PROPERTY_ITERATIONS);
+
+describe("resolveIterations", () => {
+  it("falls back to the default instead of running zero iterations on a bad value", () => {
+    expect(resolveIterations(undefined)).toBe(400);
+    expect(resolveIterations("abc")).toBe(400);
+    expect(resolveIterations("")).toBe(400);
+    expect(resolveIterations("0")).toBe(400);
+    expect(resolveIterations("-5")).toBe(400);
+    expect(resolveIterations("0.5")).toBe(400);
+    expect(resolveIterations("Infinity")).toBe(400);
+    expect(resolveIterations("12.7")).toBe(12);
+    expect(resolveIterations("50")).toBe(50);
+  });
+
+  it("never lets the property suite below run vacuously", () => {
+    expect(Number.isInteger(ITERATIONS) && ITERATIONS >= 1).toBe(true);
+  });
+});
 
 describe("relevance cache property: cached rank === freshly built rank", () => {
   it(`agrees exactly across ${ITERATIONS} randomized corpora`, () => {

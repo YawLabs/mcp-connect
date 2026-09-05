@@ -1,5 +1,9 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveComplianceSuiteVersion } from "../audit-cmd.js";
 import {
@@ -8,12 +12,18 @@ import {
   formatLaunchFailure,
   INTERRUPT_EXIT_CODE,
   isRenderableReport,
+  locateComplianceSuite,
   PUBLISH_REMOVED_MESSAGE,
   resolveComplianceSuiteSpec,
   resolveNpxLaunch,
+  resolveSuiteLaunch,
   runComplianceCommand,
   TERMINATED_EXIT_CODE,
 } from "../compliance-cmd.js";
+
+/** The path of the suite's launcher inside its package dir, separator-
+ *  agnostic: the SUT joins with the host's path flavour. */
+const LOCAL_BIN_RE = /node_modules[\\/]@yawlabs[\\/]mcp-compliance[\\/]bin[\\/]mcp-compliance\.mjs$/;
 
 function captureIo() {
   const out: string[] = [];
@@ -27,7 +37,7 @@ function captureIo() {
 
 // Only the pre-spawn arg paths are exercised here (--help and missing
 // <target>). Both return before spawning the mcp-compliance child, so these
-// tests never touch the network or npx.
+// tests never launch the suite -- neither the installed copy nor npx.
 describe("runComplianceCommand arg handling", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -102,7 +112,7 @@ describe("runComplianceCommand arg handling", () => {
     // The prefix match is anchored on `--publish=`, not on "--publish": a
     // bare startsWith would swallow a hypothetical `--publisher` and refuse a
     // flag that was never removed. Spawn is mocked so the forwarding path can
-    // be exercised without launching npx.
+    // be exercised without launching the suite.
     const report = {
       grade: "A",
       score: 100,
@@ -153,7 +163,9 @@ describe("runComplianceCommand arg handling", () => {
   });
 });
 
-// The spawn strategy. `spawn("npx.cmd", ...)` throws EINVAL synchronously on
+// The FALLBACK spawn strategy, for a build with no @yawlabs/mcp-compliance
+// installed beside it (resolveSuiteLaunch runs the installed bin first -- see
+// its own block below). `spawn("npx.cmd", ...)` throws EINVAL synchronously on
 // every patched Node on Windows (CVE-2024-27980 hardening), so the launcher
 // resolves npm's npx-cli.js and runs it with the current node binary instead.
 describe("resolveNpxLaunch", () => {
@@ -292,16 +304,19 @@ describe("resolveNpxLaunch", () => {
   }, 60_000);
 });
 
-// The diagnostic printed when BOTH strategies are out (no npx-cli.js on disk
-// AND an argument we refuse to shell-quote). quoteForShell rejects a different
-// character set per platform -- `%` only on win32, `'` only on POSIX -- so a
-// message that always says "quotes / newlines" names nothing actually at fault
-// for a percent-encoded target.
+// The diagnostic printed when EVERY strategy is out (no installed suite, no
+// npx-cli.js on disk AND an argument we refuse to shell-quote). quoteForShell
+// rejects a different character set per platform -- `%` only on win32, `'`
+// only on POSIX -- so a message that always says "quotes / newlines" names
+// nothing actually at fault for a percent-encoded target.
 describe("formatLaunchFailure", () => {
   it("names the win32 character class and echoes the offending % argument", () => {
     const msg = formatLaunchFailure(["-y", "pkg", "https://example.com/%7Bid%7D"], "win32");
-    // Installing npm stays the leading remedy -- it removes the shell path.
+    // Two remedies remove the shell path outright: npm (npx-cli.js) and the
+    // suite itself, which a reinstall of @yawlabs/mcp brings back beside it.
     expect(msg).toContain("Install npm");
+    expect(msg).toContain("reinstall @yawlabs/mcp");
+    expect(msg).toContain("not installed beside yaw-mcp");
     expect(msg).toContain("percent signs");
     expect(msg).toContain('"https://example.com/%7Bid%7D"');
     // `%` is inert on POSIX; don't send a Windows operator after single quotes.
@@ -325,12 +340,13 @@ describe("formatLaunchFailure", () => {
   });
 
   it("still explains itself if no single argument is to blame (direct callers only)", () => {
-    // Not a production shape: runTest reaches formatLaunchFailure only when
-    // resolveNpxLaunch returned null, which happens only after quoteForShell
-    // refused one of these same arguments -- so an offender is always found on
-    // that path and this branch is defensive. Pinned anyway, because the
-    // alternative it guards against is rendering `undefined` into the
-    // diagnostic if resolveNpxLaunch ever gains another way to fail.
+    // Not a production shape: runComplianceCommand reaches formatLaunchFailure
+    // only when resolveSuiteLaunch's npx fallback came back null, which
+    // happens only after quoteForShell refused one of these same arguments --
+    // so an offender is always found on that path and this branch is
+    // defensive. Pinned anyway, because the alternative it guards against is
+    // rendering `undefined` into the diagnostic if resolveNpxLaunch ever gains
+    // another way to fail.
     const msg = formatLaunchFailure(["-y", "pkg"], "linux");
     expect(msg).toContain("Install npm");
     expect(msg).toContain("cannot be safely quoted");
@@ -353,9 +369,11 @@ describe("formatLaunchFailure", () => {
 });
 
 // Wiring: the unlaunchable path inside runComplianceCommand must print THAT
-// message, not a hardcoded one. node:fs is mocked so no npx-cli.js resolves,
-// and the platform is pinned so the assertion holds on any CI runner. The
-// command returns before spawning anything.
+// message, not a hardcoded one. node:fs's existsSync is mocked so neither the
+// installed suite's bin nor any npx-cli.js is "on disk" (the manifest is still
+// read through node:fs/promises, so the fallback spec stays pinned), and the
+// platform is pinned so the assertion holds on any CI runner. The command
+// returns before spawning anything.
 describe("runComplianceCommand unlaunchable path", () => {
   it("surfaces the platform-accurate message and exits 1 without spawning", async () => {
     vi.resetModules();
@@ -376,9 +394,12 @@ describe("runComplianceCommand unlaunchable path", () => {
       // which appears in this target -- `%` is what quoteForShell rejected.
       expect(cap.err()).toContain("percent signs");
       expect(cap.err()).toContain(target);
-      expect(cap.err()).toBe(
-        mod.formatLaunchFailure(["-y", "@yawlabs/mcp-compliance", "test", "--format", "json", target], "win32"),
-      );
+      // The argv the diagnostic is built from is the npx fallback's: the
+      // pinned spec (this repo has the dependency, so the manifest resolves)
+      // ahead of the suite's own subcommand and the target.
+      const spec = await mod.resolveComplianceSuiteSpec();
+      expect(spec).toMatch(/^@yawlabs\/mcp-compliance@\d/);
+      expect(cap.err()).toBe(mod.formatLaunchFailure(["-y", spec, "test", "--format", "json", target], "win32"));
     } finally {
       Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
       vi.doUnmock("node:fs");
@@ -392,8 +413,9 @@ describe("runComplianceCommand unlaunchable path", () => {
 // lives in the parse gate and routes to the "unexpected JSON" path instead.
 describe("isRenderableReport", () => {
   // `url` is part of the fixture because the gate now checks it: printSummary
-  // renders `Target: ${url}`, and the child is spawned unpinned (`npx -y
-  // @yawlabs/mcp-compliance`), so a renamed field must route to the
+  // renders `Target: ${url}`, and the child is a separate process -- the
+  // installed dependency, or npx at a pinned-when-resolvable version -- whose
+  // output this one does not control, so a renamed field must route to the
   // "unexpected JSON" path rather than printing "Target: undefined".
   const base = {
     grade: "A",
@@ -459,14 +481,217 @@ describe("isRenderableReport", () => {
   });
 });
 
-// `compliance` and `audit` are two front doors onto the same suite. `audit`
-// runs the PINNED dependency and records its version as `suiteVersion` in
-// grades.json; `compliance` shelled out to `npx -y @yawlabs/mcp-compliance`
-// with no pin, so it graded under whatever npm called latest. Once latest moved
-// ahead of the dependency the two could hand the same server different letters
-// with nothing in either output naming the rubric.
-describe("compliance suite version pin", () => {
-  it("pins the spec to the dependency version audit records", async () => {
+// `compliance` and `audit` are two front doors onto the same suite, and they
+// must grade under ONE rubric. `audit` imports the installed dependency and
+// records its version as `suiteVersion` in grades.json. `compliance` first
+// shelled out to `npx -y @yawlabs/mcp-compliance` with no pin, so it graded
+// under whatever npm called latest; then to npx at the pinned version, which
+// re-resolved the SAME package against the registry on every run (npx looks in
+// the caller's project, never in yaw-mcp's own node_modules) and could not run
+// at all on a machine without npm beside node. It now spawns the installed
+// copy's own bin script with the current node binary; npx is the fallback for
+// a build with no dependency beside it, still at the pinned spec whenever the
+// manifest can be read.
+
+/** Plant a fake @yawlabs/mcp-compliance install under `root` -- a manifest
+ *  object, or raw bytes for an unparseable one -- and hand back a `fromUrl`
+ *  for a module one directory below `root`, so the walk's first node_modules
+ *  probe misses and its second finds the plant. */
+function plantSuite(root: string, manifest: Record<string, unknown> | string): string {
+  const dir = join(root, "node_modules", "@yawlabs", "mcp-compliance");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "package.json"), typeof manifest === "string" ? manifest : JSON.stringify(manifest));
+  const inner = join(root, "dist");
+  mkdirSync(inner, { recursive: true });
+  return pathToFileURL(join(inner, "compliance-cmd.js")).href;
+}
+
+describe("locateComplianceSuite", () => {
+  it("finds this repo's install: its directory, its version and its bin script", async () => {
+    const found = await locateComplianceSuite();
+    expect(found).toBeDefined();
+    expect(found?.dir.replace(/\\/g, "/")).toMatch(/node_modules\/@yawlabs\/mcp-compliance$/);
+    // ONE lookup feeds the version `audit` records and the spec the fallback
+    // pins, so the two commands cannot name different rubrics.
+    expect(found?.version).toBe(await resolveComplianceSuiteVersion());
+    expect(found?.version).toMatch(/^\d+\.\d+\.\d+/);
+    // The map form is what the suite ships; the entry is read by name.
+    expect(found?.bin).toBe("bin/mcp-compliance.mjs");
+  });
+
+  it("reads a single-string bin too, so a packaging change upstream cannot route every run through npx", async () => {
+    const root = mkdtempSync(join(tmpdir(), "yaw-suite-locate-"));
+    try {
+      const found = await locateComplianceSuite(plantSuite(root, { version: "1.2.3", bin: "cli.mjs" }));
+      expect(found).toMatchObject({ version: "1.2.3", bin: "cli.mjs" });
+      expect(found?.dir.replace(/\\/g, "/")).toBe(`${root.replace(/\\/g, "/")}/node_modules/@yawlabs/mcp-compliance`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("no bin when the manifest names none or only other bins; no version when it is not a string", async () => {
+    const root = mkdtempSync(join(tmpdir(), "yaw-suite-locate-"));
+    try {
+      expect(await locateComplianceSuite(plantSuite(root, { version: "1.2.3" }))).toMatchObject({
+        version: "1.2.3",
+        bin: undefined,
+      });
+      expect(await locateComplianceSuite(plantSuite(root, { version: 7, bin: { other: "x.js" } }))).toMatchObject({
+        version: undefined,
+        bin: undefined,
+      });
+      expect(await locateComplianceSuite(plantSuite(root, { version: "", bin: "" }))).toMatchObject({
+        version: undefined,
+        bin: undefined,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined (never throws) for an unresolvable fromUrl or an unreadable nearest manifest", async () => {
+    expect(await locateComplianceSuite("not-a-file-url")).toBeUndefined();
+    const root = mkdtempSync(join(tmpdir(), "yaw-suite-locate-"));
+    try {
+      // The nearest copy is the one `import()` loads; a bad manifest there
+      // must not send the walk on to an ancestor's DIFFERENT install
+      // (audit-cmd.test.ts pins the same rule through resolveComplianceSuiteVersion).
+      expect(await locateComplianceSuite(plantSuite(root, "{ not json"))).toBeUndefined();
+      expect(await locateComplianceSuite(plantSuite(root, "[1, 2]"))).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveSuiteLaunch", () => {
+  const target = "https://example.com/mcp";
+
+  it("runs the installed bin with the current node when it is on disk -- no npx, no shell", async () => {
+    // `exists` answers yes ONLY to the suite's own launcher, which proves
+    // that is the path probed -- not some npx-cli.js candidate.
+    const res = await resolveSuiteLaunch([target], {
+      execPath: "/usr/local/bin/node",
+      platform: "linux",
+      exists: (p) => LOCAL_BIN_RE.test(p),
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.launch.via).toBe("local");
+    expect(res.launch.shell).toBe(false);
+    expect(res.launch.command).toBe("/usr/local/bin/node");
+    expect(res.launch.args[0]).toMatch(LOCAL_BIN_RE);
+    // The suite's subcommand and format ahead of the caller's args, verbatim.
+    expect(res.launch.args.slice(1)).toEqual(["test", "--format", "json", target]);
+    expect(res.launch.args.join(" ")).not.toContain("npx");
+  });
+
+  it("falls back to npx at the pinned spec when the installed bin is not on disk", async () => {
+    // A pruned install: the manifest still reads (so the version is known)
+    // but the script it names is gone. `exists` says yes only to npx-cli.js.
+    const version = await resolveComplianceSuiteVersion();
+    expect(version).toBeTypeOf("string");
+    const res = await resolveSuiteLaunch([target], {
+      execPath: "/usr/local/bin/node",
+      platform: "linux",
+      exists: (p) => p.endsWith("npx-cli.js"),
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.launch.via).toBe("npx");
+    expect(res.launch.shell).toBe(false);
+    expect(res.launch.command).toBe("/usr/local/bin/node");
+    expect(res.launch.args[0]).toContain("npx-cli.js");
+    expect(res.launch.args.slice(1)).toEqual([
+      "-y",
+      `@yawlabs/mcp-compliance@${version}`,
+      "test",
+      "--format",
+      "json",
+      target,
+    ]);
+    expect(res.launch.args.join(" ")).not.toMatch(LOCAL_BIN_RE);
+  });
+
+  it("falls back to npx, still pinned, when the manifest names no bin", async () => {
+    const root = mkdtempSync(join(tmpdir(), "yaw-suite-launch-"));
+    try {
+      const res = await resolveSuiteLaunch([target], {
+        fromUrl: plantSuite(root, { version: "1.2.3" }),
+        execPath: "/usr/local/bin/node",
+        platform: "linux",
+        exists: () => true,
+      });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      expect(res.launch.via).toBe("npx");
+      // The manifest was readable, so the rubric is still named.
+      expect(res.launch.args).toContain("@yawlabs/mcp-compliance@1.2.3");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the bare package name when no install can be read at all", async () => {
+    const root = mkdtempSync(join(tmpdir(), "yaw-suite-launch-"));
+    try {
+      const res = await resolveSuiteLaunch([target], {
+        fromUrl: plantSuite(root, "{ not json"),
+        execPath: "/usr/local/bin/node",
+        platform: "linux",
+        exists: (p) => p.endsWith("npx-cli.js"),
+      });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      expect(res.launch.via).toBe("npx");
+      // The oldest behaviour -- npx fetches latest -- rather than nothing.
+      expect(res.launch.args.slice(1)).toEqual(["-y", "@yawlabs/mcp-compliance", "test", "--format", "json", target]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("hands back the npx argv when nothing can launch, so the diagnostic can name the offender", async () => {
+    const root = mkdtempSync(join(tmpdir(), "yaw-suite-launch-"));
+    try {
+      const bad = "https://example.com/%7Bid%7D";
+      const res = await resolveSuiteLaunch([bad], {
+        fromUrl: plantSuite(root, "{ not json"),
+        execPath: "C:\\nodejs\\node.exe",
+        platform: "win32",
+        exists: () => false,
+      });
+      expect(res).toEqual({ ok: false, npxArgs: ["-y", "@yawlabs/mcp-compliance", "test", "--format", "json", bad] });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Live smoke on THIS machine: the local launch must actually start under
+  // the current node binary and answer offline. `--help` behind the suite's
+  // own `test --format json` prints that subcommand's usage and exits 0
+  // without touching any server. FAIL, don't skip: this repo installs the
+  // dependency, so a host that resolves anything but the local bin is the
+  // broken-install case worth hearing about.
+  it("the local launch actually spawns on this host", async () => {
+    const res = await resolveSuiteLaunch(["--help"]);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.launch.via).toBe("local");
+    expect(res.launch.command).toBe(process.execPath);
+    const code = await new Promise<number | null>((resolve, reject) => {
+      const child = spawn(res.launch.command, res.launch.args, { stdio: ["ignore", "ignore", "ignore"] });
+      child.on("error", reject);
+      child.on("close", resolve);
+    });
+    expect(code).toBe(0);
+  }, 60_000);
+});
+
+// Wiring: what runComplianceCommand actually hands to spawn.
+describe("compliance suite launch", () => {
+  it("pins the fallback spec to the dependency version audit records", async () => {
     const version = await resolveComplianceSuiteVersion();
     const spec = await resolveComplianceSuiteSpec();
     // This repo has the dependency installed, so the pin must resolve here.
@@ -476,9 +701,9 @@ describe("compliance suite version pin", () => {
     expect(spec).not.toBe("@yawlabs/mcp-compliance");
   });
 
-  it("hands the pinned spec to npx rather than the bare package name", async () => {
-    const version = await resolveComplianceSuiteVersion();
-    expect(version).toBeTypeOf("string");
+  /** doMock node:child_process with a spawn that records what it was handed
+   *  and plays a complete report back. Call before the dynamic import. */
+  function mockRecordingSpawn(): Array<{ command: string; args: string[]; opts: Record<string, unknown> }> {
     const report = {
       grade: "A",
       score: 100,
@@ -486,11 +711,11 @@ describe("compliance suite version pin", () => {
       summary: { total: 1, passed: 1, failed: 0, required: 1, requiredPassed: 1 },
       tests: [],
     };
-    const calls: string[][] = [];
+    const calls: Array<{ command: string; args: string[]; opts: Record<string, unknown> }> = [];
     vi.resetModules();
     vi.doMock("node:child_process", () => {
-      const spawn = (_command: string, args: string[]) => {
-        calls.push(args);
+      const spawn = (command: string, args: string[], opts: Record<string, unknown> = {}) => {
+        calls.push({ command, args, opts });
         const child = new EventEmitter() as EventEmitter & {
           stdout: EventEmitter;
           pid: number;
@@ -507,20 +732,88 @@ describe("compliance suite version pin", () => {
       };
       return { spawn, default: { spawn } };
     });
+    return calls;
+  }
+
+  it("spawns the installed suite directly -- the current node and its bin script, never npx", async () => {
+    const calls = mockRecordingSpawn();
     try {
       const mod = await import("../compliance-cmd.js");
       const cap = captureIo();
       const code = await mod.runComplianceCommand(["https://example.com/mcp"], cap.io);
       expect(code).toBe(0);
       expect(calls).toHaveLength(1);
-      // resolveNpxLaunch may prepend node + npx-cli.js (or shell-quote each
-      // element), so assert on the presence of the spec token rather than a
-      // fixed index.
-      const flat = (calls[0] ?? []).join(" ");
-      expect(flat).toContain(`@yawlabs/mcp-compliance@${version}`);
-      // The bare name must not appear as a standalone spec token any more.
-      expect(flat).not.toMatch(/@yawlabs\/mcp-compliance(?!@)/);
+      const call = calls[0];
+      expect(call?.command).toBe(process.execPath);
+      expect(call?.args[0]).toMatch(LOCAL_BIN_RE);
+      expect(call?.args.slice(1)).toEqual(["test", "--format", "json", "https://example.com/mcp"]);
+      // Neither npm's npx entry nor a registry spec is anywhere in the argv:
+      // this run never consults the registry.
+      const flat = call?.args.join(" ") ?? "";
+      expect(flat).not.toContain("npx");
+      expect(flat).not.toContain("@yawlabs/mcp-compliance@");
     } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("strips yaw-mcp's own secrets from the suite's env", async () => {
+    // The suite is a registry package running arbitrary code. `audit` scrubs
+    // process.env before its spawn; this command hands the child a stripped
+    // COPY instead, so the rest of the env (PATH for one) still arrives while
+    // the vault passphrase does not. README promises the strip for every
+    // child yaw-mcp starts; this spawn inherited process.env whole.
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE", "hunter2-do-not-leak");
+    const calls = mockRecordingSpawn();
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      await mod.runComplianceCommand(["https://example.com/mcp"], cap.io);
+      expect(calls).toHaveLength(1);
+      const env = calls[0]?.opts.env as NodeJS.ProcessEnv | undefined;
+      expect(env, "spawn must pass an explicit env").toBeDefined();
+      expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+      expect(Object.keys(env ?? {}).length).toBeGreaterThan(0);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("falls back to npx at the pinned spec when the installed bin is not on disk", async () => {
+    const version = await resolveComplianceSuiteVersion();
+    expect(version).toBeTypeOf("string");
+    const calls = mockRecordingSpawn();
+    // existsSync says no to the suite's bin and yes to npm's npx-cli.js -- the
+    // pruned-install shape. The manifest is read through node:fs/promises,
+    // which stays real, so the version is still known and the spec pinned.
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, default: actual, existsSync: (p: unknown) => !LOCAL_BIN_RE.test(String(p)) };
+    });
+    try {
+      const mod = await import("../compliance-cmd.js");
+      const cap = captureIo();
+      const code = await mod.runComplianceCommand(["https://example.com/mcp"], cap.io);
+      expect(code).toBe(0);
+      expect(calls).toHaveLength(1);
+      const call = calls[0];
+      expect(call?.command).toBe(process.execPath);
+      expect(call?.args[0]).toContain("npx-cli.js");
+      expect(call?.args.slice(1)).toEqual([
+        "-y",
+        `@yawlabs/mcp-compliance@${version}`,
+        "test",
+        "--format",
+        "json",
+        "https://example.com/mcp",
+      ]);
+      // The bare name must not appear as a standalone spec token.
+      expect(call?.args.join(" ")).not.toMatch(/@yawlabs\/mcp-compliance(?!@)/);
+    } finally {
+      vi.doUnmock("node:fs");
       vi.doUnmock("node:child_process");
       vi.resetModules();
     }
@@ -790,7 +1083,7 @@ describe("runComplianceCommand child guardrails", () => {
       const mod = await import("../compliance-cmd.js");
       const cap = captureIo();
       // Fake timers only AFTER the dynamic import -- module resolution is real
-      // I/O, and so is the suite-spec read inside the command, which settles
+      // I/O, and so is the install lookup inside the command, which settles
       // under fake timers because it is fs work rather than a timer.
       vi.useFakeTimers();
       const pending = mod.runComplianceCommand(["https://example.com/mcp"], cap.io);

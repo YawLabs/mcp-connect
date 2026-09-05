@@ -51,6 +51,14 @@ export type BundlesAction = "list" | "match";
 export interface BundlesCommandOptions {
   home?: string;
   cwd?: string;
+  /** Environment `match` runs under. Both loaders it calls read exactly one
+   *  key from it (YAW_MCP_TRUST_PROJECT for bundles.json, the project-dir
+   *  walk's ownership opt-in for config.json), but it must be threaded rather
+   *  than left to default inside them: `add`, `remove` and `list` inject
+   *  theirs, and an embedded or test caller supplying an env expects THAT env
+   *  to decide which bundles.json is in effect -- not the real process's,
+   *  which made `list` and `bundles match` disagree on the same repo. */
+  env?: NodeJS.ProcessEnv;
   action?: BundlesAction;
   json?: boolean;
   out?: (s: string) => void;
@@ -152,8 +160,9 @@ export async function runBundlesCommand(opts: BundlesCommandOptions = {}): Promi
   // startup AND the same config.json profile it enforces, so the CLI's
   // partition and the LLM-facing `mcp_connect_bundles` partition are computed
   // over the identical server set.
-  const loaded = await loadLocalBundles({ cwd: opts.cwd, home: opts.home });
-  const config = await loadYawMcpConfig({ cwd: opts.cwd, home: opts.home });
+  const env = opts.env ?? process.env;
+  const loaded = await loadLocalBundles({ cwd: opts.cwd, home: opts.home, env });
+  const config = await loadYawMcpConfig({ cwd: opts.cwd, home: opts.home, env });
 
   // Surface load warnings so a malformed bundles.json (or config.json) reads as
   // "this file is broken" instead of "you have no servers." stderr keeps stdout

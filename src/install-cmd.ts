@@ -29,11 +29,27 @@
 //   - Existing client file with malformed JSON  → refuse, point at the file.
 //   - Existing `mcp` entry                      → prompt (TTY) or refuse
 //                                                  with --force/--skip flag.
-//   - --dry-run                                  → print the would-be diff
+//   - Client file changed between read + write  → refuse, ask for a re-run
+//                                                  (see the fingerprint check
+//                                                  ahead of atomicWriteFile).
+//   - settings.json changed between read + write → warn and skip the
+//                                                  best-effort permissions
+//                                                  patch, exit 0 (same
+//                                                  fingerprint check; the
+//                                                  launch entry is already
+//                                                  written, so nothing is
+//                                                  refused).
+//   - --dry-run                                  → print ONLY what would be
+//                                                  added (the entry at its
+//                                                  container path, the
+//                                                  permissions.allow delta)
 //                                                  and exit 0 without writing.
+//                                                  Never the merged file: its
+//                                                  siblings carry secrets, and
+//                                                  the entry's own carried-over
+//                                                  env prints keys only.
 
-import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -51,7 +67,6 @@ import {
   type InstallOS,
   type InstallScope,
   isProjectLocalEntry,
-  LEGACY_ENTRY_NAMES,
   resolveAppDataDir,
   resolveClaudeCodeSettingsPath,
   resolveInstallPath,
@@ -67,6 +82,7 @@ import {
   probeOam,
   resolveStableNpmEntry,
 } from "./oam-spawn.js";
+import { questionOrEmpty } from "./readline-question.js";
 
 export interface InstallCommandOptions {
   /** Target client. Omitted when --list or --all drives the run. */
@@ -230,6 +246,11 @@ export const NO_CONFIG_FLAG_DEPRECATION =
   "yaw-mcp install: --no-yaw-mcp-config is deprecated and ignored -- install no longer writes " +
   "~/.yaw-mcp/config.json at all, so there is nothing to suppress.";
 
+/** What `--dry-run` prints in place of each value of the env it carries over
+ *  from the existing entry (see the preview in runInstall). Exported so tests
+ *  pin that the preview shows the key and this, never the value. */
+export const DRY_RUN_ENV_PLACEHOLDER = "<kept from existing entry>";
+
 export async function runInstall(opts: InstallCommandOptions): Promise<InstallResult> {
   const stdout = opts.io?.stdout ?? process.stdout;
   const stderr = opts.io?.stderr ?? process.stderr;
@@ -356,6 +377,11 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       claudeConfigDir: opts.claudeConfigDir,
     });
   } catch (e) {
+    // Defensive; unreachable via runInstall's own checks. Everything the
+    // resolver throws on -- unknown client, unsupported scope, unavailable OS,
+    // a project scope with no directory -- was refused above, and projectDir
+    // is set whenever requiresProjectDir holds. Kept so a new resolver throw
+    // surfaces as a named refusal rather than an unhandled rejection.
     err(`yaw-mcp install: ${(e as Error).message}`);
     return { written: [], wouldWrite: [], messages, exitCode: 2 };
   }
@@ -376,11 +402,14 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   let rawClient: string | null = null;
   let existingHasEntry = false;
   let legacyEntry: string | null = null;
-  // EVERY legacy entry key still in the container, not just the first one
-  // findLegacyEntry reports -- the settings.json patch needs the full set to
-  // decide which legacy allow-patterns are still load-bearing.
-  let legacyEntriesPresent: string[] = [];
-  if (existsSync(resolved.absolute)) {
+  // Fingerprinted BEFORE the read (never after: a write landing between a
+  // read and a later stat would be carried forward under a fresh fingerprint)
+  // and compared again right before atomicWriteFile -- see there for why. A
+  // null fingerprint is "absent", which also stands in for the existsSync
+  // this replaced: an unreadable file still reaches the readFile below and
+  // fails there with its real error.
+  const fingerprintBefore = await fileFingerprint(resolved.absolute);
+  if (fingerprintBefore !== null) {
     let raw: string;
     try {
       raw = await readFile(resolved.absolute, "utf8");
@@ -411,7 +440,6 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
       const c = container as Record<string, unknown>;
       existingHasEntry = ENTRY_NAME in c;
       legacyEntry = findLegacyEntry(c);
-      legacyEntriesPresent = LEGACY_ENTRY_NAMES.filter((n) => n in c);
     }
   }
 
@@ -658,14 +686,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
           scope,
           home,
           projectDir,
-          os,
           claudeConfigDir: opts.claudeConfigDir,
-          // Legacy allow-patterns are only dead wildcards when the server they
-          // grant is gone. install deliberately LEAVES a legacy mcpServers
-          // entry in place (it only warns), so stripping that entry's pattern
-          // in the same run revokes a still-running server's grant and Claude
-          // Code re-prompts on every one of its tool calls.
-          retainAllowPatterns: legacyEntriesPresent.map(legacyAllowPatternFor),
         })
       : null;
 
@@ -681,9 +702,40 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   }
 
   if (opts.dryRun) {
-    log("\n--- dry run: would write the following ---");
-    log(`\n# ${resolved.absolute}\n${clientJson}`);
-    if (settingsPatch?.changed) log(`# ${settingsPatch.path}\n${settingsPatch.nextJson}`);
+    // ONLY what this run adds, never the merged file. `clientJson` is the
+    // whole post-merge config, and for ~/.claude.json that is every sibling
+    // server's `env` -- a third-party API key, a `yaw-mcp try` entry's inline
+    // secret -- printed into the transcript the user pastes into a bug report,
+    // the exact leak the Runtime-line ordering above takes care to avoid. The
+    // entry rendered at its container path is the one-sided diff a fresh
+    // entry amounts to, and it still shows WHERE the entry lands (the
+    // projects[<dir>] nesting at local scope). Same for settings.json, which
+    // carries `env` and hooks of its own: the permissions.allow delta is the
+    // whole change, so it is all that prints.
+    //
+    // The entry's own `env` is the one part of that diff that is NOT ours: it
+    // is the existing entry's, carried over verbatim above, and README tells
+    // users to put YAW_MCP_VAULT_PASSPHRASE in exactly that block. So the
+    // preview keeps its KEYS (the "Kept existing env" line already names
+    // them, and the user needs to see the block survives the overwrite) and
+    // masks every VALUE. A live run writes the real values to the file; the
+    // preview is the one output that exists to be pasted somewhere. Gated on
+    // the carry-over rather than on `env` being present so the placeholder
+    // stays truthful: buildLaunchEntry emits no env of its own here, so an
+    // env on the entry can only have come from the user's file.
+    log("\n--- dry run: would add the following (the rest of each file is left as-is) ---");
+    const previewEntry =
+      entryToWrite !== newEntry && entryToWrite.env
+        ? {
+            ...entryToWrite,
+            env: Object.fromEntries(Object.keys(entryToWrite.env).map((k) => [k, DRY_RUN_ENV_PLACEHOLDER])),
+          }
+        : entryToWrite;
+    const preview = mergeClientConfig({}, containerPath, previewEntry);
+    log(`\n# ${resolved.absolute}\n${JSON.stringify(preview, null, 2)}`);
+    if (settingsPatch?.changed) {
+      log(`# ${settingsPatch.path}\npermissions.allow += ${JSON.stringify(settingsPatch.added)}`);
+    }
     if (legacyEntry) {
       log(
         `Note: legacy "${legacyEntry}" entry at ${resolved.absolute} would remain -- remove it to avoid running yaw-mcp twice.`,
@@ -695,6 +747,26 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   }
 
   const written: string[] = [];
+
+  // Re-fingerprint immediately before publishing. The read above and this
+  // write bracket an awaited `oam --version` probe (up to 3s) and, on a
+  // collision, a prompt that waits on the user -- and ~/.claude.json is a file
+  // Claude Code itself writes during a session (MCP approvals, project
+  // metadata). atomicWriteFile only guarantees the bytes land whole; it leaves
+  // serializing the logical read-modify-write to the caller (atomic-write.ts,
+  // header), so a save that landed in that window used to be replaced by the
+  // pre-probe snapshot plus our entry with no diagnostic. `yaw-mcp install
+  // claude-code --force` run from a shell inside a live Claude Code session
+  // is exactly that shape. Refuse rather than merge: the file just changed
+  // under us, and re-reading it from the top is what a re-run does. Best
+  // effort by nature -- a same-size rewrite inside one mtime tick (coarse on
+  // some filesystems) is invisible to this check.
+  if (!sameFingerprint(fingerprintBefore, await fileFingerprint(resolved.absolute))) {
+    err(
+      `yaw-mcp install: ${resolved.absolute} changed while install was running (another process wrote it) -- nothing was written. Re-run install.`,
+    );
+    return { written, wouldWrite: [], messages, exitCode: 1 };
+  }
 
   // Write client config atomically. ~/.claude.json carries every
   // project's mcpServers + permissions + history; a non-atomic write
@@ -712,14 +784,30 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   // calls don't prompt. Best-effort: any failure here is logged but does
   // NOT fail the overall install — the launch entry is already written.
   if (settingsPatch?.changed) {
-    try {
-      await atomicWriteFile(settingsPatch.path, settingsPatch.nextJson);
-      log(`Wrote ${settingsPatch.path} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow)`);
-      written.push(settingsPatch.path);
-    } catch (e) {
+    // The same read-modify-write race the client config is guarded against
+    // above, on the file Claude Code rewrites MOST during a session: every
+    // permission approval lands in settings.json. The window is narrower --
+    // prepareClaudeCodeSettingsPatch reads after the probe and the prompt --
+    // but the client-config publish just above is an awaited write+rename
+    // inside it, and a patch computed on the pre-publish bytes would replace
+    // an approval that landed meanwhile. Skip rather than refuse: the launch
+    // entry is already in place, the patch is best-effort, and the by-hand
+    // fallback is the one every other unpatched path names. Same coarse-mtime
+    // caveat as the client check.
+    if (!sameFingerprint(settingsPatch.fingerprint, await fileFingerprint(settingsPatch.path))) {
       err(
-        `yaw-mcp install: warning -- failed to patch ${settingsPatch.path}: ${(e as Error).message}. You may be re-prompted for each yaw-mcp tool call; add "${CLAUDE_CODE_ALLOW_PATTERN}" to permissions.allow to silence.`,
+        `yaw-mcp install: warning -- ${settingsPatch.path} changed while install was running (another process wrote it); left unchanged. Add "${CLAUDE_CODE_ALLOW_PATTERN}" to permissions.allow by hand, or you may be re-prompted for each yaw-mcp tool call.`,
       );
+    } else {
+      try {
+        await atomicWriteFile(settingsPatch.path, settingsPatch.nextJson);
+        log(`Wrote ${settingsPatch.path} (added ${CLAUDE_CODE_ALLOW_PATTERN} to permissions.allow)`);
+        written.push(settingsPatch.path);
+      } catch (e) {
+        err(
+          `yaw-mcp install: warning -- failed to patch ${settingsPatch.path}: ${(e as Error).message}. You may be re-prompted for each yaw-mcp tool call; add "${CLAUDE_CODE_ALLOW_PATTERN}" to permissions.allow to silence.`,
+        );
+      }
     }
   }
 
@@ -750,27 +838,31 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
  *  can skip the write entirely. Returns null for scopes that have no
  *  corresponding settings file. Malformed or non-object existing files are
  *  left untouched (changed: false, malformed: true, malformedReason set);
- *  the caller emits a warning so the skip isn't silent. */
+ *  the caller emits a warning so the skip isn't silent. Every non-null result
+ *  carries the file's `fingerprint` from BEFORE the read, for the caller to
+ *  compare again ahead of its write (see the settings patch in runInstall). */
 async function prepareClaudeCodeSettingsPatch(opts: {
   scope: InstallScope;
   home: string;
   projectDir: string | undefined;
-  os: InstallOS;
   claudeConfigDir: string | undefined;
-  /** Legacy allow-patterns to leave in place because the entry they grant is
-   *  still wired in the client config. */
-  retainAllowPatterns?: string[];
 }): Promise<{
   path: string;
   nextJson: string;
   changed: boolean;
+  /** The patterns this patch appends to `permissions.allow` -- the whole
+   *  delta, since the merge only ever adds. What `--dry-run` prints instead of
+   *  `nextJson`, which is the entire settings.json (hooks, `env`, ...). Empty
+   *  when nothing changed. */
+  added: string[];
+  /** stat of the file taken ahead of the read; null when it was absent. */
+  fingerprint: FileFingerprint;
   malformed?: boolean;
   malformedReason?: string;
 } | null> {
   const path = resolveClaudeCodeSettingsPath(opts.scope, {
     home: opts.home,
     projectDir: opts.projectDir,
-    os: opts.os,
     claudeConfigDir: opts.claudeConfigDir,
   });
   if (!path) return null;
@@ -780,7 +872,14 @@ async function prepareClaudeCodeSettingsPatch(opts: {
   // keeps the client config's: settings.json is JSONC and hand-maintained,
   // and a JSON.stringify rewrite drops every comment in it.
   let rawSettings: string | null = null;
-  if (existsSync(path)) {
+  // Fingerprinted BEFORE the read, for the same reason the client config is
+  // (runInstall, ahead of its readFile): taken after, a write landing between
+  // the read and the stat would be carried forward under a fresh fingerprint.
+  // null is "absent", which is the existence test this used to be an
+  // existsSync for; an unreadable file still reaches the readFile below and
+  // is reported from there.
+  const fingerprint = await fileFingerprint(path);
+  if (fingerprint !== null) {
     try {
       const raw = await readFile(path, "utf8");
       if (raw.trim().length > 0) {
@@ -791,21 +890,42 @@ async function prepareClaudeCodeSettingsPatch(opts: {
         } else {
           // Not an object — leave alone, but flag it so the caller can warn
           // (otherwise the settings.json is silently never patched).
-          return { path, nextJson: "", changed: false, malformed: true, malformedReason: "not a JSON object" };
+          return {
+            path,
+            nextJson: "",
+            changed: false,
+            added: [],
+            malformed: true,
+            malformedReason: "not a JSON object",
+            fingerprint,
+          };
         }
       }
     } catch (e) {
       // Malformed settings.json — don't try to rewrite; flag it so the
       // caller can warn (let the user fix it by hand).
-      return { path, nextJson: "", changed: false, malformed: true, malformedReason: (e as Error).message };
+      return {
+        path,
+        nextJson: "",
+        changed: false,
+        added: [],
+        malformed: true,
+        malformedReason: (e as Error).message,
+        fingerprint,
+      };
     }
   }
 
-  const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN], opts.retainAllowPatterns);
+  const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
   // If nothing changed, signal no-op to the caller.
   const before = JSON.stringify(existing);
   const after = JSON.stringify(merged);
-  if (before === after) return { path, nextJson: "", changed: false };
+  if (before === after) return { path, nextJson: "", changed: false, added: [], fingerprint };
+  // The delta is "our patterns that were not already there": mergePermissionsAllow
+  // preserves every existing element and appends only the missing ones.
+  const prevAllow = (existing.permissions as { allow?: unknown } | undefined)?.allow;
+  const prevAllowList: unknown[] = Array.isArray(prevAllow) ? prevAllow : [];
+  const added = [CLAUDE_CODE_ALLOW_PATTERN].filter((p) => !prevAllowList.includes(p));
   if (rawSettings !== null) {
     // Pre-empt the one shape that makes the splice below throw: a `permissions`
     // key holding a non-object (null, a scalar, an array) has no `allow` node
@@ -825,8 +945,10 @@ async function prepareClaudeCodeSettingsPatch(opts: {
         path,
         nextJson: "",
         changed: false,
+        added: [],
         malformed: true,
         malformedReason: `"permissions" is ${describeJsonShape(blockedPermissions.value)}, not a JSON object`,
+        fingerprint,
       };
     }
     // Only `permissions.allow` changes, so edit exactly that node in the
@@ -835,7 +957,7 @@ async function prepareClaudeCodeSettingsPatch(opts: {
     const nextAllow = (merged.permissions as { allow: string[] }).allow;
     try {
       const next = editJsoncEntry(rawSettings, ["permissions"], "allow", nextAllow);
-      return { path, nextJson: next.endsWith("\n") ? next : `${next}\n`, changed: true };
+      return { path, nextJson: next.endsWith("\n") ? next : `${next}\n`, changed: true, added, fingerprint };
     } catch (e) {
       // Backstop for whatever the shape check above cannot foresee. Named the
       // same way, so even here the user gets the key alongside the parser's
@@ -844,62 +966,45 @@ async function prepareClaudeCodeSettingsPatch(opts: {
         path,
         nextJson: "",
         changed: false,
+        added: [],
         malformed: true,
         malformedReason: `could not splice permissions.allow (${(e as Error).message})`,
+        fingerprint,
       };
     }
   }
-  return { path, nextJson: `${JSON.stringify(merged, null, 2)}\n`, changed: true };
+  return { path, nextJson: `${JSON.stringify(merged, null, 2)}\n`, changed: true, added, fingerprint };
 }
-
-/** Claude Code derives a server's tool-name prefix from its entry key by
- *  replacing every non-alphanumeric char with `_` (see CLAUDE_CODE_ALLOW_PATTERN
- *  in install-targets.ts), so `yaw-mcp` grants `mcp__yaw_mcp__*` and
- *  `mcp.hosting` grants `mcp__mcp_hosting__*`. Derived rather than tabulated so
- *  a new LEGACY_ENTRY_NAMES member cannot silently miss its pattern. */
-function legacyAllowPatternFor(entryName: string): string {
-  return `mcp__${entryName.replace(/[^A-Za-z0-9]/g, "_")}__*`;
-}
-
-/** Allow-patterns earlier installers wrote into Claude Code's
- *  `permissions.allow` (one per LEGACY_ENTRY_NAMES brand). Stripped on
- *  upgrade so dead wildcards don't accumulate forever — no live tool name can
- *  match them ONCE THE ENTRY THAT SERVED THEM IS GONE. Derived from
- *  LEGACY_ENTRY_NAMES via legacyAllowPatternFor, never tabulated by hand: a
- *  hand-kept copy of this list silently omitted `mcp__mcph__*`, so the middle
- *  brand's dead wildcard survived every upgrade — exactly the drift the
- *  derivation in legacyAllowPatternFor exists to prevent.
- *  A pattern whose legacy mcpServers entry is still wired is NOT dead, so the
- *  caller passes it via `retain` (see legacyAllowPatternFor). */
-const LEGACY_CLAUDE_CODE_ALLOW_PATTERNS: string[] = LEGACY_ENTRY_NAMES.map(legacyAllowPatternFor);
 
 /** Union `patterns` into `existing.permissions.allow`, preserving every
- *  other key. Deduplicates by string equality so repeated installs don't
- *  grow the list. Also drops any pre-rename legacy patterns first so
- *  upgraded installs don't keep a dead wildcard around -- except the ones in
- *  `retain`, whose legacy server entry the caller found still present.
+ *  other key and every element already there. Deduplicates by string equality
+ *  so repeated installs don't grow the list.
+ *
+ *  Deliberately NOT a place that strips the pre-rename legacy wildcards
+ *  (`mcp__yaw_mcp__*`, `mcp__mcph__*`, `mcp__mcp_hosting__*`). An earlier
+ *  version dropped them unless the legacy mcpServers entry was still present
+ *  in the ONE container install was writing -- but ~/.claude/settings.json is
+ *  global, so a user-scope install could not see the legacy `yaw-mcp` entry a
+ *  repo's .mcp.json (or another project's local scope) still runs, stripped
+ *  its grant, and Claude Code re-prompted on every tool call of that live
+ *  server. No cheap read sees every container a global allow-list covers.
+ *  Three dead wildcards are harmless; a revoked live grant is not. The legacy
+ *  ENTRY still gets its "remove it" note in runInstall -- the pattern goes
+ *  when the user deletes the entry it serves, by hand.
  *  Exported for tests. */
-export function mergePermissionsAllow(
-  existing: Record<string, unknown>,
-  patterns: string[],
-  retain: string[] = [],
-): Record<string, unknown> {
+export function mergePermissionsAllow(existing: Record<string, unknown>, patterns: string[]): Record<string, unknown> {
   const out: Record<string, unknown> = { ...existing };
   const prev = out.permissions;
   const perms: Record<string, unknown> =
     typeof prev === "object" && prev !== null && !Array.isArray(prev) ? { ...(prev as Record<string, unknown>) } : {};
   const prevAllow = perms.allow;
-  // Non-string elements are carried through VERBATIM. The legacy-pattern drop
-  // and the dedupe below are string-only concepts, so a filter that narrowed to
+  // Every existing element is carried through VERBATIM, non-strings included.
+  // The dedupe below is a string-only concept, so a pass that narrowed to
   // string silently DELETED anything else the user (or a future Claude Code
   // schema) had put in `permissions.allow` -- an object rule, a nested array --
   // on the next install, contradicting this function's own promise to preserve
   // everything it does not manage.
-  const allow: unknown[] = Array.isArray(prevAllow)
-    ? (prevAllow as unknown[]).filter(
-        (x) => typeof x !== "string" || retain.includes(x) || !LEGACY_CLAUDE_CODE_ALLOW_PATTERNS.includes(x),
-      )
-    : [];
+  const allow: unknown[] = Array.isArray(prevAllow) ? [...(prevAllow as unknown[])] : [];
   for (const p of patterns) {
     if (!allow.includes(p)) allow.push(p);
   }
@@ -908,13 +1013,39 @@ export function mergePermissionsAllow(
   return out;
 }
 
+/** The fields a concurrent writer moves; null when the file is absent. Used
+ *  to detect a write that lands between install's read of a file and its
+ *  publishing rename: the client config (refused, see the check ahead of its
+ *  atomicWriteFile) and Claude Code's settings.json (the best-effort patch is
+ *  skipped with a warning, see the settings write below it). */
+type FileFingerprint = { mtimeMs: number; size: number } | null;
+
+async function fileFingerprint(path: string): Promise<FileFingerprint> {
+  try {
+    const st = await stat(path);
+    return { mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return null;
+  }
+}
+
+function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
+  if (a === null || b === null) return a === b;
+  return a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+
 async function promptCollision(path: string, io: InstallCommandOptions["io"]): Promise<"overwrite" | "skip" | "abort"> {
   const stdin = io?.stdin ?? process.stdin;
   const stdout = io?.stdout ?? process.stdout;
   const rl = createInterface({ input: stdin, output: stdout });
   try {
+    // questionOrEmpty, not a bare rl.question(): that promise never settles
+    // once stdin closes (Ctrl+D, a pipe running dry), so the install hung at
+    // this prompt instead of taking its default. EOF comes back as "", which
+    // is what a bare Enter produces -- the `(default: skip)` branch below.
     const answer = (
-      await rl.question(
+      await questionOrEmpty(
+        rl,
         `${path} already has an "${ENTRY_NAME}" entry.\n  [o]verwrite, [s]kip, or [a]bort? (default: skip) `,
       )
     )
@@ -1003,18 +1134,14 @@ function describeJsonShape(value: unknown): string {
 }
 
 /** Read the existing launch entry at `containerPath`, or null when the path or
- *  the entry is absent. Mirrors mergeClientConfig's walk so the two agree on
- *  where the entry lives. */
+ *  the entry is absent. Walks with readNested, the same walk mergeClientConfig
+ *  and the collision check use, so all three agree on where the entry lives. */
 export function readEntryAt(
   existing: Record<string, unknown>,
   containerPath: string[],
   entryName: string = ENTRY_NAME,
 ): { command?: string; args?: string[]; env?: Record<string, string> } | null {
-  let node: unknown = existing;
-  for (const key of containerPath) {
-    if (typeof node !== "object" || node === null || Array.isArray(node)) return null;
-    node = (node as Record<string, unknown>)[key];
-  }
+  const node = readNested(existing, containerPath);
   if (typeof node !== "object" || node === null || Array.isArray(node)) return null;
   const entry = (node as Record<string, unknown>)[entryName];
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null;
@@ -1328,6 +1455,11 @@ async function runInstallList(
 function statusFor(p: ClientProbeResult): string {
   if (p.unavailable) return "unavailable";
   if (p.malformed) return "malformed";
+  // A READ failure (a directory at the path, EACCES, a win32 EBUSY from an
+  // indexer) is not a syntax error: the probe reports it separately so the
+  // row does not send the user to fix JSON that may be perfectly fine, and so
+  // it does not fall through to "other-entries" as if the file had been read.
+  if (p.unreadable) return `unreadable: ${p.unreadable}`;
   if (p.hasMcpEntry) return "installed";
   // A file whose only yaw-mcp wiring is a PRE-RENAME entry is an upgrade
   // pending, not somebody else's config: `install <client>` has something

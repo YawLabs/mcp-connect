@@ -145,7 +145,7 @@ export async function loadUserGuide(home?: string): Promise<GuideFile | null> {
  *  directory is not approved — see the header for why this warns instead of
  *  blocking. */
 export async function loadProjectGuide(cwd: string, home?: string, env?: NodeJS.ProcessEnv): Promise<GuideFile | null> {
-  const dir = await findProjectConfigDir(cwd, home).catch((err) => {
+  const dir = await findProjectConfigDir(cwd, home, env).catch((err) => {
     log("warn", "Failed searching for project .yaw-mcp/ dir", {
       error: err instanceof Error ? err.message : String(err),
     });

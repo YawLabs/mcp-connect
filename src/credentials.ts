@@ -11,13 +11,16 @@
 //
 // Pattern 1 tolerates every phrasing servers actually emit around the name:
 // an optional "required", an optional "env"/"environment", an optional
-// "var"/"variable", and an optional COLON after it -- "Missing env var:
-// OPENAI_API_KEY" (this file's own header example) matched none of those
-// before. The `\s+` AFTER the optional colon is load-bearing: without it
-// "Missing VARIANT_TOKEN" has its leading "VAR" eaten by the var/variable
-// group and reports the name as "IANT_TOKEN".
+// "var"/"variable", and an optional COLON after ANY of "missing", "env"/
+// "environment" or "var"/"variable" -- "Missing env var: OPENAI_API_KEY"
+// (this file's own header example), "Missing env: X" and "missing: X" all
+// matched none of those before (the colon was only tolerated after the
+// var/variable group). The `\s+` AFTER each optional colon is load-bearing:
+// without it "Missing VARIANT_TOKEN" has its leading "VAR" eaten by the
+// var/variable group and reports the name as "IANT_TOKEN" (and "Missing
+// ENV_TOKEN" would lose its "ENV" the same way).
 const MISSING_PATTERNS: RegExp[] = [
-  /\bmissing\s+(?:required\s+)?(?:env\s+|environment\s+)?(?:(?:variable|var)\s*:?\s+)?([A-Z_][A-Z0-9_]{2,})\b/gi,
+  /\bmissing\s*:?\s+(?:required\s+)?(?:(?:env|environment)\s*:?\s+)?(?:(?:variable|var)\s*:?\s+)?([A-Z_][A-Z0-9_]{2,})\b/gi,
   /\b([A-Z_][A-Z0-9_]{2,})\s+is\s+(?:required|not\s+set|missing|empty|undefined)\b/gi,
   /\b([A-Z_][A-Z0-9_]{2,})\s+must\s+be\s+set\b/gi,
   /\bplease\s+set\s+(?:env\s+(?:var\s+|variable\s+)?)?([A-Z_][A-Z0-9_]{2,})\b/gi,
@@ -59,15 +62,39 @@ const CREDENTIAL_SEGMENTS = new Set([
   "PAT",
   "DSN",
   "BEARER",
+  "PASSWORDS",
+  "CLIENTSECRET",
+  "BOTTOKEN",
+  // -KEY compounds are ENUMERATED, not inferred: KEY is kept off the suffix
+  // rule below because MONKEY, TURKEY, HOCKEY and DONKEY all end in it.
+  "SECRETKEY",
   "SIGNINGKEY",
   "ACCESSKEY",
   "PRIVATEKEY",
+  "SSHKEY",
+  "AUTHKEY",
+  "MASTERKEY",
+  "LICENSEKEY",
 ]);
+
+// A segment that ENDS in one of these is a credential noun with a qualifier
+// glued to its front -- BOTTOKEN, CLIENTSECRET, AUTHTOKEN, DBPASSWORD -- and
+// reads as a credential exactly as its split form (BOT_TOKEN) does. Tested
+// as a SUFFIX, never a substring, because that is the direction English does
+// not build ordinary words in: "tokenizer" and "secretary" start with the
+// noun, nothing common ends in "token" or "secret". So S3_SECRETKEY,
+// SLACK_BOTTOKEN and OAUTH_CLIENTSECRET elicit while TOKENIZER_PATH and
+// SECRETARY_EMAIL stay refused. KEY is deliberately absent (see the -KEY
+// note in CREDENTIAL_SEGMENTS); so is PASS (BYPASS, COMPASS).
+const CREDENTIAL_NOUN_SUFFIXES = ["TOKEN", "SECRET", "PASSWORD", "PASSPHRASE", "CREDENTIAL"];
 
 // Names with no underscores at all (GITHUBTOKEN, APIKEY) never split into a
 // segment the set can match, so a small set of unambiguous substrings backs
-// the segment test up. Kept deliberately short: every entry here is a word
-// that does not occur inside an ordinary infrastructure variable name.
+// the segment test up -- for THOSE names only (see isCredentialShaped). A name
+// that has underscores already had every segment tested, and applying the
+// substring test to it as well is what made "TOKENIZER_PATH is required"
+// pop a secret prompt for a file path: "TOKEN" is a whole word here, but it
+// is also the head of an ordinary one.
 const CREDENTIAL_SUBSTRINGS = ["TOKEN", "SECRET", "PASSWORD", "PASSPHRASE", "APIKEY", "CREDENTIAL"];
 
 // Belt-and-braces on top of the credential-shape test above: these are names
@@ -123,7 +150,23 @@ function isAllCaps(name: string): boolean {
 function isCredentialShaped(name: string): boolean {
   for (const segment of name.split("_")) {
     if (CREDENTIAL_SEGMENTS.has(segment)) return true;
+    // Strictly LONGER than the noun: the whole-word case is the set's job,
+    // and this rule is only for the compound (BOTTOKEN) the set cannot list
+    // exhaustively. Before it, the underscore gate below refused every
+    // underscored compound outright -- S3_SECRETKEY, SLACK_BOTTOKEN and
+    // OAUTH_CLIENTSECRET, all of which the old substring test had caught,
+    // stopped eliciting the day TOKENIZER_PATH was fixed.
+    if (CREDENTIAL_NOUN_SUFFIXES.some((noun) => segment.length > noun.length && segment.endsWith(noun))) {
+      return true;
+    }
   }
+  // The substring fallback exists for names the segment split cannot see
+  // into (no underscore at all). A name WITH underscores has just had every
+  // segment checked, as a whole word and as a noun-suffixed compound, so a
+  // substring hit on it can only be a noun buried at the HEAD or middle of a
+  // longer segment -- TOKENIZER_PATH, SECRETARY_EMAIL -- which is exactly the
+  // false positive the segment rule was written to refuse.
+  if (name.includes("_")) return false;
   return CREDENTIAL_SUBSTRINGS.some((s) => name.includes(s));
 }
 

@@ -258,6 +258,45 @@ describe("runBundlesCommand — match", () => {
     expect(parsed.installed).not.toContain("weirdnamespace");
   });
 
+  // `match` used to call both loaders with no env at all, so the project-trust
+  // bypass an embedded or test caller injected was ignored while `add`,
+  // `remove` and `list` honoured theirs -- same repo, same options, and two
+  // commands disagreeing about which bundles.json is in effect.
+  it("reads the INJECTED env for the project-trust bypass, not process.env", async () => {
+    seedBundles([makeServer({ namespace: "github" })]);
+    const project = join(home, "proj");
+    mkdirSync(join(project, CONFIG_DIRNAME), { recursive: true });
+    // UNAPPROVED (no grantTrust): only the env bypass can make it win.
+    writeFileSync(
+      join(project, CONFIG_DIRNAME, "bundles.json"),
+      JSON.stringify({ version: 1, servers: [makeServer({ namespace: "linear" })] }),
+      "utf8",
+    );
+    const plain = captureIO();
+    await runBundlesCommand({
+      home,
+      cwd: project,
+      action: "match",
+      json: true,
+      env: {},
+      out: plain.push,
+      err: plain.pushErr,
+    });
+    expect(JSON.parse(plain.out.join("\n")).installed).toEqual(["github"]);
+
+    const bypassed = captureIO();
+    await runBundlesCommand({
+      home,
+      cwd: project,
+      action: "match",
+      json: true,
+      env: { YAW_MCP_TRUST_PROJECT: "1" },
+      out: bypassed.push,
+      err: bypassed.pushErr,
+    });
+    expect(JSON.parse(bypassed.out.join("\n")).installed).toEqual(["linear"]);
+  });
+
   it("warns on stderr (still exit 0) when bundles.json is malformed", async () => {
     writeFileSync(join(home, CONFIG_DIRNAME, "bundles.json"), "{ not json", "utf8");
     const io = captureIO();

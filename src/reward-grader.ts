@@ -67,7 +67,27 @@ const RESULT_SNIPPET_LEN = 600;
 // one field with no bound was the one that skipped every guard. GraderContext
 // is a plain interface any caller can fill, so the cap belongs here rather than
 // in a caller's discipline.
-const INTENT_MAX = 200;
+//
+// Exported because sampling-rank.ts's tiebreak prompt interpolates the SAME
+// intent from the SAME dispatch call -- and under the "aggressive" effort dial
+// sends it up to MAX_SAMPLES times per dispatch. One constant keeps the two
+// prompts' idea of "how much intent is worth paying for" from drifting apart.
+export const INTENT_MAX = 200;
+
+/** Cut `s` to at most `max` UTF-16 code units with a visible `...` marker, so
+ *  the LLM can tell a cut from a sentence that happened to end there. Shared
+ *  by the grader prompt and sampling-rank's tiebreak prompt (one bound, one
+ *  cut rule). A plain slice can land INSIDE a surrogate pair -- an emoji or a
+ *  CJK extension character straddling the boundary -- and leave a lone high
+ *  surrogate that the MCP SDK serializes as an escape a strict encoder on the
+ *  client side rejects, turning the sample into a silent null vote. The cut
+ *  therefore backs off one unit when it ends on a high surrogate. */
+export function capForPrompt(s: string, max: number): string {
+  if (s.length <= max) return s;
+  let cut = s.slice(0, max);
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+  return `${cut}...`;
+}
 
 export interface GraderContext {
   // The dispatch intent the server was routed for, if known. Best-effort:
@@ -108,8 +128,7 @@ export function buildGraderPrompt(ctx: GraderContext): string {
   const lines = ["You are grading whether an MCP tool call accomplished its goal."];
   const intent = ctx.intent?.trim() ?? "";
   if (intent.length > 0) {
-    const goal = intent.length > INTENT_MAX ? `${intent.slice(0, INTENT_MAX)}...` : intent;
-    lines.push("", `Goal: ${goal}`);
+    lines.push("", `Goal: ${capForPrompt(intent, INTENT_MAX)}`);
   }
   // Wrap the THIRD-PARTY tool output in a fenced delimiter and instruct the
   // grader to treat its contents as data, not instructions. An upstream MCP

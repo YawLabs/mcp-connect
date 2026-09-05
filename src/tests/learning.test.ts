@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { LEARNING_MAX_BOOST, LEARNING_MIN_BOOST, LEARNING_MIN_OBSERVATIONS, LearningStore } from "../learning.js";
+import {
+  LEARNING_MAX_BOOST,
+  LEARNING_MIN_BOOST,
+  LEARNING_MIN_OBSERVATIONS,
+  LearningStore,
+  type NamespaceUsage,
+} from "../learning.js";
 
 describe("LearningStore", () => {
   it("returns 1.0 boost for unknown namespaces", () => {
@@ -83,8 +89,33 @@ describe("LearningStore", () => {
     expect(store.get("gh")).toBeUndefined();
   });
 
+  describe("loadSnapshot row guard", () => {
+    it("skips a null row instead of throwing on the first dereference", () => {
+      const store = new LearningStore();
+      // The signature promises NamespaceUsage rows, so a null one can only
+      // arrive from a caller that parsed state.json itself (bypassing
+      // persistence.ts sanitizeLearning). It used to throw "Cannot read
+      // properties of null (reading 'dispatched')" and abort the whole
+      // restore, taking every GOOD row down with it.
+      const snapshot = { bad: null, gh: { dispatched: 3, succeeded: 2, lastUsedAt: 7 } };
+      expect(() => store.loadSnapshot(snapshot as unknown as Record<string, NamespaceUsage>)).not.toThrow();
+      expect(store.get("bad")).toBeUndefined();
+      expect(store.get("gh")).toEqual({ dispatched: 3, succeeded: 2, lastUsedAt: 7 });
+    });
+
+    it("drops a primitive row rather than admitting it as an all-zero entry", () => {
+      const store = new LearningStore();
+      // A string row did NOT throw -- property reads on a primitive yield
+      // undefined, which the numeric coercions turned into a phantom
+      // {0, 0, 0} row that then round-tripped to disk on every flush.
+      store.loadSnapshot({ junk: "not a row" } as unknown as Record<string, NamespaceUsage>);
+      expect(store.get("junk")).toBeUndefined();
+      expect(Object.keys(store.exportSnapshot())).toEqual([]);
+    });
+  });
+
   describe("recordSuccess without prior recordDispatch (fix 11)", () => {
-    it("does not understate dispatched when only successes are recorded", () => {
+    it("boostFactor coerces dispatched up to succeeded when only successes were recorded", () => {
       const store = new LearningStore();
       // Record 5 successes without any recordDispatch call. The coerce in
       // boostFactor must treat dispatched = max(0, 5) = 5, not 0 -- a 0

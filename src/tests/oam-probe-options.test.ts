@@ -147,6 +147,24 @@ describe("probeOam default runner", () => {
     expect(probe.version).toBe("9.9.9");
   });
 
+  it("hands oam an env with yaw-mcp's own secrets stripped", async () => {
+    // README promises the vault passphrase is stripped from every child
+    // yaw-mcp starts; this probe inherited process.env whole. The rest of the
+    // env must still arrive (oam needs PATH and HOME), so the pin is on the
+    // one key, not on an empty env.
+    vi.stubEnv("YAW_MCP_VAULT_PASSPHRASE", "hunter2-do-not-leak");
+    try {
+      await probeOam();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(spawnCalls).toHaveLength(1);
+    const env = spawnCalls[0].opts.env as NodeJS.ProcessEnv | undefined;
+    expect(env, "spawn must pass an explicit env").toBeDefined();
+    expect(env).not.toHaveProperty("YAW_MCP_VAULT_PASSPHRASE");
+    expect(Object.keys(env ?? {}).length).toBeGreaterThan(0);
+  });
+
   it("keeps the event loop responsive while a wedged binary is being probed", async () => {
     // THE regression this file exists for. Under the old synchronous probe the
     // call blocked the loop outright, so nothing else could run until it

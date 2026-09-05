@@ -5,7 +5,8 @@
 `src/tests/foundry-routing.test.ts` is a BM25 routing-regression gate that
 consumes a corpus of **real harvested dispatches**. That corpus has never been
 produced, so the gate has never run. It reports itself as a `todo` plus a
-stderr banner on every `npm test`; it does not fail CI.
+stderr banner on every `npm test`; it does not fail `npm test` (there is no CI
+by policy -- the local gates `release.sh` runs are the release check).
 
 **The fixture is deliberately absent, not missing by accident.** Read the
 "Do not hand-write this file" section before you try to make the gate green.

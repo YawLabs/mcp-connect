@@ -137,12 +137,17 @@ export const SUBCOMMAND_SPEC: SubcommandSpec[] = [
     name: "try",
     description: "Wire a one-off trial of a catalog server",
     positional: [["<slug>"]],
-    flags: ["--client", "--ttl", "--env", "--dry-run", "--base", "--help"],
+    flags: ["--client", "--ttl", "--env", "--dry-run", "--yes", "--help"],
   },
-  { name: "try-cleanup", description: "Remove a wired trial", positional: [["<slug>"]], flags: ["--base", "--help"] },
+  { name: "try-cleanup", description: "Remove a wired trial", positional: [["<slug>"]], flags: ["--help"] },
   // Inspection.
   { name: "doctor", description: "Print diagnostic of yaw-mcp setup", flags: ["--json", "--help"] },
-  { name: "servers", description: "DEPRECATED -- account mode removed, use list", flags: ["--json", "--help"] },
+  // `servers` is deliberately NOT here. It is still dispatched -- Yaw Terminal
+  // shells out to `yaw-mcp servers --json` and reads signedIn:false from its
+  // always-non-zero exit -- but it is a deprecation stub, and completing a
+  // deprecated thing teaches it to new users: the same rule that hides
+  // --token above. completion-cmd.test.ts's drift guard carries the matching
+  // exemption.
   {
     name: "bundles",
     description: "Browse curated multi-server bundles",
@@ -396,7 +401,8 @@ _yaw-mcp "$@"
 
 function renderFish(): string {
   // One helper, emitted once, resolves the ACTIVE subcommand. The flag lines
-  // below used to be guarded by `__fish_seen_subcommand_from <name>`, which
+  // below (and, one release later, the positional lines) used to be guarded
+  // by `__fish_seen_subcommand_from <name>`, which
   // matches a token ANYWHERE on the line -- so `yaw-mcp sidecars install
   // --<TAB>` saw the `install` token (a positional VALUE of `sidecars`) and
   // offered install's flags, none of which `sidecars` accepts. The helper takes
@@ -437,8 +443,13 @@ complete -c yaw-mcp -f`;
     // subcommand), so the expected count for slotIndex N is N + 2.
     for (const { candidates, index } of realPositionals(spec)) {
       const expectedCount = index + 2;
+      // Same active-subcommand helper the flag lines use (see the header
+      // above): `__fish_seen_subcommand_from` matches its argument ANYWHERE
+      // on the line, so with a positional VALUE that is also a subcommand
+      // name (`sidecars install`, `secrets list`) the token count alone
+      // decided whose candidates fish offered.
       positionalLines.push(
-        `complete -c yaw-mcp -n "__fish_seen_subcommand_from ${spec.name}; and test (count (commandline -opc)) -eq ${expectedCount}" -a "${candidates.join(" ")}"`,
+        `complete -c yaw-mcp -n "__yaw_mcp_using_subcommand ${spec.name}; and test (count (commandline -opc)) -eq ${expectedCount}" -a "${candidates.join(" ")}"`,
       );
     }
     for (const f of spec.flags) {

@@ -31,9 +31,16 @@
 //
 // Two small JSON memos keep a REPEATED startup cheap, where the lock only
 // covers a simultaneous one:
-//   - a machine-wide "checked recently" stamp throttles the registry probe.
+//   - a machine-wide "checked recently" memo throttles the registry probe.
 //     The lock is taken well after the fetch, so it never covered it, and
-//     without the memo every serve start hits registry.npmjs.org.
+//     without the memo every serve start hits registry.npmjs.org. The memo
+//     carries the ANSWER (the latest version, or null for an unreachable
+//     registry), not just a timestamp: it is keyed by uid alone, so a copy
+//     of yaw-mcp that cannot act on staleness (Yaw Terminal's bundled copy,
+//     an npx run) would otherwise re-arm it on every restart, and a
+//     global-npm copy on the same machine, reading "checked recently", would
+//     never evaluate its own staleness at all. With the answer cached, a
+//     later process of ANY install method still gets to its own plan.
 //   - a per-lock "already attempted this version" stamp stops a permanently
 //     failing install (the classic being EACCES on a sudo-installed global)
 //     from re-running a full `npm install -g` on every single serve start. A
@@ -46,7 +53,18 @@
 // over -- see defaultSpawn):
 //   - The lock is advisory and best-effort: a prefix we cannot write to
 //     yields no lock and the old unserialized behavior, and a lock left
-//     behind by a killed process is stolen once it goes stale.
+//     behind by a killed process is stolen once it goes stale (by rename, so
+//     two stealers cannot both win -- see acquireUpgradeLock). A crash between
+//     that rename and its unlink leaves a `.yaw-mcp-upgrade.lock.stale-<pid>`
+//     file behind that nothing reads.
+//   - The attempt memo (`<prefix>/.yaw-mcp-upgrade.lock.attempt`) is never
+//     deleted, not even after a successful upgrade, so every global prefix
+//     yaw-mcp has ever self-upgraded from keeps that one dotfile. Deliberate:
+//     an install that exits 0 into the WRONG tree (the multi-prefix case the
+//     `--prefix` machinery narrows but cannot close) leaves the running copy
+//     stale, and the memo is what keeps THAT from re-running a full npm
+//     install on every serve start for six hours. Deleting it on exit 0 would
+//     trade a stray 40-byte file for exactly that loop.
 //   - The child is NOT detached, which on POSIX does not mean it dies
 //     with yaw-mcp -- it only dies when the client kills the whole
 //     process group/tree (which MCP clients commonly do). If it IS
@@ -61,11 +79,13 @@
 // globals where `npm install -g` would always EACCES.
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   openSync,
   readFileSync,
   realpathSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -73,6 +93,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
+import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import {
   buildUpgradePlan,
@@ -80,7 +101,10 @@ import {
   detectInstallMethod,
   detectSea,
   fetchLatestVersion,
+  GLOBAL_UPGRADE_METHODS,
+  globalUpgradeCommandLineForTool,
   npmGlobalPrefix,
+  upgradeSpawnSpec,
 } from "./upgrade-cmd.js";
 
 declare const __VERSION__: string;
@@ -176,7 +200,7 @@ export function detectRunningInstallPrefix(argvPath: string | undefined): string
   return candidate;
 }
 
-/** Emit a stderr warning when npm's configured global prefix differs from the
+/** Log a warning when npm's configured global prefix differs from the
  *  detected running-install prefix. `detected` must be the RAW (unquoted)
  *  prefix -- comparing the shell-quoted form against npm's unquoted answer
  *  never matches, so every startup on a Windows account with a space in the
@@ -204,11 +228,14 @@ async function compareWithNpmPrefix(
   // throws, which would silently drop the resolution back to a literal
   // comparison and reintroduce the junction false positive.
   if (comparablePath(npmPrefix.trim()) === comparablePath(detected)) return;
-  process.stderr.write(
-    `yaw-mcp self-upgrade: detected running prefix differs from \`npm prefix -g\`:\n` +
-      `  running:  ${detected}\n` +
-      `  npm -g:   ${npmPrefix}\n` +
-      `  Installing into the running prefix so the upgrade lands in the same tree the client spawned from.\n`,
+  // Through log(), not a raw process.stderr.write: everything else serve
+  // emits is one JSON line per event, and a four-line plain-text blob in the
+  // middle of that stream is what a client or operator parsing yaw-mcp's
+  // stderr tripped over. The two paths ride as structured fields.
+  log(
+    "warn",
+    "yaw-mcp self-upgrade: running prefix differs from `npm prefix -g`; installing into the running prefix so the upgrade lands in the tree the client spawned from",
+    { running: detected, npmPrefix },
   );
 }
 
@@ -216,8 +243,10 @@ async function compareWithNpmPrefix(
  *  not show up in a casual `ls` of a global prefix. A caller with no prefix of
  *  its own to lock passes a scoped name instead -- see the tmpdir fallback in
  *  maybeAutoUpgrade, where one fixed name would put every tool family (and, on
- *  a shared POSIX box, every user) on one file. sidecar-refresh.ts hardcodes
- *  this default by name for its mtime heartbeat, so it is not free to change. */
+ *  a shared POSIX box, every user) on one file. sidecars-cmd.ts passes its own
+ *  SIDECARS_LOCK_NAME explicitly rather than leaning on this default; that
+ *  constant deliberately EQUALS this value for the one mixed-version upgrade
+ *  window (see its doc), so change the two together or not at all. */
 const UPGRADE_LOCK_NAME = ".yaw-mcp-upgrade.lock";
 
 /** How long a lock is honoured before it is treated as abandoned. An install
@@ -234,6 +263,35 @@ const UPGRADE_LOCK_STALE_MS = 10 * 60 * 1000;
  *  immediately, which is the same as having no lock at all. Anything further
  *  ahead than this really is a stepped clock (see the steal rule below). */
 const UPGRADE_LOCK_FUTURE_SKEW_MS = 5 * 1000;
+
+/** Is the process that wrote `lockPath` still running? The lock records its
+ *  holder's pid (see take() below), so a lock whose holder is gone is stale
+ *  NOW, not after the ten-minute mtime window: an MCP client that kills
+ *  `serve` mid-refresh leaves the file behind, and the documented recovery
+ *  (`yaw-mcp sidecars install`, or the next `add`/`remove` on bundles.json)
+ *  was refused for the whole window with a "try again in a minute" that was
+ *  wrong for nine of them. `kill(pid, 0)` sends no signal: ESRCH is "no such
+ *  process" and settles it; EPERM is a live process we may not signal, which
+ *  is still live. Anything unreadable or unparseable answers true -- an
+ *  unknown holder is honoured, the mtime rule still bounds the wait. Windows
+ *  reuses pids slowly enough that a false positive here costs at most the old
+ *  behaviour (wait out the window). */
+function lockHolderAlive(lockPath: string): boolean {
+  let pid: number;
+  try {
+    pid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+  } catch {
+    return true;
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
 
 /** Best-effort cross-process lock around the background `npm install -g`.
  *
@@ -294,29 +352,86 @@ export function acquireUpgradeLock(dir: string, lockName: string = UPGRADE_LOCK_
   const first = take();
   if (first !== undefined) return first;
 
-  // Held. Steal it only once it is provably stale. An mtime further than the
-  // skew margin into the FUTURE (clock stepped backwards between the two runs)
-  // counts as stale too: no live process on this clock could have written it,
-  // and honouring it would suppress every upgrade until wall-clock caught up.
+  // Held. Steal it only once it is provably stale: its holder is gone
+  // (lockHolderAlive), or its mtime is past the window. An mtime further than
+  // the skew margin into the FUTURE (clock stepped backwards between the two
+  // runs) counts as stale too: no live process on this clock could have
+  // written it, and honouring it would suppress every upgrade until
+  // wall-clock caught up.
+  const isLive = (ageMs: number): boolean => ageMs > -UPGRADE_LOCK_FUTURE_SKEW_MS && ageMs < UPGRADE_LOCK_STALE_MS;
   let ageMs: number;
   try {
     ageMs = Date.now() - statSync(lockPath).mtimeMs;
   } catch {
     // Vanished between the open and the stat. Treat it as stale so the steal
-    // path runs: its unlink answers ENOENT, which retries the take below rather
+    // path runs: its rename answers ENOENT, which retries the take below rather
     // than reporting contention over a lock nobody holds.
     ageMs = UPGRADE_LOCK_STALE_MS;
   }
-  if (ageMs > -UPGRADE_LOCK_FUTURE_SKEW_MS && ageMs < UPGRADE_LOCK_STALE_MS) return null;
+  if (isLive(ageMs) && lockHolderAlive(lockPath)) return null;
+
+  // Steal by RENAME, not unlink. Two processes that both read the lock as
+  // stale used to both unlinkSync it, and a successful unlink cannot tell "I
+  // removed the stale file" from "I removed the file the OTHER stealer just
+  // took": A unlinks and retakes, B's unlink then removes A's fresh lock and
+  // B's take succeeds too -- two concurrent installs into one prefix, the
+  // exact outcome the lock exists to prevent. Renaming the stale file to a
+  // name private to this process makes the steal itself exclusive: only one
+  // rename of that inode can succeed, and the loser sees ENOENT.
+  const stolenPath = `${lockPath}.stale-${process.pid}`;
   try {
-    unlinkSync(lockPath);
+    renameSync(lockPath, stolenPath);
   } catch (err) {
-    // ENOENT is "there was nothing to steal" -- the holder released between the
-    // stat and here, or the file was already gone. The prefix is free, so fall
-    // through to the retry. Anything else means we lost the steal race, and
-    // whoever won it owns the lock now.
+    // ENOENT is "there was nothing left to steal" -- the holder released
+    // between the stat and here, or another stealer's rename won. Either way
+    // the path may be free now, and one retry of take() settles it: EEXIST
+    // there is the winner's fresh lock, and that answer is final. Anything
+    // else is a lost race too.
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
+    const retry = take();
+    return retry === undefined ? null : retry;
   }
+  // The rename moved SOME file, but not provably the stale one: the winner of
+  // an earlier steal can have retaken a FRESH lock at this path between our
+  // stat and our rename, and a rename cannot tell the two apart any more than
+  // an unlink could. So check the file actually caught. A live mtime means a
+  // running holder's lock was just pulled out from under it -- give it back
+  // and yield.
+  let stoleLive = false;
+  try {
+    stoleLive = isLive(Date.now() - statSync(stolenPath).mtimeMs) && lockHolderAlive(stolenPath);
+  } catch {
+    // Vanished under us: nothing to restore and nothing to unlink.
+  }
+  if (stoleLive) {
+    // Restore without clobbering anyone: re-create the path with O_EXCL and
+    // the holder's own pid, so its ownership-checked release still recognises
+    // the file. EEXIST here means a THIRD process took the path meanwhile; the
+    // live holder's lock is then simply gone, and the cost is bounded to one
+    // possible duplicate install in that three-way race (the pre-lock
+    // behavior) -- its release is ownership-checked, so nothing cascades.
+    try {
+      const holder = readFileSync(stolenPath, "utf8");
+      const fd = openSync(lockPath, "wx");
+      try {
+        writeSync(fd, holder);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // EEXIST, or the stolen file vanished: leave it.
+    }
+    try {
+      unlinkSync(stolenPath);
+    } catch {}
+    return null;
+  }
+  // Genuinely stale: discard it and take the freed path. The unlink is
+  // best-effort -- a crash between the rename and here leaves a
+  // `.stale-<pid>` file that nothing reads and no later steal contends on.
+  try {
+    unlinkSync(stolenPath);
+  } catch {}
   const second = take();
   return second === undefined ? null : second;
 }
@@ -331,12 +446,16 @@ function defaultAcquireLock(dir: string, lockName: string): (() => void) | null 
   return acquireUpgradeLock(dir, lockName);
 }
 
-/** How long a completed registry check is reused before another one fires.
- *  The check is a startup nicety, never a correctness input: without the memo
- *  every serve start hits registry.npmjs.org, and N panes starting at once
- *  means N requests -- the prefix lock is taken long after the fetch, so it
- *  never covered this. An hour keeps a same-day release reachable while
- *  collapsing a burst of startups into one request. */
+/** How long a completed registry check (and the answer it fetched) is reused
+ *  before another one fires. The check is a startup nicety, never a
+ *  correctness input: without the memo every serve start hits
+ *  registry.npmjs.org -- the prefix lock is taken long after the fetch, so it
+ *  never covered this. An hour keeps a same-day release reachable while a
+ *  REPEATED start within the hour reuses the cached answer. It does not
+ *  collapse a simultaneous burst: the memo is written only after the fetch
+ *  completes, so N panes starting inside the ~3s fetch window still make N
+ *  requests. (A provisional memo written before the fetch would close that,
+ *  at the price of a crashed fetch suppressing every re-check for an hour.) */
 const UPGRADE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 /** How long one background upgrade ATTEMPT suppresses another at the SAME
@@ -346,13 +465,13 @@ const UPGRADE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
  *  needs no expiry -- the next start is no longer stale and never gets here. */
 const UPGRADE_ATTEMPT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
-/** Age of a memo written by writeMemo, or null when there is no usable one:
- *  absent, unreadable, malformed, written for a different target version, or
- *  stamped further into the future than the clock-skew margin (same reasoning
- *  as the lock's future-dated steal rule -- a stepped clock is not evidence
- *  that anything happened recently). A memo only ever suppresses work, so every
- *  failure shape degrades to "do the work". */
-function memoAgeMs(path: string, version: string | null): number | null {
+/** A memo written by writeMemo, parsed and age-checked, or null when there is
+ *  no usable one: absent, unreadable, malformed, or stamped further into the
+ *  future than the clock-skew margin (same reasoning as the lock's
+ *  future-dated steal rule -- a stepped clock is not evidence that anything
+ *  happened recently). A memo only ever suppresses work, so every failure
+ *  shape degrades to "do the work". */
+function readMemo(path: string): { ageMs: number; memo: Record<string, unknown> } | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, "utf8"));
@@ -363,22 +482,29 @@ function memoAgeMs(path: string, version: string | null): number | null {
   // and reading `.at` off that throws OUTSIDE the parse try -- so the shape is
   // checked before anything is read off it.
   if (typeof parsed !== "object" || parsed === null) return null;
-  const memo = parsed as { at?: unknown; version?: unknown };
+  const memo = parsed as Record<string, unknown>;
   if (typeof memo.at !== "number") return null;
-  if (version !== null && memo.version !== version) return null;
-  const age = Date.now() - memo.at;
-  return age < -UPGRADE_LOCK_FUTURE_SKEW_MS ? null : age;
+  const ageMs = Date.now() - memo.at;
+  return ageMs < -UPGRADE_LOCK_FUTURE_SKEW_MS ? null : { ageMs, memo };
 }
 
-/** Best-effort memo write. An unwritable directory is not an error here: losing
- *  the memo costs a redundant check, never a wrong answer. */
-function writeMemo(path: string, version: string | null): void {
-  const memo = version === null ? { at: Date.now() } : { at: Date.now(), version };
+/** Best-effort memo write of `{ at: Date.now(), ...fields }`. An unwritable
+ *  directory is not an error here: losing the memo costs a redundant check,
+ *  never a wrong answer. */
+function writeMemo(path: string, fields: Record<string, unknown>): void {
   try {
-    writeFileSync(path, `${JSON.stringify(memo)}\n`);
+    writeFileSync(path, `${JSON.stringify({ at: Date.now(), ...fields })}\n`);
   } catch {
     // Read-only tmpdir / prefix, EACCES, EPERM -- degrade to no memo at all.
   }
+}
+
+/** What a fresh check memo hands back: the registry's answer as of that check.
+ *  `latest: null` is a cached "unreachable" -- an offline machine answers null
+ *  on every attempt, and re-probing an unreachable registry on each start is
+ *  the same waste the memo exists to stop. */
+export interface CachedCheck {
+  latest: string | null;
 }
 
 /** Machine-wide memo of the last completed registry check. It has to live in
@@ -389,37 +515,97 @@ function checkMemoPath(): string {
   return join(tmpdir(), `.yaw-mcp-upgrade-check-${process.getuid?.() ?? "win"}.json`);
 }
 
+/** The cached registry answer at `path`, or null when there is none to reuse:
+ *  no usable memo (see readMemo), one older than UPGRADE_CHECK_INTERVAL_MS, or
+ *  one without a `latest` field. That last case is the memo an older yaw-mcp
+ *  wrote -- a bare timestamp -- and it is deliberately NOT honoured as
+ *  "checked recently": a timestamp-only memo is precisely what let a
+ *  non-actionable copy (bundled-app, npx) starve a global-npm copy on the same
+ *  machine of ever evaluating its own staleness. Exported for tests: the
+ *  default hooks below short-circuit under vitest. */
+export function readCheckMemo(path: string): CachedCheck | null {
+  const read = readMemo(path);
+  if (read === null || read.ageMs >= UPGRADE_CHECK_INTERVAL_MS) return null;
+  const latest = read.memo.latest;
+  if (latest !== null && typeof latest !== "string") return null;
+  return { latest };
+}
+
+/** Record a completed registry check together with its answer. Exported for
+ *  tests, as readCheckMemo is. */
+export function writeCheckMemo(path: string, latest: string | null): void {
+  writeMemo(path, { latest });
+}
+
 /** The attempt memo sits next to the lock whose name it borrows, so it inherits
  *  that scoping for free: per prefix for a detected global install, per tool +
- *  uid for the tmpdir fallback. */
+ *  uid for the tmpdir fallback. Keyed on the target version: a memo written
+ *  for a different version is no evidence about this one. */
 function attemptMemoPath(dir: string, lockName: string): string {
   return join(dir, `${lockName}.attempt`);
+}
+
+/** Where the attempt memo goes when `dir` cannot take it: the classic is a
+ *  sudo-installed global (`/usr/local/lib/node_modules`) that a non-root
+ *  `serve` can neither write a memo into nor lock. Without a fallback that
+ *  install re-spawned `npm install -g` on EVERY start -- the check memo caches
+ *  the registry answer, the attempt memo silently failed to land, the lock
+ *  handed back a no-op release, and nothing between the cache and the spawn
+ *  could say "already tried". Scoped by uid and by a hash of the prefix + lock
+ *  name so two prefixes (or two users on a shared box) never share one. */
+function attemptMemoFallbackPath(dir: string, lockName: string, fallbackDir: string): string {
+  const scope = createHash("sha256").update(`${dir}\0${lockName}`).digest("hex").slice(0, 16);
+  return join(fallbackDir, `.yaw-mcp-upgrade-attempt-${process.getuid?.() ?? "win"}-${scope}.json`);
 }
 
 // The four defaults below short-circuit under vitest for the same reason
 // defaultAcquireLock does: no unit test may write a memo into a real tmpdir or
 // global prefix, and none may inherit one left by an earlier test in the run.
 // Tests that mean to exercise the wiring inject the hooks instead.
-function defaultCheckedRecently(): boolean {
-  if (process.env.VITEST) return false;
-  const age = memoAgeMs(checkMemoPath(), null);
-  return age !== null && age < UPGRADE_CHECK_INTERVAL_MS;
+function defaultCheckedRecently(): CachedCheck | null {
+  if (process.env.VITEST) return null;
+  return readCheckMemo(checkMemoPath());
 }
 
-function defaultRecordCheck(): void {
+function defaultRecordCheck(latest: string | null): void {
   if (process.env.VITEST) return;
-  writeMemo(checkMemoPath(), null);
+  writeCheckMemo(checkMemoPath(), latest);
 }
 
 function defaultAttemptedRecently(dir: string, lockName: string, version: string): boolean {
   if (process.env.VITEST) return false;
-  const age = memoAgeMs(attemptMemoPath(dir, lockName), version);
-  return age !== null && age < UPGRADE_ATTEMPT_COOLDOWN_MS;
+  return attemptedRecentlyAt(dir, lockName, version);
 }
 
 function defaultRecordAttempt(dir: string, lockName: string, version: string): void {
   if (process.env.VITEST) return;
-  writeMemo(attemptMemoPath(dir, lockName), version);
+  recordAttemptAt(dir, lockName, version);
+}
+
+/** The memo logic behind the two defaults, exported for tests: the in-prefix
+ *  memo is authoritative when present; the fallback under `fallbackDir`
+ *  (the real tmpdir in production; a sandbox in tests, which must never
+ *  write into the machine's temp dir) answers when the prefix was
+ *  unwritable (see attemptMemoFallbackPath). */
+export function attemptedRecentlyAt(dir: string, lockName: string, version: string, fallbackDir = tmpdir()): boolean {
+  const recent = (read: ReturnType<typeof readMemo>): boolean =>
+    read !== null && read.memo.version === version && read.ageMs < UPGRADE_ATTEMPT_COOLDOWN_MS;
+  if (recent(readMemo(attemptMemoPath(dir, lockName)))) return true;
+  return recent(readMemo(attemptMemoFallbackPath(dir, lockName, fallbackDir)));
+}
+
+export function recordAttemptAt(dir: string, lockName: string, version: string, fallbackDir = tmpdir()): void {
+  // writeMemo swallows every failure, so probe the prefix write ourselves:
+  // the fallback is written only when the prefix memo did not land, keeping
+  // the in-prefix file the source of truth wherever it CAN exist.
+  const primary = attemptMemoPath(dir, lockName);
+  try {
+    writeFileSync(primary, `${JSON.stringify({ at: Date.now(), version })}\n`);
+    return;
+  } catch {
+    // Read-only prefix (EACCES/EPERM/EROFS): fall through to the fallback dir.
+  }
+  writeMemo(attemptMemoFallbackPath(dir, lockName, fallbackDir), { version });
 }
 
 export interface AutoUpgradeDeps {
@@ -444,11 +630,14 @@ export interface AutoUpgradeDeps {
   npmPrefixImpl?: () => Promise<string | null>;
   /** Test hook: force single-executable (SEA binary) detection. */
   isSeaImpl?: () => boolean | Promise<boolean>;
-  /** Test hook: replace the "a registry check already ran recently" memo.
-   *  Needed in tests because the default short-circuits to false under VITEST. */
-  checkedRecentlyImpl?: () => boolean;
-  /** Test hook: replace the recorder for a completed registry check. */
-  recordCheckImpl?: () => void;
+  /** Test hook: replace the "a registry check already ran recently" memo. A
+   *  non-null answer is the CACHED registry result and skips the fetch; null
+   *  means "no fresh check, go ask". Needed in tests because the default
+   *  short-circuits to null under VITEST. */
+  checkedRecentlyImpl?: () => CachedCheck | null;
+  /** Test hook: replace the recorder for a completed registry check. Receives
+   *  the answer the fetch produced (null for an unreachable registry). */
+  recordCheckImpl?: (latest: string | null) => void;
   /** Test hook: replace the "this exact upgrade was already attempted" memo. */
   attemptedRecentlyImpl?: (dir: string, lockName: string, version: string) => boolean;
   /** Test hook: replace the recorder for a background upgrade attempt. */
@@ -470,18 +659,22 @@ function defaultSpawn(cmd: string, args: string[], onDone: () => void = () => {}
     onDone();
   };
 
-  // Build the corrective command the user should run for their tool.
-  // Only npm gets the EACCES/sudo hint -- pnpm and bun manage their own
-  // permissions and the sudo suggestion doesn't apply to them.
-  const correctiveCmd =
-    cmd === "npm"
-      ? "npm install -g @yawlabs/mcp@latest"
-      : cmd === "pnpm"
-        ? "pnpm add -g @yawlabs/mcp@latest"
-        : "bun add -g @yawlabs/mcp@latest";
+  // The corrective command the user should run for their tool comes from the
+  // same whitelist table the spawn argv did (upgrade-cmd's UPGRADE_COMMANDS),
+  // keyed by tool because that is all this function is handed. Null only for
+  // a tool the table does not know, which maybeAutoUpgrade never passes.
+  const correctiveCmd = globalUpgradeCommandLineForTool(cmd);
 
   const child = spawn(cmd, args, {
     stdio: "ignore",
+    // yaw-mcp's own secrets stay out of the install. npm runs every
+    // dependency's pre/postinstall with this env, and README tells the user to
+    // put YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's env block precisely because
+    // "yaw-mcp strips its own secrets from every child env" -- a promise the
+    // upstream spawn kept and this one, spawning with the full inherited
+    // process.env, silently did not: a compromised transitive dependency's
+    // install script plus ~/.yaw-mcp/secrets.json was the whole vault.
+    env: stripInternalSecretsFromEnv(process.env),
     // Not detached, so the install shares yaw-mcp's process group and an MCP
     // client that tears down the whole tree takes it with it. Two things this
     // does NOT buy (the file header lists both as known gaps): on POSIX a
@@ -501,10 +694,13 @@ function defaultSpawn(cmd: string, args: string[], onDone: () => void = () => {}
       // stdio is "ignore" so we can't surface the underlying tool error.
       // The common cause for npm is a non-user-writable global prefix
       // (yaw-mcp was installed with sudo); pnpm/bun have analogous issues.
+      // Only npm gets the EACCES/sudo hint -- pnpm and bun manage their own
+      // permissions and the sudo suggestion doesn't apply to them.
       const hint = cmd === "npm" ? " (often EACCES on a sudo-installed global -- run with the right permissions)" : "";
+      const manual = correctiveCmd === null ? "Set" : `Run \`${correctiveCmd}\` manually, or set`;
       log(
         "warn",
-        `yaw-mcp self-upgrade: ${cmd} exited non-zero${hint}. Run \`${correctiveCmd}\` manually, or set YAW_MCP_AUTO_UPGRADE=0 to silence this.`,
+        `yaw-mcp self-upgrade: ${cmd} exited non-zero${hint}. ${manual} YAW_MCP_AUTO_UPGRADE=0 to silence this.`,
         { code },
       );
     }
@@ -514,38 +710,6 @@ function defaultSpawn(cmd: string, args: string[], onDone: () => void = () => {}
     finish();
     log("warn", `yaw-mcp self-upgrade: ${cmd} spawn failed`, { error: err?.message });
   });
-}
-
-/** Classify the install method from argv[1], resolving symlinks when the
- *  literal answer is one this module cannot act on.
- *
- *  detectInstallMethod already realpaths a literal `unknown` -- and the ORDER
- *  is load-bearing there (see its docblock: resolving a pnpm global FIRST lands
- *  in the store and reads as local-node-modules), so a literal that classifies
- *  is never second-guessed. That leaves one gap this path cares about:
- *  `local-node-modules` IS a literal answer, so a `node_modules/@yawlabs/mcp`
- *  that is a symlink into a global prefix -- `npm link`, a bin shim staged into
- *  a project tree -- keeps the local classification and never
- *  background-upgrades, even though the bytes actually running belong to the
- *  global install. Re-running the classifier on the resolved path answers for
- *  the tree the code really lives in.
- *
- *  Filesystem-only: the ~3s `npm prefix -g` objection documented at the call
- *  site does not apply. It degrades safely in both directions -- an `npm
- *  link`ed checkout resolves to `dev-checkout` and a project-local shim back to
- *  `local-node-modules`, and neither spawns anything. */
-function classifyInstallMethod(argvPath: string | undefined): ReturnType<typeof detectInstallMethod> {
-  const literal = detectInstallMethod(argvPath);
-  if (argvPath === undefined || (literal !== "unknown" && literal !== "local-node-modules")) return literal;
-  let resolved: string;
-  try {
-    resolved = realpathSync(argvPath);
-  } catch {
-    // Nonexistent or unreadable: the literal answer stands, exactly as
-    // detectRunningInstallPrefix and comparablePath degrade.
-    return literal;
-  }
-  return resolved === argvPath ? literal : detectInstallMethod(resolved);
 }
 
 /** Fire-and-forget startup self-upgrade check. Resolves once the check
@@ -561,9 +725,8 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   if (current === "dev") return;
 
   const argvPath = deps.argvPath ?? process.argv[1];
-  // NOTE: maybeAutoUpgrade deliberately uses the classifier's fast, synchronous
-  // path-pattern heuristic (classifyInstallMethod above, which adds only a
-  // realpath to detectInstallMethod) rather than the async
+  // NOTE: maybeAutoUpgrade deliberately uses detectInstallMethod's fast,
+  // synchronous path-pattern heuristic rather than the async
   // refineInstallMethod (which runs `npm prefix -g` -- a ~3s npm
   // subprocess -- to distinguish a real global-npm install from a local
   // node_modules install that happens to share a path prefix). The serve
@@ -574,19 +737,38 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // no background upgrade fires for it even when stale. Users in that setup
   // should run `yaw-mcp upgrade --run` manually, or set the standard npm
   // global prefix.
+  //
+  // `local-node-modules` joins `unknown` in the realpath second chance (the
+  // CLI resolves `unknown` only -- see detectInstallMethod's docblock for why
+  // the literal answer is otherwise never second-guessed). It IS a literal
+  // answer, so a `node_modules/@yawlabs/mcp` that is a symlink into a global
+  // prefix -- `npm link`, a bin shim staged into a project tree -- would keep
+  // the local classification and never background-upgrade, even though the
+  // bytes actually running belong to the global install. Filesystem-only, so
+  // the ~3s objection above does not apply, and it degrades safely in both
+  // directions: an `npm link`ed checkout resolves to `dev-checkout` and a
+  // project-local shim back to `local-node-modules`, and neither spawns.
   const method = (deps.isSeaImpl ? await deps.isSeaImpl() : await detectSea())
     ? "binary"
-    : classifyInstallMethod(argvPath);
+    : detectInstallMethod(argvPath, realpathSync, ["unknown", "local-node-modules"]);
 
   // Throttle the registry probe itself. The lock below is acquired well AFTER
   // the fetch, so it never covered it: without this, every serve start hits
-  // registry.npmjs.org and N panes starting at once means N requests.
-  if ((deps.checkedRecentlyImpl ?? defaultCheckedRecently)()) return;
-  const latest = await (deps.fetchLatestImpl ?? fetchLatestVersion)();
-  // Record the check whichever way it went. An offline machine answers null on
-  // every attempt, and re-probing an unreachable registry on each start is the
-  // same waste this memo exists to stop.
-  (deps.recordCheckImpl ?? defaultRecordCheck)();
+  // registry.npmjs.org. A fresh memo carries the ANSWER, so a repeated start
+  // (of this copy, or of any other install on the machine) evaluates its own
+  // staleness from the cache instead of skipping the evaluation altogether --
+  // see the file header on how a timestamp-only memo starved global-npm copies.
+  const cached = (deps.checkedRecentlyImpl ?? defaultCheckedRecently)();
+  let latest: string | null;
+  if (cached !== null) {
+    latest = cached.latest;
+  } else {
+    latest = await (deps.fetchLatestImpl ?? fetchLatestVersion)();
+    // Record the check whichever way it went. An offline machine answers null
+    // on every attempt, and re-probing an unreachable registry on each start
+    // is the same waste this memo exists to stop.
+    (deps.recordCheckImpl ?? defaultRecordCheck)(latest);
+  }
   // Offline / registry unreachable / malformed response -- no-op.
   if (latest === null) return;
 
@@ -616,19 +798,11 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
   // prefix, so any account with a space in its name hit it on every stale
   // startup. Quote for the shell we actually invoke.
   const quotedPrefix = rawPrefix === null ? null : quoteShellArgIfNeeded(rawPrefix);
-  const globalSpec =
-    method === "global-npm"
-      ? {
-          cmd: "npm",
-          args: quotedPrefix
-            ? ["install", "-g", "--prefix", quotedPrefix, "@yawlabs/mcp@latest"]
-            : ["install", "-g", "@yawlabs/mcp@latest"],
-        }
-      : method === "pnpm-global"
-        ? { cmd: "pnpm", args: ["add", "-g", "@yawlabs/mcp@latest"] }
-        : method === "bun-global"
-          ? { cmd: "bun", args: ["add", "-g", "@yawlabs/mcp@latest"] }
-          : null;
+  // One whitelist for every spawn surface (upgrade-cmd's UPGRADE_COMMANDS):
+  // `--prefix` is inserted only for global-npm, and only when the prefix
+  // survived quoting -- a null quotedPrefix drops the flag rather than emit a
+  // mangled command line, and pnpm/bun never get one (rawPrefix is null there).
+  const globalSpec = GLOBAL_UPGRADE_METHODS.includes(method) ? upgradeSpawnSpec(method, quotedPrefix) : null;
   if (globalSpec) {
     // Serialize concurrent background installs into one prefix. N MCP clients
     // starting at once each reach this line with the same verdict; without the
@@ -688,7 +862,11 @@ export async function maybeAutoUpgrade(deps: AutoUpgradeDeps = {}): Promise<void
     // warning claims we install into the running prefix, which is only true
     // when the `--prefix` flag actually survived quoting.
     if (method === "global-npm" && rawPrefix !== null && quotedPrefix !== null) {
-      void compareWithNpmPrefix(rawPrefix, deps.npmPrefixImpl);
+      // Fire-and-forget WITH a rejection sink. The default probe never
+      // rejects, but an injected npmPrefixImpl (or a future comparablePath
+      // that throws) would otherwise become an unhandled rejection inside
+      // serve, which Node terminates the process on.
+      compareWithNpmPrefix(rawPrefix, deps.npmPrefixImpl).catch(() => {});
     }
     // Record the attempt BEFORE the spawn, not after it settles: the failure
     // this memo exists for (a torn-down process tree, a synchronous throw) is

@@ -23,11 +23,10 @@
 //      printed on stdout -- only the cache is missing. Deliberately distinct
 //      from 1 and 2, both of which mean nothing was graded at all.
 
-import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { locateComplianceSuite } from "./compliance-cmd.js";
 import { gradesCachePath, writeGrade } from "./grades-cache.js";
+import { scrubForWarning } from "./health-score.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { hasSecretRefs } from "./secrets-vault.js";
@@ -63,9 +62,11 @@ export interface AuditCommandOptions {
   platform?: NodeJS.Platform;
 }
 
+/** Only the exit code. index.ts reads nothing else, and tests capture output
+ *  through the out/err hooks -- a `lines` transcript used to ride along here
+ *  with no consumer at all. */
 export interface AuditCommandResult {
   exitCode: number;
-  lines: string[];
 }
 
 /** cmd.exe metacharacters that split or redirect an UNQUOTED command line:
@@ -142,6 +143,14 @@ const SECRET_FLAG_RE = /^--?[a-z0-9_-]*(token|secret|passw|apikey|api[-_]?key|au
  * like `--token` / `--api-key`. The flag name itself is echoed back with the
  * operator's original casing. A flag outside the exact set still redacts when
  * its NAME matches SECRET_FLAG_RE (`--access-token`, `--client_secret`, ...).
+ *
+ * This is the FIRST of two passes over the preamble. It knows only the two
+ * flag shapes above; a credential anywhere else -- inside a URL's query
+ * string, an `Authorization: Bearer ...` header arg, an inline JSON body --
+ * is not a flag value and printed in the clear. The joined line therefore
+ * also goes through health-score's scrubForWarning (see runAudit), which
+ * covers exactly those shapes; keeping this pass is what preserves the
+ * `--flag <redacted>` rendering the operator reads the argv by.
  *
  * Exported for tests -- the redaction is a leak-prevention control, so it is
  * asserted directly as well as through the `audit` preamble.
@@ -230,48 +239,19 @@ function findServer(servers: UpstreamServerConfig[], namespace: string): Upstrea
  * ("2025-11-25"), identical across compliance releases, so persisting it made
  * every rubric's letters indistinguishable.
  *
- * Read straight off the package.json on disk rather than through the module
- * system: the package's `exports` map carries only an `import` condition (no
- * `require`/`default` and no "./package.json" subpath), so both createRequire
- * resolution and a package.json subpath import throw
- * ERR_PACKAGE_PATH_NOT_EXPORTED. The ancestor walk below mirrors Node's own
- * node_modules lookup (<dir>/node_modules at every level up to the root), so
- * the copy found is the copy `import()` loads.
+ * The lookup itself (an ancestor walk over node_modules, read off the manifest
+ * because the package's `exports` map hides it from the module system) lives
+ * in compliance-cmd.ts as locateComplianceSuite: `compliance` needs the same
+ * install to spawn its bin script, and keeping the walk there means that
+ * command no longer imports this module -- and with it upstream.ts and the
+ * vault -- just to read a version string.
  *
  * `fromUrl` is injectable for tests; it defaults to this module's own URL.
  * Returns undefined (never throws) when nothing resolvable is found -- the
  * cache entry then simply omits `suiteVersion`, same as a pre-field entry.
  */
 export async function resolveComplianceSuiteVersion(fromUrl: string = import.meta.url): Promise<string | undefined> {
-  let here: string;
-  try {
-    here = fileURLToPath(fromUrl);
-  } catch {
-    return undefined;
-  }
-  for (let dir = dirname(here); ; dir = dirname(dir)) {
-    const pjPath = join(dir, "node_modules", "@yawlabs", "mcp-compliance", "package.json");
-    let raw: string;
-    try {
-      raw = await readFile(pjPath, "utf8");
-    } catch {
-      if (dirname(dir) === dir) return undefined;
-      continue;
-    }
-    // Nearest installed copy found -- the one Node resolves. Do NOT keep
-    // walking on a bad manifest: an ancestor's copy would be a DIFFERENT
-    // install, and attributing its version here would mislabel the rubric.
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      const version =
-        parsed && typeof parsed === "object" && !Array.isArray(parsed)
-          ? (parsed as Record<string, unknown>).version
-          : undefined;
-      return typeof version === "string" && version.length > 0 ? version : undefined;
-    } catch {
-      return undefined;
-    }
-  }
+  return (await locateComplianceSuite(fromUrl))?.version;
 }
 
 /** Lazily load the real compliance runner. Kept behind a dynamic import so a
@@ -303,15 +283,8 @@ async function defaultRunner(target: {
 export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCommandResult> {
   const write = opts.out ?? ((s: string) => process.stdout.write(s));
   const writeErr = opts.err ?? ((s: string) => process.stderr.write(s));
-  const lines: string[] = [];
-  const print = (s = ""): void => {
-    lines.push(s);
-    write(`${s}\n`);
-  };
-  const printErr = (s: string): void => {
-    lines.push(s);
-    writeErr(`${s}\n`);
-  };
+  const print = (s = ""): void => write(`${s}\n`);
+  const printErr = (s: string): void => writeErr(`${s}\n`);
 
   const namespace = opts.namespace;
   if (!namespace) {
@@ -321,7 +294,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     // Exit 2 matches the parse-layer usage-error convention (index.ts), not
     // the exit-1 "namespace not found" case below.
     printErr("yaw-mcp audit: missing <namespace>.");
-    return { exitCode: 2, lines };
+    return { exitCode: 2 };
   }
 
   const home = opts.home ?? homedir();
@@ -340,7 +313,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     printErr(
       `yaw-mcp audit: no server named "${namespace}" in bundles.json${where}. Run \`yaw-mcp list\` to see configured servers.`,
     );
-    return { exitCode: 1, lines };
+    return { exitCode: 1 };
   }
 
   // Only stdio/command servers are auditable here. A remote server carries a
@@ -354,7 +327,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     } else {
       printErr(`yaw-mcp audit: "${namespace}" has no command to spawn -- it can't be audited as a stdio server.`);
     }
-    return { exitCode: 2, lines };
+    return { exitCode: 2 };
   }
 
   // Windows only: the compliance runner spawns the audited server with
@@ -381,7 +354,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
       printErr(
         `yaw-mcp audit: "${namespace}" cannot be audited on Windows -- its spawn config contains a cmd.exe metacharacter (& | < > ^ parentheses) in ${JSON.stringify(offender)}. The compliance suite spawns stdio targets through cmd.exe here, which would split the command line at that character. Rework the server's command/args in bundles.json to drop it, or audit this server on macOS/Linux.`,
       );
-      return { exitCode: 2, lines };
+      return { exitCode: 2 };
     }
   }
 
@@ -404,7 +377,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
       printErr(
         `yaw-mcp audit: "${namespace}" references vault secrets (${refNames.join(", ")}) that could not be resolved: ${msg}. Set YAW_MCP_VAULT_PASSPHRASE (and store the secrets with \`yaw-mcp secrets set\`) so the audit runs with the server's real environment.`,
       );
-      return { exitCode: 2, lines };
+      return { exitCode: 2 };
     }
   }
   // The compliance runner spawns the audited server with `{ ...process.env,
@@ -424,9 +397,24 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
   // In --json mode stdout must be pure JSON (the Yaw MCP panel parses it), so
   // skip the human preamble; print it only for interactive use. (A server arg
   // containing a brace would otherwise corrupt brace-based JSON extraction.)
+  //
+  // Two redaction passes over the args, both display-only (the runner gets
+  // the raw argv). redactSecretArgs handles the `--flag value` shapes and keeps
+  // the flag name legible; scrubForWarning then covers everything that is not
+  // a flag value -- `?api_key=` in a URL, `Authorization: Bearer ...` in a
+  // header arg, a `"token":"..."` JSON body, a vendor-prefixed key -- which the
+  // first pass printed in the clear. Each ARG goes through it on its own, then
+  // they are joined: the scrubber's whole-clause tail runs to the next
+  // NAME=/NAME: pair or a dash-run, so on a space-joined line a
+  // `X-Api-Key: abc` arg swallowed every positional arg after it (a path, a
+  // port) and the closing paren; per-arg scrubbing bounds the tail at the
+  // argument. It also collapses runs of whitespace inside an arg to one
+  // space, which is fine for a preamble.
   if (!opts.json) {
-    const printableArgs = redactSecretArgs(target.args);
-    print(`Auditing "${namespace}" (${target.command}${printableArgs.length ? ` ${printableArgs.join(" ")}` : ""})...`);
+    const printableArgs = redactSecretArgs(target.args)
+      .map((a) => scrubForWarning(a))
+      .join(" ");
+    print(`Auditing "${namespace}" (${target.command}${printableArgs.length ? ` ${printableArgs}` : ""})...`);
   }
 
   const runner = opts.runner ?? defaultRunner;
@@ -441,7 +429,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     // local-bundles.ts downgraded for its untrusted-project probe.
     log("debug", "audit: compliance suite failed", { namespace, error: msg });
     printErr(`yaw-mcp audit: compliance suite failed for "${namespace}": ${msg}`);
-    return { exitCode: 2, lines };
+    return { exitCode: 2 };
   }
 
   const gradedAt = new Date().toISOString();
@@ -501,7 +489,7 @@ export async function runAudit(opts: AuditCommandOptions = {}): Promise<AuditCom
     printErr(
       `yaw-mcp audit: computed grade ${report.grade} but could not write ${gradesCachePath(home)}: ${cacheError}`,
     );
-    return { exitCode: 3, lines };
+    return { exitCode: 3 };
   }
-  return { exitCode: 0, lines };
+  return { exitCode: 0 };
 }

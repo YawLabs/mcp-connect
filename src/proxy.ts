@@ -1,3 +1,4 @@
+import { scrubForWarning } from "./health-score.js";
 import { log } from "./logger.js";
 import { META_TOOLS } from "./meta-tools.js";
 import type { UpstreamConnection, UpstreamServerConfig } from "./types.js";
@@ -480,7 +481,9 @@ export async function routeResourceRead(
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log("error", "Resource read failed", { uri, namespace: route.namespace, error: message });
+    // Scrubbed for the log line only -- see routeToolCall's catch for why.
+    // The client still gets the raw text in the body below.
+    log("error", "Resource read failed", { uri, namespace: route.namespace, error: scrubForWarning(message) });
     return { contents: [{ uri, text: `Error: ${message}` }] };
   }
 }
@@ -508,7 +511,9 @@ export async function routePromptGet(
     return result as { messages: Array<{ role: string; content: { type: string; text: string } }> };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log("error", "Prompt get failed", { name, namespace: route.namespace, error: message });
+    // Scrubbed for the log line only -- see routeToolCall's catch for why.
+    // The client still gets the raw text in the message below.
+    log("error", "Prompt get failed", { name, namespace: route.namespace, error: scrubForWarning(message) });
     return { messages: [{ role: "user", content: { type: "text", text: `Error: ${message}` } }] };
   }
 }
@@ -641,7 +646,18 @@ export async function routeToolCall(
       err && typeof err === "object" && "code" in err && typeof (err as { code: unknown }).code === "number"
         ? (err as { code: number }).code
         : undefined;
-    log("error", "Tool call failed", { tool: toolName, namespace: route.namespace, error: message, code });
+    // The log line is scrubbed; the tool result is not. Third-party servers
+    // routinely echo args and secrets in error text (URLs with api_key=,
+    // request bodies, tracebacks with locals -- see error-category.ts), and
+    // for a stdio server this stderr IS the client's on-disk log, where it
+    // outlives the session. The client already receives the full text in the
+    // result below, so nothing is lost for debugging.
+    log("error", "Tool call failed", {
+      tool: toolName,
+      namespace: route.namespace,
+      error: scrubForWarning(message),
+      code,
+    });
     const codeTag = code !== undefined ? ` [code=${code}]` : "";
     return {
       content: [{ type: "text", text: `Error calling ${toolName}${codeTag}: ${message}` }],

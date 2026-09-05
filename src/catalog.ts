@@ -14,7 +14,15 @@
 // a catalog shape change is fixed in one place.
 
 const DEFAULT_CATALOG_URL = "https://yaw.sh/data/mcp-catalog.json";
-const FETCH_TIMEOUT_MS = 10_000;
+/** Exported so the timeout test advances its fake clock by THIS value rather
+ *  than a literal that silently desyncs the day the constant moves. */
+export const FETCH_TIMEOUT_MS = 10_000;
+/** The slug shape `add` and `try` gate on BEFORE touching the catalog:
+ *  lowercase letters, digits and dashes, leading alphanumeric, 64 chars at
+ *  most. One exported definition, because each verb used to carry a private
+ *  copy and the two could only stay identical by accident; the catalog is
+ *  the thing a slug names, so its resolver owns the shape. */
+export const CATALOG_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** A single required-env descriptor as the catalog stores it. */

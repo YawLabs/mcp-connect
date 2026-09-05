@@ -82,15 +82,19 @@ describe("loadProjectGuide outside $HOME trust gate", () => {
     // one of those returns null. Flipping ONLY the opt-in and re-running
     // against the SAME directory serves the guide, which pins the null above
     // on the ownership gate specifically.
-    vi.stubEnv(ALLOW_UNOWNED_ENV, "1");
-    expect((await loadProjectGuide(outside, home, {}))?.content).toBe("planted notes");
+    // The opt-in travels in the INJECTED env, which is what doctor and the
+    // guide loader actually thread through; process.env stays empty here to
+    // prove the walk reads the injected one and not the real environment.
+    expect((await loadProjectGuide(outside, home, { [ALLOW_UNOWNED_ENV]: "1" }))?.content).toBe("planted notes");
   });
 
   it("serves the guide when ownership is unverifiable but the env opt-in is set", async () => {
     writeGuide(join(outside, CONFIG_DIRNAME), "trusted second-drive notes");
     Object.defineProperty(process, "geteuid", { value: undefined, configurable: true, writable: true });
-    vi.stubEnv(ALLOW_UNOWNED_ENV, "1");
-    const g = await loadProjectGuide(outside, home, {});
+    // process.env deliberately does NOT carry the opt-in: only the injected
+    // env does, so a regression back to reading process.env fails here.
+    vi.stubEnv(ALLOW_UNOWNED_ENV, "");
+    const g = await loadProjectGuide(outside, home, { [ALLOW_UNOWNED_ENV]: "1" });
     expect(g?.scope).toBe("project");
     expect(g?.content).toBe("trusted second-drive notes");
   });

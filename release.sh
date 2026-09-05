@@ -295,6 +295,23 @@ else
   info "Current: v${CURRENT_VERSION} -> v${VERSION}"
 fi
 
+# --- Guard: refuse to START from anywhere but main. Step 3 re-checks the
+# branch right before the push (it can change between steps), but that check
+# used to be the ONLY one, and it runs AFTER the bump commit and the annotated
+# tag have landed on whatever branch is checked out. A feature branch sitting
+# exactly at origin/main passes the HEAD comparison above, collects the
+# v${VERSION} commit + tag, and only then dies -- and the re-run on main is not
+# a resume (main's package.json is still the old version) so it trips the
+# tag-collision guard below, leaving the operator to delete the stray tag and
+# commit by hand. Failing here, before anything is written, is the cheap fix.
+PREFLIGHT_BRANCH=$(current_branch)
+if [ "$PREFLIGHT_BRANCH" != "main" ]; then
+  if [ "$PREFLIGHT_BRANCH" = "HEAD" ]; then
+    fail "Detached HEAD -- refusing to release. Check out main (git checkout main) and re-run ./release.sh ${VERSION}."
+  fi
+  fail "On branch '${PREFLIGHT_BRANCH}', not main -- refusing to release. The bump commit and tag would land on this branch and the push in step 3 would then refuse. Check out main and re-run ./release.sh ${VERSION}."
+fi
+
 # Pull the latest remote tags + commits so we can detect a stale local view of
 # HEAD (e.g. a previous interrupted run that already pushed the bump).
 git fetch --tags --prune origin >/dev/null 2>&1 || warn "git fetch failed (offline?) -- proceeding with local state"
@@ -382,7 +399,14 @@ run_npm_check "Type check" typecheck 'error TS[0-9]' '' 'npx tsc --noEmit'
 # looser 'FAIL|[0-9]+ failed': a test NAME containing "FAILS" already exists
 # (foundry-routing.test.ts) and captured console output is echoed verbatim, so
 # a loose pattern can hard-fail a passing run.
-run_npm_check "Tests" test 'Test Files +[0-9]+ failed|Tests +[0-9]+ failed' 'Test Files +[0-9]+ passed'
+# `Errors +N error` is vitest's UNHANDLED-error summary line (an unhandled
+# rejection or an error thrown outside any test). vitest prints it beside a
+# fully-green `Test Files N passed` and exits 1, so without it in fail_re the
+# ARM64 tolerance path above -- done_re matches, rc is the segfault -- would
+# wave a red run through. Same one-or-more-space shape as the sibling summary
+# rows; what keeps a test that echoes captured output from false-matching it
+# is the trailing `[0-9]+ error` shape, not the spacing.
+run_npm_check "Tests" test 'Test Files +[0-9]+ failed|Tests +[0-9]+ failed|Errors +[0-9]+ error' 'Test Files +[0-9]+ passed'
 info "Lint + typecheck + tests passed"
 
 step 2 "Build"
@@ -432,7 +456,23 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
     info "server.json bumped"
   fi
 else
-  npm version "$VERSION" --no-git-tag-version
+  # The one MUTATING npm call in the script, and the only one with no ARM64
+  # segfault tolerance until now: `set -e` turned a 139 from npm's exit
+  # cleanup into an abort AFTER package.json had already been rewritten. The
+  # resume path recovers (package.json is excluded from the dirt check, and
+  # server.json self-heals above), but the first run on the ARM box died here
+  # every time. Same rule as run_npm_check: the tool's OUTPUT -- here the
+  # version the file now carries -- is authoritative, not npm's exit code.
+  bump_rc=0
+  npm version "$VERSION" --no-git-tag-version || bump_rc=$?
+  if [ "$bump_rc" -ne 0 ]; then
+    BUMPED_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "")
+    if [ "$IS_MINGW_ARM64" = true ] && { [ "$bump_rc" -eq 139 ] || [ "$bump_rc" -eq 134 ]; } && [ "$BUMPED_VERSION" = "$VERSION" ]; then
+      warn "npm version exited $bump_rc (ARM64 npm exit-cleanup segfault) but package.json now reads v${VERSION} -- tolerating"
+    else
+      fail "npm version failed (exit $bump_rc); package.json reads '${BUMPED_VERSION:-unreadable}'"
+    fi
+  fi
   info "package.json bumped"
   # Keep server.json in lockstep. The script is the single source of truth
   # now; CI no longer rewrites server.json.

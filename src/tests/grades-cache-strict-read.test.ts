@@ -1,4 +1,5 @@
-// writeGrade's strict read, tested with a read-side-only failure.
+// writeGrade under INJECTED fs failures: the strict read (a read-side-only
+// failure) and the lock steal (a rename-side-only failure).
 //
 // Lives in its own file because it mocks node:fs/promises module-wide:
 // the sibling grades-cache.test.ts exercises the real fs and must not
@@ -11,30 +12,47 @@
 // `catch { return {} }` the write then succeeded and published a
 // one-entry file over every other cached grade. Only a mocked read
 // failure reproduces that shape on every platform.
+//
+// The same AV/indexer hold is what makes a stale-lock steal's rename fail
+// with EPERM on Windows, and Node cannot open a file in a way that blocks
+// another rename (libuv always shares delete), so that shape too is only
+// reproducible by injection -- see the last describe.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Hoisted errno the mock throws on the NEXT readFile; one-shot so
-// atomicWriteFile and later readers see the real fs.
+// Hoisted errnos the mock throws on the NEXT readFile / the NEXT rename;
+// one-shot so atomicWriteFile and later callers see the real fs.
 const failNextRead = vi.hoisted(() => ({ code: null as string | null }));
+const failNextRename = vi.hoisted(() => ({ code: null as string | null }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const real = await importOriginal<typeof import("node:fs/promises")>();
+  const injected = (code: string): NodeJS.ErrnoException => {
+    const err = new Error(`${code}: injected`) as NodeJS.ErrnoException;
+    err.code = code;
+    return err;
+  };
   return {
     ...real,
     readFile: (async (...args: Parameters<typeof real.readFile>) => {
       const code = failNextRead.code;
       if (code) {
         failNextRead.code = null;
-        const err = new Error(`${code}: injected`) as NodeJS.ErrnoException;
-        err.code = code;
-        throw err;
+        throw injected(code);
       }
       return real.readFile(...args);
     }) as typeof real.readFile,
+    rename: (async (...args: Parameters<typeof real.rename>) => {
+      const code = failNextRename.code;
+      if (code) {
+        failNextRename.code = null;
+        throw injected(code);
+      }
+      return real.rename(...args);
+    }) as typeof real.rename,
   };
 });
 
@@ -49,6 +67,7 @@ let synthHome: string;
 
 beforeEach(() => {
   failNextRead.code = null;
+  failNextRename.code = null;
   synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-grades-strict-"));
 });
 
@@ -94,5 +113,31 @@ describe("writeGrade -- strict read (read fails, path writable)", () => {
     await writeGrade("gh", ENTRY_A, synthHome);
     const parsed = JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8"));
     expect(parsed.gh).toEqual(ENTRY_A);
+  });
+});
+
+describe("writeGrade -- a stale lock that will not move (steal's rename fails, path held)", () => {
+  it("waits the hold out and steals on the next pass instead of failing the write", async () => {
+    // An abandoned lock is stolen by rename. On Windows an AV/indexer handle
+    // on that file makes the rename EPERM for a beat -- the same transient
+    // hold atomicWriteFile retries its publish rename around. Throwing on it
+    // refused a write that succeeds one poll later, and audit then reported
+    // the grade as computed-but-not-cached (exit 3) over a hold that had
+    // already cleared by the time the user read the message.
+    const dir = join(synthHome, CONFIG_DIRNAME);
+    mkdirSync(dir, { recursive: true });
+    const lockPath = `${gradesCachePath(synthHome)}.lock`;
+    writeFileSync(lockPath, "dead-process\n");
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, past, past);
+
+    failNextRename.code = "EPERM";
+    await writeGrade("gh", ENTRY_A, synthHome, { lockWaitMs: 5_000 });
+    // The steal consumed the injected failure -- not atomicWriteFile's publish
+    // rename, which would otherwise have thrown its way out of the write.
+    expect(failNextRename.code).toBeNull();
+    expect(JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8")).gh).toEqual(ENTRY_A);
+    // The second pass moved the stale lock and released our own afterwards.
+    expect(existsSync(lockPath)).toBe(false);
   });
 });

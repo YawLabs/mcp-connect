@@ -14,7 +14,7 @@ import { maybeAutoUpgrade } from "./auto-upgrade.js";
 import { bundleActivateHint, CURATED_BUNDLES, matchBundles, topPartialBundles } from "./bundles.js";
 import { formatShadowLine, installTargetForCli } from "./cli-shadows.js";
 import { type ComplianceGrade, classifyGrade, parseMinCompliance, passesMinCompliance } from "./compliance.js";
-import { loadYawMcpConfig, type Profile, profileAllows, toProfile } from "./config-loader.js";
+import { loadYawMcpConfig, type Profile, profileAllows, type ResolvedConfig, toProfile } from "./config-loader.js";
 import { estimateFromConnectedTools, estimateFromToolCache, formatCostLabel } from "./cost-estimate.js";
 import { detectMissingCredentials } from "./credentials.js";
 import { formatRelativeAge, scanShellHistoryForShadows } from "./doctor-cmd.js";
@@ -41,7 +41,7 @@ import {
   pushToolCall,
   type ToolCallRecord,
 } from "./idle-ttl.js";
-import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudge, shouldNudge } from "./install-nudge.js";
+import { INSTALL_NUDGE_MIN_COUNT, installNudgeEnabled, recordNudges, shouldNudge } from "./install-nudge.js";
 import { setJsonKey } from "./json-key.js";
 import { LearningStore, PENALTY_RATE_THRESHOLD } from "./learning.js";
 import { loadLocalBundles } from "./local-bundles.js";
@@ -324,6 +324,15 @@ export function isRoutingFaultText(text: string): boolean {
   return ROUTING_FAULT_MARKERS.some((marker) => text.includes(marker));
 }
 
+// The empty-catalog message, shared by discover and dispatch. One constant
+// because the two used to drift: discover was rewritten for the local-only
+// product (`yaw-mcp add <slug>` into ~/.yaw-mcp/bundles.json) while dispatch
+// -- the documented FIRST call, so the fresh-install path -- kept sending the
+// user to the retired hosted add/enable UI at yaw.sh/mcp, a page that can no
+// longer do what the text said.
+const NO_SERVERS_INSTALLED_TEXT =
+  "No servers installed. Browse the catalog at https://yaw.sh/mcp/catalog/ and add one with `yaw-mcp add <slug>` — it lands in ~/.yaw-mcp/bundles.json. Restart this MCP client afterwards; yaw-mcp reads bundles.json once at startup.";
+
 /** Namespaces from an activate/deactivate meta-tool args bag. `servers`
  *  (array) wins over the single `server` form; empty when neither is
  *  usable. Exported so tests exercise the real resolver, not a copy. */
@@ -583,9 +592,16 @@ export class ConnectServer {
   // completions, so without this a long call to B can be killed mid-flight
   // by a burst of short calls to A (and then booked as B's failure).
   private inflightCalls = new Map<string, number>();
-  // Latched by shutdown() before it drains anything. activateOne refuses
-  // while set, so a connection can't be registered into this.connections
-  // after the teardown snapshot and leak a live child process.
+  // Latched by shutdown() before it drains anything. Three gates read it so a
+  // connection can't be registered into this.connections after the teardown
+  // snapshot and leak a live child process: activateOne refuses BEFORE a
+  // spawn; runActivateOne refuses at the top of EVERY attempt (its retry
+  // sleep and the elicitation re-entries, which call it directly, are both
+  // reachable after the latch without passing activateOne again); and
+  // runActivateOne re-checks AFTER `await connectToUpstream` -- shutdown()'s
+  // drain is bounded, so a handshake that outlives it resolves into a map
+  // shutdown has already cleared, and that gate is the only thing that
+  // closes the transport in that case.
   private shuttingDown = false;
   // Usage learning — nudges dispatch toward namespaces that have been
   // genuinely useful. Counts persist across yaw-mcp restarts via state.json
@@ -867,7 +883,16 @@ export class ConnectServer {
   // entry (this.toolCache) wins over server.toolCache when both exist —
   // the persisted copy can be stale relative to a fresh activation, and
   // the in-memory map is what tools/list and formatShadowLine should
-  // actually see.
+  // actually see. An EMPTY learned list does not win: it is a real
+  // observation for hasKnownTools, but as a tool list it has nothing to
+  // show, so a curated list is still worth rendering over it.
+  //
+  // This is the ONE precedence rule for a cold server's tool list. Every
+  // reader goes through it -- getProfiledActiveServers merges once and the
+  // discover body reads the merged `server.toolCache`; rankableFor calls it
+  // for the BM25 corpus. Two more copies of the resolution used to live in
+  // those readers with `??` semantics (empty learned list WINS), so discover
+  // could rank a server on an empty list while listing its curated tools.
   //
   // Identity preservation: when both sides resolve to the same array
   // reference — which in practice means BOTH are undefined (server.ts
@@ -1015,7 +1040,15 @@ export class ConnectServer {
     });
   }
 
-  async start(): Promise<void> {
+  // `config`: an already-resolved .yaw-mcp/config.* result. The CLI entry
+  // (index.ts) loads the config before constructing this server -- for the
+  // warnings, which it logs itself -- so handing it in here means one read
+  // per startup instead of two. When absent (an embedded or test host that
+  // constructs ConnectServer directly), start() loads it AND logs its
+  // warnings, so a typo'd key that fails open to allow-all is reported on
+  // every path rather than only on the one whose caller happened to log
+  // first.
+  async start(opts: { config?: ResolvedConfig } = {}): Promise<void> {
     // Hydrate learning + pack-history state from ~/.yaw-mcp/state.json
     // before anything else so subsequent record* writes land on top of
     // the restored signal rather than replacing it. loadState() never
@@ -1054,7 +1087,17 @@ export class ConnectServer {
     // session. One read here derives BOTH the profile and the nudge gate
     // (previously loadEffectiveProfile re-read the config just for the
     // profile slice).
-    const resolvedConfig = await loadYawMcpConfig({ cwd: process.cwd() }).catch(() => null);
+    let resolvedConfig: ResolvedConfig | null;
+    if (opts.config) {
+      resolvedConfig = opts.config;
+    } else {
+      resolvedConfig = await loadYawMcpConfig({ cwd: process.cwd() }).catch(() => null);
+      // The loader's soft problems (unknown keys, wrong-typed values, retired
+      // hosted-backend keys). Logged HERE only when we did the load: a caller
+      // that hands the config in has already seen them, and the same line
+      // twice reads like two problems.
+      for (const w of resolvedConfig?.warnings ?? []) log("warn", "Config warning", { warning: w });
+    }
     this.profile = resolvedConfig ? toProfile(resolvedConfig) : null;
     if (this.profile) {
       log("info", "Loaded profile", {
@@ -1184,8 +1227,19 @@ export class ConnectServer {
       // they're independent (prewarm populates toolCache for newly-enabled
       // servers, this one spins up the recurring workflow's servers for
       // real). Fire-and-forget — the handshake shouldn't block on it.
-      if (isAutoLoadEnabled() && this.persistenceReady) {
-        this.autoLoadRecurringPack().catch((err: Error) => log("warn", "Auto-load failed", { error: err?.message }));
+      if (isAutoLoadEnabled()) {
+        if (this.persistenceReady) {
+          this.autoLoadRecurringPack().catch((err: Error) => log("warn", "Auto-load failed", { error: err?.message }));
+        } else {
+          // The flag is set but there is no history to replay from, so the
+          // recurring pack will never load -- and without this line nothing
+          // says why. persistenceReady is false for exactly two reasons (see
+          // the state hydration at the top of start()), so name the one that
+          // applies. Once per session: oninitialized fires once.
+          log("info", "YAW_MCP_AUTO_LOAD is set but persisted history is unavailable; skipping auto-load", {
+            reason: isPersistenceDisabled() ? "YAW_MCP_DISABLE_PERSISTENCE is set" : "state.json could not be read",
+          });
+        }
       }
     };
     await this.server.connect(transport);
@@ -1489,10 +1543,18 @@ export class ConnectServer {
       // multi-server call. For any other shape the filter is reset
       // (see handleActivate), matching the "activate without tools
       // clears the filter" rule.
-      const toolsFilter =
-        namespaces.length === 1 && Array.isArray(args.tools) && args.tools.every((t) => typeof t === "string")
-          ? (args.tools as string[])
-          : undefined;
+      //
+      // Non-string entries are DROPPED, not fatal -- the same rule
+      // resolveNamespaces applies to `servers`. The raw value is untyped tool
+      // input, and discarding the whole array on one bad entry handed a
+      // malformed NARROWING request to the clear-the-filter branch, so
+      // `tools: ["foo", 42]` widened the advertised surface to every tool.
+      // Only when nothing usable survives does the request mean "no filter".
+      let toolsFilter: string[] | undefined;
+      if (namespaces.length === 1 && Array.isArray(args.tools)) {
+        const names = args.tools.filter((t): t is string => typeof t === "string" && t.length > 0);
+        toolsFilter = names.length > 0 ? names : undefined;
+      }
       const result = await this.handleActivate(namespaces, progress, toolsFilter);
       return this.attachGuideNudge(result);
     }
@@ -1709,7 +1771,12 @@ export class ConnectServer {
       }
     }
 
-    // Capture connection ref before the await to avoid race with config reconciliation
+    // Capture the connection ref BEFORE the await. The map entry for this
+    // namespace can be swapped out from under the call while the upstream
+    // is working -- an auto-reconnect re-registering under the same key, the
+    // idle reaper or prewarm teardown deleting it -- and the health stats
+    // below must be booked on the connection that actually served the call,
+    // not on whatever holds the key afterwards (or on nothing).
     const connForHealth = route ? this.connections.get(route.namespace) : undefined;
 
     // Mark the namespace busy for the duration of the upstream call. The
@@ -1904,16 +1971,23 @@ export class ConnectServer {
     return tools.slice(0, 3).map((t) => t.name);
   }
 
+  // The BM25 view of one server. A LIVE tool list wins outright; a cold
+  // server's list comes from mergeToolCache, which is the ONE precedence rule
+  // between the learned (this.toolCache) and curated (server.toolCache)
+  // lists. This used to carry its own `sessionCache ?? persistedCache` chain,
+  // under which an EMPTY learned list beat a curated one -- the opposite of
+  // what discover's `known tools:` line and getDeferredServers showed for the
+  // same server. mergeToolCache is idempotent, so callers that already pass a
+  // merged server (every current one does) pay one small clone and nothing
+  // else.
   private rankableFor(server: UpstreamServerConfig): RankableServer {
     const connection = this.connections.get(server.namespace);
     const liveTools = connection?.tools.map((t) => ({ name: t.name, description: t.description }));
-    const sessionCache = this.toolCache.get(server.namespace);
-    const persistedCache = server.toolCache;
     return {
       namespace: server.namespace,
       name: server.name,
       description: server.description,
-      tools: liveTools ?? sessionCache ?? persistedCache ?? [],
+      tools: liveTools ?? this.mergeToolCache(server).toolCache ?? [],
     };
   }
 
@@ -1999,6 +2073,13 @@ export class ConnectServer {
     // an already-connected winner.
     const existing = this.connections.get(top.namespace);
     if (existing && existing.status === "connected") {
+      // Claim it, as activateOne(fromPrewarm=false) would: if this connection
+      // is prewarm's (its teardown has not run yet), prewarm must see the
+      // claim and leave it alive -- otherwise it closes the very server this
+      // response is about to call "Auto-loaded". The other two intent-driven
+      // sites (handleActivate, handleDispatch) get this from activateOne;
+      // this shortcut bypasses it and so has to do it by hand.
+      this.prewarmNamespaces.delete(top.namespace);
       const grew = !this.sessionActivated.has(top.namespace);
       this.sessionActivated.add(top.namespace);
       if (grew) {
@@ -2117,14 +2198,7 @@ export class ConnectServer {
     warmedNamespace: string | null,
   ): { content: Array<{ type: string; text: string }> } {
     if (!this.config || this.config.servers.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "No servers installed. Browse the catalog at https://yaw.sh/mcp/catalog/ and add one with `yaw-mcp add <slug>` — it lands in ~/.yaw-mcp/bundles.json. Restart this MCP client afterwards; yaw-mcp reads bundles.json once at startup.",
-          },
-        ],
-      };
+      return { content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }] };
     }
 
     const activeServers = this.getProfiledActiveServers();
@@ -2282,7 +2356,9 @@ export class ConnectServer {
           costLabel = ` — ${formatCostLabel(sample)}`;
         }
       } else {
-        const cached = this.toolCache.get(server.namespace) ?? server.toolCache;
+        // `server` came through getProfiledActiveServers, so this is the
+        // merged list (see mergeToolCache) -- do not re-resolve it here.
+        const cached = server.toolCache;
         if (cached && cached.length > 0) {
           costLabel = ` — ${formatCostLabel(estimateFromToolCache(cached))}`;
         }
@@ -2341,9 +2417,10 @@ export class ConnectServer {
       const usageHint = formatUsageHint(this.learning.get(server.namespace), coUsageMap.get(server.namespace) ?? []);
       if (usageHint) lines.push(`    ${usageHint}`);
 
-      // Show cached tool names for servers that aren't currently connected
+      // Show cached tool names for servers that aren't currently connected.
+      // Same merged list as the cost label above.
       if (!connection) {
-        const cached = this.toolCache.get(server.namespace) ?? server.toolCache;
+        const cached = server.toolCache;
         if (cached && cached.length > 0) {
           const toolNames = cached.map((t) => t.name).join(", ");
           lines.push(`    known tools: ${toolNames}`);
@@ -2464,7 +2541,7 @@ export class ConnectServer {
   //     already has a server that covers it — intersect the hit's namespaces
   //     with the installed set),
   //   - skip if the per-CLI cooldown hasn't elapsed (shouldNudge).
-  // Surviving CLIs are recorded (recordNudge) so they stay suppressed for
+  // Surviving CLIs are recorded (recordNudges, one write per discover) so they stay suppressed for
   // the cooldown, and rendered as one line + the `yaw-mcp add <slug>` CLI
   // command that installs the server. The nudge points at the CLI rather
   // than a meta-tool: adding a server writes ~/.yaw-mcp/bundles.json, which
@@ -2509,9 +2586,14 @@ export class ConnectServer {
     for (const { cli, count, target } of candidates) {
       lines.push(`  ${cli.padEnd(10)} (ran ${count}x recently) -> install ${target.package}`);
       lines.push(`     run: yaw-mcp add ${target.namespace}`);
-      // Suppress this CLI for the cooldown now that we've surfaced it.
-      recordNudge(cli, this.nudgeHome);
     }
+    // Suppress every surfaced CLI for the cooldown in ONE read-modify-write
+    // (see install-nudge.ts recordNudges) -- the per-CLI call in the loop was
+    // N writes of the same file for one discover.
+    recordNudges(
+      candidates.map((c) => c.cli),
+      this.nudgeHome,
+    );
     return lines;
   }
 
@@ -2544,12 +2626,12 @@ export class ConnectServer {
     // Refuse once shutdown() has latched. Anything spawned from here would
     // land in this.connections after the teardown snapshot and outlive the
     // process's own bookkeeping — a live child nothing will ever close.
+    // (runActivateOne carries its own gates: one per attempt, for the retry
+    // sleep and the elicitation re-entries that bypass this wrapper, and one
+    // after its await, for the spawn that was already in flight when the
+    // latch went down.)
     if (this.shuttingDown) {
-      return Promise.resolve({
-        ok: false,
-        isChanged: false,
-        message: `"${namespace}" was not loaded — yaw-mcp is shutting down.`,
-      });
+      return Promise.resolve(this.shuttingDownRefusal(namespace));
     }
 
     // An explicit (non-prewarm) activation claims the namespace: prewarm
@@ -2572,7 +2654,7 @@ export class ConnectServer {
             ok: false,
             isChanged: false,
             capped: true,
-            message: capDecision.message ?? "Concurrent server cap reached.",
+            message: capDecision.message,
           });
         }
       }
@@ -2601,6 +2683,13 @@ export class ConnectServer {
     });
     this.activationInflight.set(namespace, promise);
     return promise;
+  }
+
+  // The one refusal every shutdown gate returns -- the pre-spawn check in
+  // activateOne, the per-attempt check at the top of runActivateOne's loop,
+  // and its post-handshake check -- so they cannot drift apart in wording.
+  private shuttingDownRefusal(namespace: string): { ok: false; message: string; isChanged: false } {
+    return { ok: false, isChanged: false, message: `"${namespace}" was not loaded — yaw-mcp is shutting down.` };
   }
 
   // Evaluate the concurrent-server cap for one candidate namespace against
@@ -2713,10 +2802,10 @@ export class ConnectServer {
     const anyMatch = this.config?.servers.find((s) => s.namespace === namespace);
     if (!anyMatch) {
       // Split "not found" from "disabled" so the caller knows whether to
-      // (a) fix a typo / install the server or (b) flip the toggle at
-      // Yaw MCP. Fuzzy suggestions only when the input is a clear
-      // near-miss — noise-free by construction (closestNames returns []
-      // otherwise).
+      // (a) fix a typo / install the server or (b) set "isActive": true
+      // for it in ~/.yaw-mcp/bundles.json. Fuzzy suggestions only when the
+      // input is a clear near-miss — noise-free by construction
+      // (closestNames returns [] otherwise).
       const allNamespaces = this.config?.servers.map((s) => s.namespace) ?? [];
       const suggestions = closestNames(namespace, allNamespaces, 3);
       const hint =
@@ -2771,7 +2860,7 @@ export class ConnectServer {
           ok: false,
           isChanged: false,
           capped: true,
-          message: capDecision.message ?? "Concurrent server cap reached.",
+          message: capDecision.message,
         };
       }
     }
@@ -2795,6 +2884,19 @@ export class ConnectServer {
 
       let lastError: unknown = null;
       for (let attempt = 0; attempt < 2; attempt++) {
+        // Re-check the latch before EVERY spawn, not only in activateOne.
+        // The wrapper's gate is the last one on the way in for attempt 0 of
+        // a fresh activation, and it is stale by the time we get here in
+        // every other case: attempt 1 sits behind the retry sleep below, and
+        // the elicitation re-entries (maybeElicitAndRetry,
+        // elicitVaultPassphraseAndRetry) call runActivateOne directly, behind
+        // a modal round-trip of up to 60s. A SIGTERM landing in either window
+        // used to spawn a fresh child AFTER shutdown() had latched. The
+        // post-handshake gate below would close that child -- but only once
+        // its handshake resolves, and a cold npx handshake outlives the
+        // bounded drain and then the process itself, which orphans it.
+        // Refuse instead of spawning.
+        if (this.shuttingDown) return this.shuttingDownRefusal(namespace);
         try {
           progress?.(
             attempt === 0 ? `Spawning "${namespace}" upstream…` : `Retrying "${namespace}" (attempt ${attempt + 1})…`,
@@ -2805,6 +2907,17 @@ export class ConnectServer {
             this.onUpstreamListChanged,
             this.clientBridge,
           );
+          // shutdown() latched while this handshake was in flight. Its drain
+          // is bounded (SHUTDOWN_DRAIN_MS), so by now the teardown may already
+          // have snapshotted and cleared this.connections -- registering here
+          // would put a live child into a map nothing reads again, and
+          // yaw-mcp would exit without ever closing its transport (a child
+          // that does not exit on stdin EOF is then orphaned). Close it
+          // ourselves and report the refusal the pre-spawn gate would have.
+          if (this.shuttingDown) {
+            await disconnectFromUpstream(connection).catch(() => {});
+            return this.shuttingDownRefusal(namespace);
+          }
           progress?.(`"${namespace}" loaded ${connection.tools.length} tools`);
           this.connections.set(namespace, connection);
           this.idleCallCounts.set(namespace, 0);
@@ -3091,9 +3204,10 @@ export class ConnectServer {
   ): Promise<{ ok: boolean; message: string; isChanged: boolean; serverId?: string } | null> {
     // Someone else is already asking. Join their prompt: on success retry
     // straight away (the vault is now unlocked for every namespace, which is
-    // the whole point), on anything else give up quietly rather than opening
-    // a second modal. Deliberately conservative -- the winner already spent
-    // an attempt from the shared budget, and a later explicit activate can
+    // the whole point); on a rejected entry report it exactly as the winner
+    // does; on anything else give up quietly rather than opening a second
+    // modal. Deliberately conservative -- the winner already spent an
+    // attempt from the shared budget, and a later explicit activate can
     // still re-ask while that budget lasts.
     //
     // Checked BEFORE the stop-asking latch, which governs STARTING a prompt:
@@ -3104,8 +3218,16 @@ export class ConnectServer {
     if (joined) {
       progress?.("Waiting for the vault passphrase prompt already in flight");
       const outcome = await joined;
-      if (outcome !== "unlocked") return null;
-      return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true);
+      if (outcome === "unlocked") return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true);
+      // The follower saw the SAME rejected entry the winner did, so it gets
+      // the same words and the same no-penalty exit. Returning null here
+      // instead sent it down runActivateOne's give-up path, which logged the
+      // stale "vault locked" error, booked an activationFailures entry that
+      // down-ranked the server in dispatch for the TTL, and told the user
+      // YAW_MCP_VAULT_PASSPHRASE was not set when they had just typed one --
+      // for every namespace in the batch but the winner.
+      if (outcome === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
+      return null;
     }
 
     if (this.vaultPassphraseElicited) return null;
@@ -3139,23 +3261,31 @@ export class ConnectServer {
       return this.runActivateOne(namespace, progress, fromPrewarm, /* skipCap */ true);
     }
 
-    if (outcome === "rejected") {
-      // Say what actually happened. Falling through to the generic failure
-      // path reported the ORIGINAL "vault is locked" error, which is no
-      // longer the problem -- the user typed something and it was wrong --
-      // and booked an activationFailures penalty against a server that never
-      // got to run. Returning here skips both.
-      const retryHint = this.vaultPassphraseElicited
-        ? " No further prompts this session: set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env and restart this MCP client."
-        : ` Activate "${namespace}" again to try another passphrase.`;
-      return {
-        ok: false,
-        isChanged: false,
-        message: `Could not load "${namespace}": the passphrase entered does not unlock your local secret vault, which its env (${lastError.refKeys.join(", ")}) references.${retryHint}`,
-      };
-    }
+    if (outcome === "rejected") return this.vaultPassphraseRejected(namespace, lastError);
 
     return null;
+  }
+
+  // The result for a vault passphrase the user typed that did not verify.
+  // Shared by the prompt's winner and every follower that joined it (they all
+  // saw the one rejected entry), so the two paths cannot drift. Say what
+  // actually happened: falling through to runActivateOne's generic failure
+  // path reported the ORIGINAL "vault is locked" error, which is no longer
+  // the problem -- the user typed something and it was wrong -- and booked an
+  // activationFailures penalty against a server that never got to run.
+  // Returning this skips both.
+  private vaultPassphraseRejected(
+    namespace: string,
+    lastError: VaultPassphraseRequiredError,
+  ): { ok: false; message: string; isChanged: false } {
+    const retryHint = this.vaultPassphraseElicited
+      ? " No further prompts this session: set YAW_MCP_VAULT_PASSPHRASE in yaw-mcp's own env and restart this MCP client."
+      : ` Activate "${namespace}" again to try another passphrase.`;
+    return {
+      ok: false,
+      isChanged: false,
+      message: `Could not load "${namespace}": the passphrase entered does not unlock your local secret vault, which its env (${lastError.refKeys.join(", ")}) references.${retryHint}`,
+    };
   }
 
   // The prompt half of the vault path, split out so concurrent callers can
@@ -3390,15 +3520,6 @@ export class ConnectServer {
     };
   }
 
-  // Smart-routing meta-tool. The LLM describes the task in plain English
-  // ("create a github issue for this bug"); yaw-mcp ranks configured servers
-  // with BM25 and activates the top N, then lets the LLM call the now-
-  // exposed tools normally. Default budget is 1 because over-activating
-  // pollutes the tool list in the LLM's context with noise.
-  // Is A -> B a designed multi-server flow rather than a routing miss? True
-  // when both namespaces co-occur in a curated bundle or a detected usage
-  // pack — those A-then-B sequences are intentional, so re-dispatch from A
-  // to B must NOT penalize A. Used as detectMiss's exclusion predicate.
   // Background refinement of a just-recorded heuristic reward via the optional
   // LLM grader. Fire-and-forget: the tool result has already returned. If the
   // grader returns a verdict different from the heuristic, revise the credit by
@@ -3415,6 +3536,10 @@ export class ConnectServer {
     }
   }
 
+  // Is A -> B a designed multi-server flow rather than a routing miss? True
+  // when both namespaces co-occur in a curated bundle or a detected usage
+  // pack — those A-then-B sequences are intentional, so re-dispatch from A
+  // to B must NOT penalize A. Used as detectMiss's exclusion predicate.
   private isLegitChain(a: string, b: string): boolean {
     for (const bundle of CURATED_BUNDLES) {
       if (bundle.namespaces.includes(a) && bundle.namespaces.includes(b)) return true;
@@ -3425,6 +3550,17 @@ export class ConnectServer {
     return false;
   }
 
+  // Smart-routing meta-tool. The LLM describes the task in plain English
+  // ("create a github issue for this bug"); yaw-mcp ranks configured servers
+  // with BM25 and activates the top N, then lets the LLM call the now-
+  // exposed tools normally. Default budget is 1 because over-activating
+  // pollutes the tool list in the LLM's context with noise.
+  //
+  // The three empty-state messages below are the fresh-install path (dispatch
+  // is the documented first call), so each names the LOCAL fix -- `yaw-mcp
+  // add <slug>`, `"isActive": true` in ~/.yaw-mcp/bundles.json -- rather than
+  // the retired hosted add/enable UI at yaw.sh/mcp that discover and bundles
+  // were already migrated away from.
   private async handleDispatch(
     intent: string,
     budget: number,
@@ -3440,23 +3576,48 @@ export class ConnectServer {
     }
     if (!this.config || this.config.servers.length === 0) {
       return {
-        content: [{ type: "text", text: "No servers installed. Add servers at yaw.sh/mcp to get started." }],
+        content: [{ type: "text", text: NO_SERVERS_INSTALLED_TEXT }],
         isError: true,
       };
     }
 
     const activeServers = this.getProfiledActiveServers();
     if (activeServers.length === 0) {
-      const note = this.profile
-        ? ` (project profile at ${this.profile.path} restricts which servers are available)`
-        : "";
+      // Every installed server is either "isActive": false or kept out by
+      // the project profile -- there is no third way past the filter above,
+      // so at least one of the two lists below is non-empty. Both fixes are
+      // local edits, but they are DIFFERENT edits in different files, so
+      // name only the ones that apply. A profile-blocked server is already
+      // active: telling the model to set "isActive": true for it, or to look
+      // for it in discover's disabled list (discover renders profile-blocked
+      // entries nowhere), sent it to the wrong file. Name the namespaces and
+      // the exact list in the profile that keeps each one out instead.
+      const profile = this.profile;
+      const disabled = this.config.servers.filter((s) => !s.isActive);
+      const blocked = profile
+        ? this.config.servers.filter((s) => s.isActive && !profileAllows(profile, s.namespace))
+        : [];
+      const parts = ["No servers enabled."];
+      if (profile && blocked.length > 0) {
+        const quote = (servers: UpstreamServerConfig[]) => servers.map((s) => `"${s.namespace}"`).join(", ");
+        // isAllowed: an explicit "blocked" entry wins over the allow list, so
+        // a namespace on it needs removing from there; every other blocked
+        // namespace is missing from a non-empty "servers" allow list.
+        const denied = blocked.filter((s) => profile.blocked?.includes(s.namespace));
+        const unlisted = blocked.filter((s) => !profile.blocked?.includes(s.namespace));
+        const edits: string[] = [];
+        if (unlisted.length > 0) edits.push(`add ${quote(unlisted)} to its "servers" allow list`);
+        if (denied.length > 0) edits.push(`remove ${quote(denied)} from its "blocked" list`);
+        parts.push(`The project profile at ${profile.path} keeps ${quote(blocked)} out: ${edits.join(" and ")}.`);
+      }
+      if (disabled.length > 0) {
+        parts.push(
+          `Set "isActive": true for a server in ~/.yaw-mcp/bundles.json; mcp_connect_discover lists what is installed but disabled.`,
+        );
+      }
+      parts.push("Restart this MCP client after editing.");
       return {
-        content: [
-          {
-            type: "text",
-            text: `No servers enabled${note}. Enable servers at yaw.sh/mcp or re-run mcp_connect_discover.`,
-          },
-        ],
+        content: [{ type: "text", text: parts.join(" ") }],
         isError: true,
       };
     }
@@ -3482,7 +3643,7 @@ export class ConnectServer {
         content: [
           {
             type: "text",
-            text: `No installed server matches "${trimmed}". Use mcp_connect_discover to see what's installed, or add a relevant server at yaw.sh/mcp.`,
+            text: `No installed server matches "${trimmed}". Use mcp_connect_discover to see what's installed, or browse https://yaw.sh/mcp/catalog/ and add one with \`yaw-mcp add <slug>\`.`,
           },
         ],
         isError: true,
@@ -3554,13 +3715,14 @@ export class ConnectServer {
       this.redispatch.push(primary, intentTokens, now);
       // Privacy-safe, opt-in routing-eval harvest (the "environment foundry").
       // Disabled unless YAW_MCP_FOUNDRY is set; only a REDACTED token bag plus
-      // candidate namespaces ever leave memory — never the raw intent string.
+      // the chosen namespace is ever written -- never the raw intent string,
+      // and not the ranker's shortlist either (it was accepted and dropped on
+      // the floor for a release; see FoundryTrace in foundry.ts).
       if (isFoundryEnabled()) {
         const redacted = redactIntent(trimmed);
         void appendFoundryTrace({
           tokens: redacted.tokens,
           redactedCount: redacted.redactedCount,
-          candidates: ranked.slice(0, 5).map((r) => ({ ns: r.namespace, score: r.score })),
           chosen: primary,
         });
       }
@@ -4001,13 +4163,16 @@ export class ConnectServer {
       // server" contradicts handleReadTool, which names the real reason for
       // the very same namespace and points at the fix. Same lookup and same
       // wording as that path, so the two agree.
+      //
+      // spawnGateRefusal covers exactly the two ways getProfiledActiveServers()
+      // drops a configured server (disabled, profile-blocked), so a
+      // configured-but-filtered namespace ALWAYS yields a refusal here, and a
+      // null means the namespace was never configured at all -- the
+      // not-installed message below. There is no third state; the fallback
+      // string that used to stand in for one could not run.
       const configured = this.config?.servers.find((s) => s.namespace === serverArg);
-      if (configured) {
-        const refusal =
-          this.spawnGateRefusal(configured, "inspect its tools") ??
-          `"${serverArg}" is installed but not visible to this report.`;
-        return { content: [{ type: "text", text: refusal }], isError: true };
-      }
+      const refusal = configured ? this.spawnGateRefusal(configured, "inspect its tools") : null;
+      if (refusal) return { content: [{ type: "text", text: refusal }], isError: true };
       return {
         content: [
           {
@@ -4601,8 +4766,11 @@ export class ConnectServer {
   async shutdown(): Promise<void> {
     log("info", "Shutting down yaw-mcp");
 
-    // Latch FIRST: activateOne refuses from here on, so nothing new can be
-    // registered into this.connections behind the teardown below.
+    // Latch FIRST: activateOne refuses from here on, runActivateOne refuses
+    // to start another attempt (its retry, an elicitation re-entry), and it
+    // closes any handshake that resolves after this instead of registering
+    // it, so nothing new can land in this.connections behind the teardown
+    // below.
     this.shuttingDown = true;
 
     // Flush any pending state save before we stop accepting writes.
@@ -4617,10 +4785,12 @@ export class ConnectServer {
 
     // Drain activations that were already past the gate when we latched.
     // start()'s fire-and-forget prewarm can have several children mid-
-    // handshake; each one registers its connection on resolve. Snapshotting
-    // this.connections without waiting would miss them entirely, leaving
-    // live child processes nobody ever disconnects (the parent exiting is
-    // what masks this in production, not any cleanup we do).
+    // handshake. One that resolves inside this window is closed by
+    // runActivateOne's post-handshake shuttingDown gate (it never reaches
+    // this.connections), and the drain is what gives that close time to run
+    // before index.ts exits the process; one that resolves AFTER the window
+    // takes the same gate, so a late handshake can no longer register into
+    // the map cleared below and leak a live child.
     //
     // BOUNDED, deliberately. A single runActivateOne can burn a 15s connect
     // timeout (upstream.ts) retried once, plus a 60s elicitInput round-trip
@@ -4657,6 +4827,12 @@ export class ConnectServer {
       this.stateSaveTimer = null;
       if (this.persistenceReady) await this.flushStateSave();
     }
+    // Close the save path for good. Anything that lands from here on -- a
+    // fire-and-forget refineRewardInBackground resolving late, a tool call an
+    // embedded host lets finish after shutdown -- would otherwise re-arm the
+    // debounce and write state.json AFTER the final flush above. In the CLI
+    // process exit masks that; in an embedded or test host nothing does.
+    this.persistenceReady = false;
 
     // Disconnect all upstreams
     const disconnects = Array.from(this.connections.values()).map((conn) => disconnectFromUpstream(conn));

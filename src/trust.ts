@@ -370,39 +370,26 @@ export type TrustStatus =
   /** The store itself is unusable -- deny everything. */
   | "store-unreadable";
 
-/** Classify one path + its exact bytes against an already-loaded store. */
+/**
+ * Classify one path + its exact bytes against an already-loaded store.
+ *
+ * Every consumer (local-bundles, trust-cmd, doctor) holds a store already and
+ * classifies through here, so the file is read once per command; there is no
+ * one-shot "load and check" wrapper any more -- one existed, had no caller,
+ * and was deleted rather than kept for a hypothetical embedder.
+ *
+ * NOTE: neither this nor readTrustStore consults TRUST_BYPASS_ENV. The bypass
+ * is a LOADER-level policy decision (see local-bundles.ts), not a claim that
+ * the file is trusted -- keeping it out of here means `yaw-mcp trust --list`
+ * and doctor keep reporting the real state even when the escape hatch is on.
+ * That property is pinned by trust.test.ts ("ignores the env escape hatch"),
+ * which sets the variable before asserting it changes nothing here.
+ */
 export function trustStatusFor(path: string, contents: Buffer | string, store: TrustStore): TrustStatus {
   if (store.malformed) return "store-unreadable";
   const record = store.entries[normalizeTrustKey(path)];
   if (!record) return "untrusted";
   return record.sha256 === hashTrustContent(contents) ? "trusted" : "changed";
-}
-
-/**
- * Is this exact file (path + bytes) trusted? Convenience wrapper that loads
- * the store itself; callers that already hold a store should use
- * `trustStatusFor` so they only read the file once.
- *
- * NOTE: this deliberately ignores TRUST_BYPASS_ENV. The bypass is a
- * LOADER-level policy decision (see local-bundles.ts), not a claim that the
- * file is trusted -- keeping it out of here means `yaw-mcp trust --list`
- * and doctor keep reporting the real state even when the escape hatch is on.
- * That property is pinned by trust.test.ts ("ignores the env escape hatch"),
- * which sets the variable before asserting it changes nothing here.
- *
- * NO PRODUCTION CALLER TODAY: every in-repo consumer already holds a store
- * (local-bundles, trust-cmd, doctor) and uses trustStatusFor to avoid a second
- * read. It is kept as the one-shot form of the check for embedders and tests;
- * if it is still unused when the module next changes shape, delete it rather
- * than growing a caller to justify it.
- */
-export async function isTrusted(
-  path: string,
-  contents: Buffer | string,
-  opts: { home?: string } = {},
-): Promise<boolean> {
-  const store = await readTrustStore(opts.home ?? homedir());
-  return trustStatusFor(path, contents, store) === "trusted";
 }
 
 /** Serialize + atomically persist a store. Mode 0600 (the file records
@@ -547,16 +534,50 @@ async function revokeKeyCandidates(p: string, platform: NodeJS.Platform): Promis
  * Like grantTrust, the store is re-read immediately before the write so a
  * concurrent grant from another terminal is preserved instead of being
  * reverted by this command's older snapshot.
+ *
+ * A refused revoke reports WHICH kind of unusable store it met
+ * (`malformedKind` / `malformedReason`, the same triple readTrustStore
+ * classifies), not just that it was one: the three kinds carry three
+ * different remedies (fix permissions / upgrade / delete), and collapsing them
+ * to a boolean forced trust-cmd to read the store a second time just to
+ * recover the distinction this function had already made.
  */
+export interface RevokeTrustResult {
+  storePath: string;
+  /** True when a row was removed; false for a no-op revoke AND for a refused
+   *  one -- `storeWasMalformed` tells the two apart. */
+  removed: boolean;
+  /** True when the store was unusable, so nothing could be (or was) revoked. */
+  storeWasMalformed: boolean;
+  /** Why the store was unusable -- see TrustStore.malformedKind. Null when it
+   *  was fine. */
+  malformedKind: TrustStore["malformedKind"];
+  malformedReason: string | null;
+}
+
 export async function revokeTrust(
   path: string,
   opts: { home?: string; platform?: NodeJS.Platform } = {},
-): Promise<{ storePath: string; removed: boolean; storeWasMalformed: boolean }> {
+): Promise<RevokeTrustResult> {
   const home = opts.home ?? homedir();
   const platform = opts.platform ?? process.platform;
   const store = await readTrustStore(home, platform);
   const storePath = trustStorePath(home);
-  if (store.malformed) return { storePath, removed: false, storeWasMalformed: true };
+  const refused = (s: TrustStore): RevokeTrustResult => ({
+    storePath,
+    removed: false,
+    storeWasMalformed: true,
+    malformedKind: s.malformedKind,
+    malformedReason: s.malformedReason,
+  });
+  const done = (removed: boolean): RevokeTrustResult => ({
+    storePath,
+    removed,
+    storeWasMalformed: false,
+    malformedKind: null,
+    malformedReason: null,
+  });
+  if (store.malformed) return refused(store);
   const candidates = await revokeKeyCandidates(path, platform);
   // Object.hasOwn, not `in`: entries comes from JSON.parse and carries
   // Object.prototype, so `"toString" in entries` is true for every store.
@@ -573,22 +594,30 @@ export async function revokeTrust(
   // consent-WITHDRAWAL command, the same class of bug the physical candidate
   // was added to fix.
   const keys = candidates.filter((c) => Object.hasOwn(store.entries, c));
-  if (keys.length === 0) return { storePath, removed: false, storeWasMalformed: false };
+  if (keys.length === 0) return done(false);
   const fresh = await readTrustStore(home, platform);
-  if (fresh.malformed) return { storePath, removed: false, storeWasMalformed: true };
+  if (fresh.malformed) return refused(fresh);
   const present = keys.filter((k) => Object.hasOwn(fresh.entries, k));
-  if (present.length === 0) return { storePath, removed: false, storeWasMalformed: false };
+  if (present.length === 0) return done(false);
   const entries = { ...fresh.entries };
   for (const k of present) delete entries[k];
   await writeTrustStore(home, entries);
   log("info", "Revoked project bundles.json trust", { path: resolve(path) });
-  return { storePath, removed: true, storeWasMalformed: false };
+  return done(true);
+}
+
+/** Every granted record in an already-loaded store, sorted by display path.
+ *  Empty when the store is malformed (nothing is trusted then). The pure half
+ *  of listTrusted, for a caller that already holds the store: trust-cmd's
+ *  --list reads it once to name the failure kind and must not read it a
+ *  second time just to render the rows. */
+export function trustedRecords(store: TrustStore): TrustRecord[] {
+  if (store.malformed) return [];
+  return Object.values(store.entries).sort((a, b) => a.path.localeCompare(b.path));
 }
 
 /** Every granted record, sorted by display path. Empty when the store is
  *  absent OR malformed (nothing is trusted in either case). */
 export async function listTrusted(opts: { home?: string } = {}): Promise<TrustRecord[]> {
-  const store = await readTrustStore(opts.home ?? homedir());
-  if (store.malformed) return [];
-  return Object.values(store.entries).sort((a, b) => a.path.localeCompare(b.path));
+  return trustedRecords(await readTrustStore(opts.home ?? homedir()));
 }

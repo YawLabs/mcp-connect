@@ -32,11 +32,11 @@ import {
   grantTrust,
   hashTrustContent,
   isTrustBypassEnabled,
-  listTrusted,
   readTrustStore,
   revokeTrust,
   TRUST_BYPASS_ENV,
   TrustStoreUnreadableError,
+  trustedRecords,
   trustStorePath,
 } from "./trust.js";
 import type { UpstreamServerConfig } from "./types.js";
@@ -706,7 +706,10 @@ async function runTrustList(opts: TrustCommandOptions): Promise<TrustCommandResu
     return { exitCode: opts.json ? 0 : 1 };
   }
 
-  const records = await listTrusted({ home });
+  // The rows come from the store already in hand. listTrusted would read the
+  // file again -- and a store that went unreadable between the two reads would
+  // then list NOTHING under a header that just said it was fine.
+  const records = trustedRecords(store);
   const rows: Array<{ path: string; sha256: string; grantedAt: string; status: ListStatus }> = [];
   for (const r of records) {
     rows.push({ ...r, status: await classifyRecord(r.path, r.sha256) });
@@ -849,15 +852,16 @@ async function runTrustRevoke(opts: TrustCommandOptions): Promise<TrustCommandRe
     // remedies. Collapsing them into "is unreadable, so nothing is trusted and
     // there was nothing to revoke" was wrong for a NEWER-SCHEMA store -- the
     // grants are real and still there, for the build that wrote them -- and it
-    // contradicted the "do NOT delete it" the other two surfaces print.
-    const store = await readTrustStore(home);
+    // contradicted the "do NOT delete it" the other two surfaces print. The
+    // kind comes back on the result: re-reading the store here to learn it
+    // could classify a DIFFERENT failure than the one that refused the revoke.
     const fix =
-      store.malformedKind === "io"
+      res.malformedKind === "io"
         ? "fix its permissions (do NOT delete it -- your approvals are still in there)"
-        : store.malformedKind === "schema"
+        : res.malformedKind === "schema"
           ? "upgrade with `npm i -g @yawlabs/mcp@latest` (do NOT delete it -- your approvals are still in there)"
           : "fix or delete it";
-    const msg = `trust store unusable: ${store.malformedReason ?? "unknown"} -- nothing was revoked; ${fix}, then re-run`;
+    const msg = `trust store unusable: ${res.malformedReason ?? "unknown"} -- nothing was revoked; ${fix}, then re-run`;
     if (opts.json) out(`${JSON.stringify({ ok: false, path: target, removed: false, error: msg }, null, 2)}\n`);
     else printErr(`yaw-mcp trust --revoke: ${msg}`);
     return { exitCode: 1 };

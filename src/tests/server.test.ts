@@ -357,9 +357,9 @@ describe("ConnectServer", () => {
 
     it("surfaces the marketplace URL hint when the user has a sparse config", () => {
       // Threshold is 5 installed servers; 2 is well below. Hint should
-      // point to the publicly-browsable catalog at /explore — there is
-      // no JSON API for the catalog, so this is an URL pointer, not a
-      // programmatic surface.
+      // point to the publicly-browsable catalog at https://yaw.sh/mcp/catalog/
+      // — there is no JSON API for the catalog, so this is an URL pointer,
+      // not a programmatic surface.
       const priv = getPrivate(server);
       priv.config = makeConfig([
         makeServerConfig({ namespace: "gh", name: "GitHub" }),
@@ -498,6 +498,27 @@ describe("ConnectServer", () => {
 
       const merged = priv.getProfiledActiveServers();
       expect(merged[0].toolCache).toEqual([{ name: "npm_search" }, { name: "npm_audit" }, { name: "npm_view" }]);
+    });
+
+    it("discover's known-tools line and the BM25 corpus read the SAME merged list", () => {
+      // rankableFor and the discover body used to re-resolve the cold tool
+      // list on their own with `this.toolCache.get(ns) ?? server.toolCache`,
+      // under which an EMPTY learned list beat a curated one -- while
+      // mergeToolCache (what getDeferredServers and formatShadowLine see) let
+      // the curated list win. Four copies, two empty-list semantics. Pin the
+      // one rule: mergeToolCache's.
+      const priv = getPrivate(server);
+      const serverConfig = makeServerConfig({
+        namespace: "gh",
+        name: "GitHub",
+        toolCache: [{ name: "create_issue", description: "open an issue" }],
+      });
+      priv.config = makeConfig([serverConfig]);
+      priv.toolCache.set("gh", []); // learned "zero tools", curated list present
+
+      const text = priv.handleDiscover().content[0].text;
+      expect(text).toContain("known tools: create_issue");
+      expect(priv.rankableFor(serverConfig).tools).toEqual([{ name: "create_issue", description: "open an issue" }]);
     });
 
     it("exposes the merged cache to the guide auto-section via getBuiltinResources", () => {
@@ -732,7 +753,7 @@ describe("ConnectServer", () => {
     });
 
     it("distinguishes an installed-but-disabled server from an unknown one", async () => {
-      // Disabled-in-dashboard case gets its own message so the model
+      // Disabled-in-bundles.json case gets its own message so the model
       // doesn't tell the user to install something they already have.
       const priv = getPrivate(server);
       priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false })]);
@@ -1423,6 +1444,22 @@ describe("ConnectServer", () => {
       await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo"] });
 
       // Filter is persisted on the server for subsequent tools/list calls.
+      expect(priv.toolFilters.get("gh")).toEqual(new Set(["foo"]));
+      expect(await listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
+    });
+
+    it("a non-string entry in tools is dropped, not read as 'clear the filter'", async () => {
+      // The raw args are untyped tool input. Discarding the WHOLE array on
+      // one bad entry routed a malformed narrowing request into the
+      // clear-the-filter branch, so `tools: ["foo", 42]` widened the
+      // advertised surface to every tool -- the opposite of what was asked.
+      // resolveNamespaces filters `servers` the same way.
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      vi.mocked(connectToUpstream).mockResolvedValueOnce(makeConnection("gh", ["foo", "bar", "baz"]));
+
+      await priv.handleToolCall("mcp_connect_activate", { server: "gh", tools: ["foo", 42, null, ""] });
+
       expect(priv.toolFilters.get("gh")).toEqual(new Set(["foo"]));
       expect(await listedUpstreamToolNames(priv)).toEqual(["gh_foo"]);
     });
@@ -4728,13 +4765,134 @@ describe("shutdown drains and refuses activations", () => {
     const activation = priv.activateOne("gh");
 
     const shutdownPromise = server.shutdown();
-    // The child finishes its handshake AFTER shutdown started: without the
-    // drain its connection lands in a map nobody will ever disconnect.
+    // The child finishes its handshake AFTER shutdown started. The drain is
+    // what gives runActivateOne's post-handshake gate time to close it
+    // before the process exits; without either, the connection lands in a
+    // map nobody will ever disconnect.
     resolveConnect(makeConnection("gh", ["create_issue"]));
     await Promise.all([activation, shutdownPromise]);
 
     expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledTimes(1);
     expect(priv.connections.size).toBe(0);
+  });
+
+  it("closes a handshake that outlives the drain instead of registering it", async () => {
+    vi.useFakeTimers();
+    try {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+
+      let resolveConnect: (conn: UpstreamConnection) => void = () => {};
+      vi.mocked(connectToUpstream).mockReturnValueOnce(
+        new Promise<UpstreamConnection>((r) => {
+          resolveConnect = r;
+        }),
+      );
+      const activation = priv.activateOne("gh");
+
+      // The drain gives up at SHUTDOWN_DRAIN_MS and shutdown() clears the map.
+      const shutdownPromise = server.shutdown();
+      await vi.advanceTimersByTimeAsync(2000);
+      await shutdownPromise;
+      expect(priv.connections.size).toBe(0);
+
+      // NOW the cold npx handshake comes back -- into a server that is done.
+      // Registering it left a live child in a map nothing reads again, and
+      // yaw-mcp exited without ever closing its transport.
+      const late = makeConnection("gh", ["create_issue"]);
+      resolveConnect(late);
+      const result = await activation;
+
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain("shutting down");
+      expect(priv.connections.size).toBe(0);
+      expect(vi.mocked(disconnectFromUpstream)).toHaveBeenCalledWith(late);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses to spawn the retry when shutdown latches during the retry sleep", async () => {
+    // Timers only: Date stays real, exactly as withoutRetryBackoff does.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const priv = getPrivate(server);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      vi.mocked(connectToUpstream).mockRejectedValueOnce(new Error("spawn ENOENT"));
+
+      const activation = priv.activateOne("gh");
+      // Attempt 1 has failed and runActivateOne is parked on its retry sleep
+      // (the only pending timer) -- the window a SIGTERM lands in. The
+      // wrapper's pre-spawn gate is behind us; only a gate INSIDE the loop
+      // can stop the retry from spawning a child behind the latch.
+      await until(() => vi.mocked(connectToUpstream).mock.calls.length === 1 && vi.getTimerCount() > 0);
+
+      const shutdownPromise = server.shutdown();
+      // Fires the retry sleep first, then the bounded drain.
+      await vi.advanceTimersByTimeAsync(5000);
+      const result = await activation;
+      await shutdownPromise;
+
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain("shutting down");
+      // Exactly the failed first attempt: nothing was spawned after the latch.
+      expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+      expect(priv.connections.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses an elicitation re-entry that arrives after the latch", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    // The user answers the vault prompt AFTER shutdown latched. The modal is
+    // a round-trip of up to 60s, so this is the common shape of a SIGTERM
+    // mid-prompt; the re-entry calls runActivateOne directly and never
+    // passes activateOne's gate, so runActivateOne has to refuse it itself.
+    priv.server.elicitInput = vi.fn().mockImplementation(async () => {
+      priv.shuttingDown = true;
+      return { action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "session-only" } };
+    });
+    vi.mocked(connectToUpstream).mockRejectedValueOnce(
+      new VaultPassphraseRequiredError("vault locked", "gh", ["GITHUB_TOKEN"], "missing"),
+    );
+
+    try {
+      const result = await withoutRetryBackoff(() => priv.activateOne("gh"));
+
+      // Prove the prompt ran, so the single connect below is the refused
+      // re-entry and not a path that never re-entered at all.
+      expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain("shutting down");
+      expect(vi.mocked(connectToUpstream)).toHaveBeenCalledTimes(1);
+      expect(priv.connections.size).toBe(0);
+    } finally {
+      // The accepted prompt installed a module-level session passphrase;
+      // shutdown() is what clears it, and this describe has no afterEach.
+      await server.shutdown();
+      clearSessionVaultPassphrase();
+    }
+  });
+
+  it("closes the save path so a late scheduleStateSave cannot write after the final flush", async () => {
+    const priv = getPrivate(server);
+    // Stand in for a start() that hydrated state. The flush itself is
+    // stubbed so nothing touches ~/.yaw-mcp/state.json.
+    priv.persistenceReady = true;
+    priv.flushStateSave = vi.fn().mockResolvedValue(undefined);
+
+    await server.shutdown();
+    expect(priv.flushStateSave).toHaveBeenCalledTimes(1);
+
+    // A fire-and-forget refineRewardInBackground (or a tool call an embedded
+    // host lets finish) landing now must not re-arm the debounce: that timer
+    // would write state.json after the flush shutdown() promised was final.
+    priv.scheduleStateSave();
+    expect(priv.persistenceReady).toBe(false);
+    expect(priv.stateSaveTimer).toBeNull();
   });
 
   it("gives up on a hanging activation instead of outliving the force-exit timer", async () => {
@@ -5834,6 +5992,102 @@ describe("vault passphrase elicitation", () => {
     expect(gh.ok).toBe(true);
     expect(linear.ok).toBe(true);
     expect(vaultPassphrase()).toBe("s3kr1t");
+  });
+
+  it("a follower on a REJECTED shared prompt gets the winner's words and no penalty", async () => {
+    // Same batch as above, but the one passphrase typed is wrong. The winner
+    // already reported that accurately ("does not unlock") with no
+    // activationFailures entry. The follower used to fall through
+    // runActivateOne's give-up path instead: "vault locked ... not set" when
+    // the user had just typed one, plus the penalty healthFactor and
+    // discover's `warn: last activation failed` line read for the TTL -- for
+    // every namespace in the batch but the winner.
+    const priv = getPrivate(server);
+    priv.config = makeConfig([
+      makeServerConfig({ namespace: "gh", name: "GitHub" }),
+      makeServerConfig({ namespace: "linear", name: "Linear" }),
+    ]);
+    priv.server.getClientCapabilities = () => ({ elicitation: {} });
+    let answer: (result: unknown) => void = () => {};
+    const answered = new Promise((resolve) => {
+      answer = resolve;
+    });
+    priv.server.elicitInput = vi.fn().mockReturnValue(answered);
+    vi.mocked(verifyVaultPassphrase).mockResolvedValue(false);
+    vi.mocked(connectToUpstream).mockImplementation((async (cfg: UpstreamServerConfig) => {
+      throw lockedVaultError(cfg.namespace);
+    }) as unknown as typeof connectToUpstream);
+
+    const both = Promise.all([priv.activateOne("gh"), priv.activateOne("linear")]);
+    await until(() => vi.mocked(priv.server.elicitInput).mock.calls.length > 0);
+    answer({ action: "accept", content: { YAW_MCP_VAULT_PASSPHRASE: "wrong" } });
+    const [gh, linear] = await both;
+
+    expect(priv.server.elicitInput).toHaveBeenCalledTimes(1);
+    for (const r of [gh, linear]) {
+      expect(r.ok).toBe(false);
+      expect(r.message).toContain("does not unlock");
+      expect(r.message).not.toContain("vault locked");
+    }
+    expect(priv.activationFailures.size).toBe(0);
+    expect(vaultPassphrase()).toBeUndefined();
+  });
+});
+
+describe("handleSecretsReport refusals", () => {
+  let server: ConnectServer;
+  let synthHome: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // The report lists the vault's KEY NAMES from ~/.yaw-mcp/secrets.json;
+    // point homedir() at an empty temp dir so the developer's real vault is
+    // never read (USERPROFILE on win32, HOME on POSIX).
+    synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-secrets-report-"));
+    vi.stubEnv("HOME", synthHome);
+    vi.stubEnv("USERPROFILE", synthHome);
+    server = new ConnectServer();
+  });
+
+  afterEach(async () => {
+    await server.shutdown();
+    vi.unstubAllEnvs();
+    rmSync(synthHome, { recursive: true, force: true });
+  });
+
+  // A configured server missing from getProfiledActiveServers() is ALWAYS
+  // disabled or profile-blocked, and spawnGateRefusal words exactly those two
+  // -- there is no third state for this branch to report.
+  it("names the bundles.json toggle for an installed-but-disabled server", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false })]);
+
+    const result = await priv.handleSecretsReport("gh");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("installed but disabled");
+    expect(result.content[0].text).toContain('"isActive": true');
+  });
+
+  it("names the profile for a profile-blocked server", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+    priv.profile = { path: "/proj/.yaw-mcp/config.json", blocked: ["gh"] };
+
+    const result = await priv.handleSecretsReport("gh");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("not allowed by the project profile at /proj/.yaw-mcp/config.json");
+  });
+
+  it("reports an unconfigured namespace as not installed", async () => {
+    const priv = getPrivate(server);
+    priv.config = makeConfig([makeServerConfig({ namespace: "gh", name: "GitHub" })]);
+
+    const result = await priv.handleSecretsReport("nope");
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('No installed server with namespace "nope"');
   });
 });
 

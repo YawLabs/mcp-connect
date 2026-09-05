@@ -8,7 +8,7 @@
 // stays pure.)
 import { MAX_EXEC_STEPS } from "./exec-engine.js";
 import { PENALTY_RATE_THRESHOLD } from "./learning.js";
-import { collectSecretRefNames } from "./secrets-vault.js";
+import { collectMalformedSecretRefs, collectSecretRefNames } from "./secrets-vault.js";
 
 // Numbers the descriptions below quote to the model, interpolated from the
 // constants that actually enforce them rather than retyped. learning.ts
@@ -75,7 +75,7 @@ export const META_TOOLS = {
   deactivate: {
     name: "mcp_connect_deactivate",
     description:
-      'Unload one or more MCP servers\' tools from the current session to free context. The server stays configured in ~/.yaw-mcp/bundles.json and can be reloaded via `mcp_connect_activate` when needed again. Unload servers you\'re done with; yaw-mcp also auto-unloads any server idle for 10+ tool calls to other servers. Pass "server" for one or "servers" for multiple.',
+      'Unload one or more MCP servers\' tools from the current session to free context. The server stays configured in ~/.yaw-mcp/bundles.json and can be reloaded via `mcp_connect_activate` when needed again. Unload servers you\'re done with; yaw-mcp also auto-unloads a server after a stretch of tool calls to other servers (baseline set by YAW_MCP_IDLE_THRESHOLD, raised for a server used in bursts). Pass "server" for one or "servers" for multiple.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -224,7 +224,7 @@ export const META_TOOLS = {
   secrets: {
     name: "mcp_connect_secrets",
     description:
-      "List, per installed server, which local-vault secrets its `${secret:NAME}` env references resolve to — by NAME only, never a value. Use this to confirm a server will get the credentials it needs before activating it, or to spot a typo'd / un-set secret reference. `injectedSecrets` are the names the local vault HAS and the server references; `missing` are names the server references but the vault LACKS (set them via `yaw-mcp secrets set <name>`). This is a values-free preview: it reads the vault's KEY LIST and the server's env-reference NAMES, and never decrypts or returns any secret value. Servers with no `${secret:...}` references are omitted. Requires no passphrase (no decryption happens).",
+      "List, per installed server, which local-vault secrets its `${secret:NAME}` env references resolve to — by NAME only, never a value. Use this to confirm a server will get the credentials it needs before activating it, or to spot a typo'd / un-set secret reference. `injectedSecrets` are the names the local vault HAS and the server references; `missing` are names the server references but the vault LACKS (set them via `yaw-mcp secrets set <name>`); `malformed` are `${secret:` references that do not PARSE (a space in the name, a missing `}`), quoted in bounded form behind a `<malformed ref>` marker -- yaw-mcp refuses to start the server over one exactly as over a missing name, so the fix is editing the reference in the server's env. This is a values-free preview: it reads the vault's KEY LIST and the server's env-reference NAMES, and never decrypts or returns any secret value. Servers with no `${secret:...}` references (well-formed or malformed) are omitted. Requires no passphrase (no decryption happens).",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -313,17 +313,25 @@ export interface SecretsReportRow {
   injectedSecrets: string[];
   /** Names this server references but the vault LACKS (sorted). */
   missing: string[];
+  /** `${secret:` references in this server's env that do not PARSE, in
+   *  secrets-vault's bounded `display` form (`<malformed ref> ${secret:gh
+   *  token}`; sorted). Never a raw env value: the span is control-stripped
+   *  and capped before it gets here (see MalformedSecretRef). A server with
+   *  only malformed refs still gets a row -- it is exactly the one whose
+   *  spawn is being refused with nothing else to explain why. */
+  malformed: string[];
 }
 
 /**
  * Pure, values-free computation backing the `mcp_connect_secrets`
  * meta-tool. Given each server's namespace + env map and the SET of secret
  * names the vault holds, returns one row per server that references at
- * least one `${secret:...}`:
+ * least one `${secret:...}`, well-formed or not:
  *   - injectedSecrets = referenced names ∩ vaultKeys
  *   - missing         = referenced names \ vaultKeys
- * Never decrypts; takes only NAMES in and emits only NAMES out. Servers
- * with no references are omitted.
+ *   - malformed       = references the strict regex cannot parse
+ * Never decrypts; takes only NAMES in and emits only NAMES (plus bounded
+ * malformed spans) out. Servers with no references at all are omitted.
  */
 export function computeSecretsReport(
   servers: Array<{ namespace: string; env?: Record<string, string> }>,
@@ -341,7 +349,12 @@ export function computeSecretsReport(
     // the fresh-instance rule for every name-only caller (upstream.ts's spawn
     // audit and doctor's vault section are the others).
     const referenced = collectSecretRefNames(server.env);
-    if (referenced.size === 0) continue;
+    // The strict scanner above cannot see a reference a typo has put outside
+    // SECRET_REF_RE, while resolveServerEnv refuses the spawn over it. Without
+    // this column the report said "gh: injected" about a server that will not
+    // start, and said nothing at all about one whose only ref is the typo.
+    const malformed = collectMalformedSecretRefs(server.env);
+    if (referenced.size === 0 && malformed.length === 0) continue;
     const injectedSecrets: string[] = [];
     const missing: string[] = [];
     for (const name of referenced) {
@@ -352,6 +365,7 @@ export function computeSecretsReport(
       server: server.namespace,
       injectedSecrets: injectedSecrets.sort(),
       missing: missing.sort(),
+      malformed: malformed.sort(),
     });
   }
   return rows;

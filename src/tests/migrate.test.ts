@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { lstat, readFile, stat } from "node:fs/promises";
+import { lstat, readFile, rename, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,17 @@ import {
 } from "../migrate.js";
 import { CONFIG_DIRNAME, userConfigDir } from "../paths.js";
 
+// Only `rename` is WRAPPED (real behaviour by default): the sibling-process
+// race case below slots a second migrator's move in ahead of ours through a
+// per-test mockImplementationOnce. Everything else in node:fs/promises stays
+// real, so the suite keeps running against genuine temp directories.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rename: vi.fn(actual.rename) };
+});
+
+const mockRename = vi.mocked(rename);
+
 // findLegacyProjectRoot is not exported -- all walk-up behaviour is exercised
 // indirectly through migrateLegacyConfigPaths, in the SECOND describe block
 // below ("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)").
@@ -19,10 +30,16 @@ import { CONFIG_DIRNAME, userConfigDir } from "../paths.js";
 // they were written, not a reading order: the walk-up block holds 5, 5b, 6,
 // 7, 8, 12 and 13, while 9, 10 and 11 sit in the first block above them.
 
-// Helper: create a legacy file at <dir>/<name> with minimal content.
-function writeLegacy(dir: string, name: string): string {
+/** The allow-list a pre-0.12 flat file carries -- the payload that survives
+ *  the migration. (The flat file's old hosted-backend `token` is retired and
+ *  the loader ignores the key; a fixture built on it would be pinning a
+ *  decommissioned surface.) */
+const LEGACY_SERVERS = ["github-legacy"];
+
+// Helper: create a legacy file at <dir>/<name> carrying an allow-list.
+function writeLegacy(dir: string, name: string, servers: string[] = LEGACY_SERVERS): string {
   const p = join(dir, name);
-  writeFileSync(p, JSON.stringify({ token: "mcp_pat_legacy_aaaa" }), "utf8");
+  writeFileSync(p, JSON.stringify({ servers }), "utf8");
   return p;
 }
 
@@ -67,6 +84,9 @@ describe("migrateLegacyConfigPaths", () => {
   });
 
   afterEach(() => {
+    // mockReset restores the implementation vi.fn was created with (the real
+    // rename) and drops any *Once a failed assertion left unconsumed.
+    mockRename.mockReset();
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
   });
@@ -82,7 +102,7 @@ describe("migrateLegacyConfigPaths", () => {
     await expect(stat(legacyPath)).rejects.toThrow();
     // Target should now exist with the original content.
     const content = JSON.parse(await readFile(targetPath, "utf8"));
-    expect(content.token).toBe("mcp_pat_legacy_aaaa");
+    expect(content.servers).toEqual(LEGACY_SERVERS);
   });
 
   // 2. Idempotent: does NOT overwrite target when ~/.yaw-mcp/config.json already exists.
@@ -92,7 +112,7 @@ describe("migrateLegacyConfigPaths", () => {
     const targetDir = userConfigDir(home);
     mkdirSync(targetDir, { recursive: true });
     const targetPath = join(targetDir, "config.json");
-    writeFileSync(targetPath, JSON.stringify({ token: "mcp_pat_new_bbbb" }), "utf8");
+    writeFileSync(targetPath, JSON.stringify({ servers: ["github-new"] }), "utf8");
 
     const warns: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
@@ -105,9 +125,9 @@ describe("migrateLegacyConfigPaths", () => {
       spy.mockRestore();
     }
 
-    // Target content must be unchanged (new token wins, legacy is orphaned).
+    // Target content must be unchanged (the new list wins, legacy is orphaned).
     const content = JSON.parse(await readFile(targetPath, "utf8"));
-    expect(content.token).toBe("mcp_pat_new_bbbb");
+    expect(content.servers).toEqual(["github-new"]);
 
     // Legacy file must still exist (not deleted, not renamed).
     await expect(stat(join(home, LEGACY_GLOBAL_FILENAME))).resolves.toBeDefined();
@@ -153,6 +173,47 @@ describe("migrateLegacyConfigPaths", () => {
     // The reason travels with it -- a bare "it failed" is not diagnosable.
     expect(typeof failed?.error).toBe("string");
     expect(String(failed?.error).length).toBeGreaterThan(0);
+  });
+
+  // 11b. The check-then-act pair `exists(target)` + rename, against a SIBLING
+  //      process. config-loader memoizes the migration per process only, so
+  //      two yaw-mcp processes starting together (several MCP client panes)
+  //      both pass the check and the loser's rename ENOENTs on a file its
+  //      sibling has already moved. That used to log the "migration failed"
+  //      warn for a file sitting exactly where it should be.
+  it("reports a rename that lost to a sibling process as migrated, not failed", async () => {
+    const legacyPath = writeLegacy(home, LEGACY_GLOBAL_FILENAME);
+    const targetPath = join(userConfigDir(home), "config.json");
+    // The sibling's move, slotted in just before ours: the real rename runs
+    // first (the file lands at the target), then OUR rename sees ENOENT.
+    mockRename.mockImplementationOnce(async (from, to) => {
+      await rename(from, to);
+      const err = new Error("ENOENT: no such file or directory, rename") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      throw err;
+    });
+    // The verdict is an INFO line; the suite's default threshold hides it.
+    vi.stubEnv("LOG_LEVEL", "info");
+
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown): boolean => {
+      chunks.push(String(chunk));
+      return true;
+    });
+    try {
+      await migrateLegacyConfigPaths({ cwd, home });
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The migration DID happen (by the sibling), and the outcome says so.
+    await expect(stat(legacyPath)).rejects.toThrow();
+    expect(JSON.parse(await readFile(targetPath, "utf8")).servers).toEqual(LEGACY_SERVERS);
+    const migrated = findLog(chunks, "migrated by another yaw-mcp process");
+    expect(migrated, "no 'migrated by another process' info was emitted").toBeDefined();
+    expect(migrated?.from).toBe(legacyPath);
+    expect(migrated?.to).toBe(targetPath);
+    expect(findLog(chunks, "legacy migration failed")).toBeUndefined();
   });
 
   // 3. No-op when legacy file does not exist (ENOENT).
@@ -320,7 +381,7 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
     // inside the project root.
     const targetPath = join(projectRoot, CONFIG_DIRNAME, "config.json");
     const content = JSON.parse(await readFile(targetPath, "utf8"));
-    expect(content.token).toBe("mcp_pat_legacy_aaaa");
+    expect(content.servers).toEqual(LEGACY_SERVERS);
 
     // Legacy file must no longer exist.
     await expect(stat(join(projectRoot, LEGACY_PROJECT_FILENAME))).rejects.toThrow();
@@ -343,7 +404,7 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
 
     const targetPath = join(projectRoot, CONFIG_DIRNAME, "config.json");
     const content = JSON.parse(await readFile(targetPath, "utf8"));
-    expect(content.token).toBe("mcp_pat_legacy_aaaa");
+    expect(content.servers).toEqual(LEGACY_SERVERS);
     await expect(stat(join(projectRoot, LEGACY_PROJECT_FILENAME))).rejects.toThrow();
   });
 
@@ -371,7 +432,7 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
     // expectation with the code.
     const targetPath = join(projectRoot, CONFIG_DIRNAME, "config.local.json");
     const content = JSON.parse(await readFile(targetPath, "utf8"));
-    expect(content.token).toBe("mcp_pat_legacy_aaaa");
+    expect(content.servers).toEqual(LEGACY_SERVERS);
 
     await expect(stat(join(projectRoot, LEGACY_LOCAL_FILENAME))).rejects.toThrow();
     // The shared config.json is NOT invented on the local file's behalf.
@@ -383,12 +444,10 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
   //     mkdirs the parent for each, and the second mkdir must be idempotent).
   it("migrates both legacy files in a root into one .yaw-mcp/ directory", async () => {
     const projectRoot = mkdtempSync(join(home, "proj-"));
-    // Distinct tokens (writeLegacy's single token could not tell the two moves
+    // Distinct lists (writeLegacy's default could not tell the two moves
     // apart if one file's contents landed under the other's new name).
-    const writeToken = (name: string, token: string): void =>
-      writeFileSync(join(projectRoot, name), JSON.stringify({ token }), "utf8");
-    writeToken(LEGACY_PROJECT_FILENAME, "mcp_pat_shared_cccc");
-    writeToken(LEGACY_LOCAL_FILENAME, "mcp_pat_local_dddd");
+    writeLegacy(projectRoot, LEGACY_PROJECT_FILENAME, ["shared-only"]);
+    writeLegacy(projectRoot, LEGACY_LOCAL_FILENAME, ["local-only"]);
 
     await migrateLegacyConfigPaths({ cwd: projectRoot, home });
 
@@ -396,8 +455,8 @@ describe("findLegacyProjectRoot (via migrateLegacyConfigPaths walk-up)", () => {
     const shared = JSON.parse(await readFile(join(newDir, "config.json"), "utf8"));
     const local = JSON.parse(await readFile(join(newDir, "config.local.json"), "utf8"));
     // Contents did not cross over: each legacy file kept its own payload.
-    expect(shared.token).toBe("mcp_pat_shared_cccc");
-    expect(local.token).toBe("mcp_pat_local_dddd");
+    expect(shared.servers).toEqual(["shared-only"]);
+    expect(local.servers).toEqual(["local-only"]);
 
     await expect(stat(join(projectRoot, LEGACY_PROJECT_FILENAME))).rejects.toThrow();
     await expect(stat(join(projectRoot, LEGACY_LOCAL_FILENAME))).rejects.toThrow();

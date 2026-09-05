@@ -1,7 +1,7 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_KDF,
   decryptEntry,
@@ -9,18 +9,23 @@ import {
   type EncryptedEntry,
   encryptEntry,
   generateSalt,
+  KEY_LEN,
   LEGACY_KDF,
 } from "../secrets-crypto.js";
 import {
+  collectMalformedSecretRefs,
   getSecret,
   hasSecretRefs,
   listKeys,
   loadVault,
   lock,
+  MALFORMED_REF_MARKER,
+  MALFORMED_REF_MAX_CHARS,
   newVault,
   removeSecret,
   resolveSecretRefs,
   rotateVault,
+  SECRET_NAME_RE,
   SECRET_REF_RE,
   SECRETS_SCHEMA_VERSION,
   saveVault,
@@ -44,6 +49,7 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(synthHome, { recursive: true, force: true });
   lock();
+  vi.restoreAllMocks();
 });
 
 describe("secrets-crypto", () => {
@@ -172,6 +178,32 @@ describe("secrets-vault: set/get/list/remove", () => {
     }
   });
 
+  it("saveVault asks for a 0o600 file inside a 0o700 .yaw-mcp/ that it creates itself", async () => {
+    // Fresh home: neither the vault nor its parent .yaw-mcp/ exists, so this
+    // save takes atomicWriteFile's create path -- the file born 0o600 and the
+    // directory born 0o700. Every other save in this file pre-creates the
+    // directory (contrary to saveVault's own MUST NOT note), which turns the
+    // dirMode into a no-op and left the request itself unpinned. Mirrors
+    // secrets-audit.test.ts: the MODES REQUESTED are this module's decision;
+    // whether the filesystem honours POSIX bits is the OS's business (Windows
+    // reports a synthetic 0o666), so statting the result proves nothing here.
+    const atomic = await import("../atomic-write.js");
+    const spy = vi.spyOn(atomic, "atomicWriteFile");
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "github", "ghp_abc");
+    const path = vaultPath(synthHome);
+    expect(existsSync(join(synthHome, ".yaw-mcp"))).toBe(false);
+
+    await saveVault(path, vault);
+
+    expect(existsSync(path)).toBe(true);
+    const call = spy.mock.calls.find((c) => c[0] === path);
+    expect(call, "saveVault did not go through atomicWriteFile").toBeDefined();
+    expect(call?.[3]).toBe(0o600);
+    expect(call?.[4]).toBe(0o700);
+  });
+
   it("loadVault returns null when no file exists", async () => {
     const v = await loadVault(join(synthHome, "no-such-file.json"));
     expect(v).toBeNull();
@@ -198,6 +230,36 @@ describe("secrets-vault: set/get/list/remove", () => {
     const { resolved, missing } = resolveSecretRefs({ X: "${secret:toString}" }, vault, key);
     expect(resolved.X).toBe("${secret:toString}");
     expect(missing).toEqual(["toString"]);
+  });
+
+  it("unlock hands back the caller's OWN copy of the key, so lock() cannot zero it under them", async () => {
+    // lock() zero-fills the module-cached Buffer in place. When unlock
+    // returned that same object, a caller holding it across a lock() went on
+    // encrypting under 32 zero bytes -- which encryptEntry accepts (it only
+    // checks the length) -- and saved entries no passphrase could decrypt,
+    // with a green exit code. Nothing shipped sequences things that way, but
+    // it was a one-line refactor away (a lock() on a shutdown path, rotate's
+    // lock() hoisted above its save).
+    let vault = newVault();
+    const first = await unlock(vault, "hunter2");
+    vault = setSecret(vault, first, "github", "ghp_abc");
+    // The cache-hit path must hand out a copy too, not the cached object.
+    const second = await unlock(vault, "hunter2");
+    expect(second).not.toBe(first);
+    expect(second.equals(first)).toBe(true);
+    expect(second).toHaveLength(KEY_LEN);
+
+    lock();
+
+    // Both copies survive the lock() intact and still work.
+    expect(first.some((b) => b !== 0)).toBe(true);
+    expect(second.equals(first)).toBe(true);
+    expect(getSecret(vault, first, "github")).toBe("ghp_abc");
+    // ...and a value written under a post-lock() copy reads back under a
+    // fresh derivation -- the exact save that used to be unrecoverable.
+    vault = setSecret(vault, second, "aws", "aws_xyz");
+    const fresh = await unlock(vault, "hunter2");
+    expect(getSecret(vault, fresh, "aws")).toBe("aws_xyz");
   });
 
   it("unlock rejects a wrong passphrase even when a key is already cached for this vault", async () => {
@@ -238,17 +300,19 @@ describe("secrets-vault: set/get/list/remove", () => {
     await expect(unlock(vault, "anything")).resolves.toBeInstanceOf(Buffer);
   });
 
-  it("legacy vault (entries, no check) verifies via first-entry canary", async () => {
-    // Build a vault, then strip its check to simulate a pre-check vault.
+  it("legacy vault (entries, no check) verifies via any-entry canary", async () => {
+    // Build a vault, then strip its check to simulate a pre-check vault. ANY
+    // entry that decrypts proves the key (the first-entry-corrupt case is
+    // pinned further down); only an all-fail is a wrong passphrase.
     let vault = newVault();
     const key = await unlock(vault, "hunter2");
     vault = setSecret(vault, key, "github", "ghp_abc");
     const legacy = { version: vault.version, salt: vault.salt, entries: vault.entries };
     lock();
-    // Correct passphrase: canary decrypts -> resolves.
+    // Correct passphrase: an entry decrypts -> resolves.
     await expect(unlock(legacy, "hunter2")).resolves.toBeInstanceOf(Buffer);
     lock();
-    // Wrong passphrase: canary fails -> throws.
+    // Wrong passphrase: nothing decrypts -> throws.
     await expect(unlock(legacy, "hunter3")).rejects.toThrow(/wrong passphrase/i);
   });
 
@@ -285,7 +349,10 @@ describe("secrets-vault: set/get/list/remove", () => {
     writeFileSync(path, `${JSON.stringify({ version: 99, salt, entries: {} })}\n`);
     await expect(loadVault(path)).rejects.toThrow(/newer/i);
     // Equal (current) version still loads -- forward reads stay compatible.
-    writeFileSync(path, `${JSON.stringify({ version: 1, salt, entries: {} })}\n`);
+    // The CURRENT constant, not a literal 1: v1 is the migration tests'
+    // business, and a literal silently stopped pinning the equal case the
+    // moment the schema moved past it.
+    writeFileSync(path, `${JSON.stringify({ version: SECRETS_SCHEMA_VERSION, salt, entries: {} })}\n`);
     await expect(loadVault(path)).resolves.not.toBeNull();
   });
 
@@ -365,6 +432,33 @@ describe("SECRET_REF_RE is exported and matches ${secret:NAME}", () => {
     // on that (see doctor-cmd.ts, meta-tools.ts, upstream.ts).
     const m = [...`x ${"${secret:gh}"} y`.matchAll(SECRET_REF_RE)];
     expect(m[0][1]).toBe("gh");
+  });
+
+  it("agrees with SECRET_NAME_RE on every name: storable iff referenceable", () => {
+    // The two used to be separate literals kept in sync by hand. A class
+    // that widened in one and not the other would let a name be STORED that
+    // no reference could ever address, or the reverse; building both from
+    // one SECRET_NAME_CLASS is what this pins.
+    const opener = "${secret:";
+    for (const name of [
+      "gh",
+      "GH_token.v2-1",
+      "__proto__",
+      "a",
+      "",
+      "has space",
+      "a:b",
+      "a{b}",
+      "a/b",
+      "a$b",
+      "x\ny",
+    ]) {
+      const storable = SECRET_NAME_RE.test(name);
+      const ref = `${opener}${name}}`;
+      const m = [...ref.matchAll(new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags))];
+      const referenceable = m.length === 1 && m[0][0] === ref && m[0][1] === name;
+      expect(referenceable, JSON.stringify(name)).toBe(storable);
+    }
   });
 });
 
@@ -555,6 +649,116 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
     const { resolved } = resolveSecretRefs({ LITERAL: "no refs here", GITHUB_TOKEN: "${secret:github}" }, vault, key);
     expect(resolved.LITERAL).toBe("no refs here");
     expect(resolved.GITHUB_TOKEN).toBe("ghp_abc");
+  });
+
+  it("reports a MALFORMED ${secret:...} reference in `malformed` instead of passing it to the child", async () => {
+    // hasSecretRefs gates on the `${secret:` substring, so each of these
+    // passes the gate, demands a passphrase and unlocks the vault -- and used
+    // to come out of `replace` untouched with `missing` EMPTY, because the
+    // strict regex never matched. The child was then spawned with the literal
+    // as its token: a one-character typo silently broke the fail-closed
+    // promise, and no "missing" audit event was written either.
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "gh", "ghp_abc");
+    for (const [literal, auditName] of [
+      ["${secret:gh token}", `${MALFORMED_REF_MARKER} gh`],
+      ["${secret:gh", `${MALFORMED_REF_MARKER} gh`],
+      // No name prefix parses at all: the marker stands alone.
+      ["${secret:}", MALFORMED_REF_MARKER],
+    ]) {
+      expect(hasSecretRefs({ GITHUB_TOKEN: literal }), literal).toBe(true);
+      const { resolved, missing, malformed } = resolveSecretRefs({ GITHUB_TOKEN: literal }, vault, key);
+      expect(resolved.GITHUB_TOKEN, literal).toBe(literal);
+      // Its OWN list, never folded into `missing`: `missing` is NAMES, and
+      // every consumer (the audit trail above all) treats it as such.
+      expect(missing, literal).toEqual([]);
+      // `display` quotes the span the user actually wrote, behind the marker,
+      // so the refusal can point at the typo; `auditName` keeps only the
+      // prefix that IS legal name text.
+      expect(malformed, literal).toEqual([{ display: `${MALFORMED_REF_MARKER} ${literal}`, auditName }]);
+    }
+  });
+
+  it("a malformed reference is reported alongside the well-formed ones in the same value", async () => {
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "gh", "ghp_abc");
+    const { resolved, missing, malformed } = resolveSecretRefs(
+      { AUTH: "${secret:gh} ${secret:bad name} ${secret:absent}" },
+      vault,
+      key,
+    );
+    // The good ref still resolves; the value is refused over the other two.
+    expect(resolved.AUTH).toBe("ghp_abc ${secret:bad name} ${secret:absent}");
+    expect(missing).toEqual(["absent"]);
+    expect(malformed).toEqual([
+      { display: `${MALFORMED_REF_MARKER} \${secret:bad name}`, auditName: `${MALFORMED_REF_MARKER} bad` },
+    ]);
+  });
+
+  it("never returns a malformed span raw: display is control-stripped and capped, auditName stops at the name", async () => {
+    // An unterminated reference runs to the END of the env value, so the
+    // span can carry whatever the user put after the typo -- a host, a
+    // password, a newline, an escape sequence. Folded into `missing` as-is,
+    // it used to reach the thrown error (an MCP payload and a log line) and
+    // the audit log's names-only `secret` field verbatim.
+    const vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    const tail = `DB_PASS@db.internal:5432/prod?x=y&pw=${"z".repeat(200)}`;
+    const { missing, malformed } = resolveSecretRefs({ DB: `\${secret:${tail}` }, vault, key);
+    expect(missing).toEqual([]);
+    expect(malformed).toHaveLength(1);
+    const [ref] = malformed;
+    // Bounded: marker + space + MALFORMED_REF_MAX_CHARS of span + "...".
+    expect(ref.display.length).toBeLessThanOrEqual(MALFORMED_REF_MARKER.length + 1 + MALFORMED_REF_MAX_CHARS + 3);
+    expect(ref.display.startsWith(`${MALFORMED_REF_MARKER} \${secret:DB_PASS`)).toBe(true);
+    expect(ref.display.endsWith("...")).toBe(true);
+    expect(ref.display).not.toContain("pw=");
+    // The audit form never carries anything past the legal-name prefix --
+    // not the host, not the port, not the query string.
+    expect(ref.auditName).toBe(`${MALFORMED_REF_MARKER} DB_PASS`);
+    expect(ref.auditName).not.toContain("@db.internal");
+
+    // Control characters are DROPPED from display (not escaped): the string
+    // is headed for a terminal and a log, where a raw ESC can forge a cursor
+    // move and a newline can forge a line. What remains is inert text. The
+    // ESC is built at runtime so no control byte sits in this source file.
+    const ESC = String.fromCharCode(0x1b);
+    const NL = String.fromCharCode(0x0a);
+    const ctl = resolveSecretRefs({ X: `\${secret:gh${ESC}[2J${NL}token}` }, vault, key).malformed;
+    expect(ctl).toEqual([
+      { display: `${MALFORMED_REF_MARKER} \${secret:gh[2Jtoken}`, auditName: `${MALFORMED_REF_MARKER} gh` },
+    ]);
+  });
+
+  it("does not mistake a `${secret:` inside a DECRYPTED value for an unparsed reference", async () => {
+    // The malformed-span scan runs on the ORIGINAL value: a secret whose
+    // plaintext happens to contain the opener must not be reported malformed
+    // after it was substituted in.
+    let vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    vault = setSecret(vault, key, "tricky", "literally ${secret:inside");
+    const { resolved, missing, malformed } = resolveSecretRefs({ X: "${secret:tricky}" }, vault, key);
+    expect(resolved.X).toBe("literally ${secret:inside");
+    expect(missing).toEqual([]);
+    expect(malformed).toEqual([]);
+  });
+
+  it("collectMalformedSecretRefs names the spans the strict name scanners cannot see, in display form", () => {
+    // doctor and mcp_connect_secrets scan with the strict regex, so a
+    // reference a typo has put outside it is invisible to them while the
+    // spawn is refused over it. This is how they can name it -- and they get
+    // the same bounded `display` the refusal quotes, never the raw span.
+    expect(collectMalformedSecretRefs(undefined)).toEqual([]);
+    expect(collectMalformedSecretRefs({ A: "${secret:ok}", B: "plain" })).toEqual([]);
+    expect(
+      collectMalformedSecretRefs({ A: "${secret:gh token}", B: "x ${secret:gh token} y", C: "${secret:tail" }),
+    ).toEqual([`${MALFORMED_REF_MARKER} \${secret:gh token}`, `${MALFORMED_REF_MARKER} \${secret:tail`]);
+    const long = collectMalformedSecretRefs({ C: `\${secret:DB_PASS@db.internal/${"q".repeat(100)}` });
+    expect(long).toHaveLength(1);
+    expect(long[0].length).toBeLessThanOrEqual(MALFORMED_REF_MARKER.length + 1 + MALFORMED_REF_MAX_CHARS + 3);
+    expect(long[0].endsWith("...")).toBe(true);
   });
 
   it("resolveSecretRefs caches decryption across multiple refs to the same secret", async () => {

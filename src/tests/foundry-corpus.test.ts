@@ -6,6 +6,7 @@ import {
   loadFoundryCorpus,
   parseTraceLines,
   scoreCorpus,
+  traceDropReason,
   validateCorpus,
 } from "../foundry-corpus.js";
 import type { RankableServer } from "../relevance.js";
@@ -73,6 +74,27 @@ describe("buildCorpusFromTraces", () => {
 
   it("drops traces with empty tokens", () => {
     expect(buildCorpusFromTraces([{ tokens: [], chosen: "github" }], SERVERS).entries).toHaveLength(0);
+  });
+
+  it("reports why a trace is dropped through the same rule the fold applies", () => {
+    // The export's zero-entries message counts these; the fold consults the
+    // same function, so the two cannot name different causes.
+    const known = new Set(SERVERS.map((s) => s.namespace));
+    expect(traceDropReason({ tokens: ["a"], chosen: "unknown" }, known)).toBe("unknown-chosen");
+    expect(traceDropReason({ tokens: [], chosen: "github" }, known)).toBe("empty-tokens");
+    // A bag with no string in it folds to nothing too, so it is the same cause.
+    expect(traceDropReason({ tokens: [1 as unknown as string], chosen: "github" }, known)).toBe("empty-tokens");
+    // Both wrong: the catalog mismatch is the one a maintainer can act on.
+    expect(traceDropReason({ tokens: [], chosen: "unknown" }, known)).toBe("unknown-chosen");
+    expect(traceDropReason({ tokens: ["issue"], chosen: "github" }, known)).toBeNull();
+    const traces = [
+      { tokens: ["a"], chosen: "unknown" },
+      { tokens: [], chosen: "github" },
+      { tokens: ["issue"], chosen: "github" },
+    ];
+    expect(buildCorpusFromTraces(traces, SERVERS).entries).toHaveLength(
+      traces.filter((t) => traceDropReason(t, known) === null).length,
+    );
   });
 
   it("caps entries, stratified across chosen servers", () => {
