@@ -18,7 +18,10 @@ export interface ReadToolResult {
 // form ("gh_create_issue"). We strip a leading "<namespace>_" when it
 // matches so callers can paste whichever form they already have in
 // context. The namespace-aware check (rather than a blind split on
-// "_") keeps underscore-containing namespaces like "mcp_hosting" safe.
+// "_") keeps an underscore-containing namespace safe. The catalog never
+// derives one (deriveNamespace strips punctuation), but bundles.json's
+// `namespace` is user-set and NAMESPACE_RE allows "_", so a user who names
+// the catalog's google-maps server "google_maps" gets exactly this shape.
 //
 // When `tools` is provided, try an exact-match against the list first.
 // Only strip the namespace prefix when no tool in the list has the

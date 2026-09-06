@@ -34,8 +34,8 @@
 // Default is privacy-safe: harvesting is DISABLED unless YAW_MCP_FOUNDRY is
 // explicitly "1" / "true". When enabled, only the redacted+sorted token bag
 // and the chosen namespace are written -- never the raw intent string, and
-// never the candidate shortlist or its scores (see FoundryTrace.candidates:
-// callers may still pass it, nothing persists or reads it).
+// never the candidate shortlist or its scores (the FoundryTrace shape no
+// longer carries one; see the note on the interface).
 
 import { appendFile, mkdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -278,15 +278,10 @@ export function redactIntent(intent: string): RedactedIntent {
 
 export interface FoundryTrace {
   tokens: string[];
-  /** The ranker's shortlist at decision time. ACCEPTED but NOT PERSISTED:
-   *  nothing has ever read it back. It was written ns-only (scores stripped,
-   *  because a score reflects the ranker's live health/learning state and
-   *  would bias an eval replay against that same state), and a ns-only
-   *  shortlist no consumer opens is pure weight against the 5 MiB harvest
-   *  cap -- fewer traces fit for no signal. Kept OPTIONAL on the in-memory
-   *  shape so the dispatch call site (server.ts) still type-checks while it
-   *  is unwound; drop it there and it can leave this interface too. */
-  candidates?: Array<{ ns: string; score: number }>;
+  // No `candidates` field: the ranker's shortlist was accepted here for a
+  // release and never persisted (nothing read it back, and a ns-only list no
+  // consumer opens was pure weight against the 5 MiB harvest cap). The
+  // dispatch call site (server.ts) no longer passes it.
   chosen: string;
   redactedCount: number;
 }
@@ -344,18 +339,26 @@ export async function appendFoundryTrace(trace: FoundryTrace, home: string = hom
       // and let the append attempt proceed / fail quietly below.
     }
 
-    // Persist ONLY the redacted bag + routing decision -- never raw intent,
-    // and never `trace.candidates`: the shortlist was written scores-stripped
-    // (to keep an eval replay off the ranker's own live state) and then never
-    // read by anything, so it only ate into the size cap. See FoundryTrace.
+    // Persist ONLY the redacted bag + routing decision -- never raw intent.
+    // (The ranker's shortlist used to ride along scores-stripped and was never
+    // read by anything, so it only ate into the size cap; it is gone from the
+    // trace shape now. See FoundryTrace.)
     const line = `${JSON.stringify({
       tokens: trace.tokens,
       chosen: trace.chosen,
       redactedCount: trace.redactedCount,
     })}\n`;
 
-    await mkdir(dir, { recursive: true });
-    await appendFile(file, line, "utf8");
+    // Born owner-only, best-effort like everything else here. The file header
+    // says it: ordinary words -- names, company names, ticket text -- survive
+    // redaction, so on a multi-user host a harvest born at the umask default
+    // (0644, inside a 0755 ~/.yaw-mcp this same call may create) hands every
+    // token bag to any local user. `mode` on mkdir applies only to directories
+    // it creates and on appendFile only to a file it creates, so neither
+    // touches perms the user already has. Mirrors secrets-audit.ts, the
+    // repo's other privacy-adjacent append-only log. No-op on Windows.
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await appendFile(file, line, { encoding: "utf8", mode: 0o600 });
   } catch {
     // Swallow everything. Telemetry must never break a dispatch.
   }

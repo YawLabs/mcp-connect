@@ -27,7 +27,12 @@ import { type RankableServer, rankServers } from "../relevance.js";
 //      FOUNDRY_CORPUS_VERSION or a truncated file would silently un-gate
 //      routing while the log claimed no fixture was ever committed.
 //   3. fixture PRESENT and valid -> the real gate runs. No code change needed
-//      to get here; commit the fixture and it activates.
+//      to get here; commit the fixture and it activates. The path that gets
+//      you here -- harvest with appendFoundryTrace, export off disk with
+//      runFoundryExport, load the result with loadFoundryCorpus -- is proven
+//      end to end in foundry-activation.test.ts, so a maintainer who harvests
+//      real (and non-repeatable) traffic is not also betting that the two
+//      halves of the procedure agree about the file between them.
 //
 // Deliberately NOT satisfied with a synthetic fixture. The gate's premise is
 // real (tokens -> chosen) pairs from the full pipeline; hand-written entries
@@ -199,6 +204,13 @@ describe("foundry routing regression gate", () => {
 // fail". This block runs gateReport against a deliberately-broken inline
 // probe and asserts it reports the breakage, so whenever a real corpus does
 // land, the machinery consuming it is known to work.
+//
+// Sibling coverage, deliberately in another file: this block proves the gate
+// can go RED on a corpus handed to it in memory, while
+// foundry-activation.test.ts proves an EXPORTED corpus reaches it at all
+// (harvest -> `foundry export` off disk -> loadFoundryCorpus -> scoreCorpus,
+// against a temp home and a temp --out). Neither is a routing corpus; both
+// exist so the only missing ingredient here is real traffic.
 //
 // The probe below is NOT a routing corpus and is NOT harvested data: two
 // nonsense servers, two entries constructed to miss on purpose, never written

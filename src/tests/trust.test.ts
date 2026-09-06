@@ -40,7 +40,6 @@ import {
   grantTrust,
   hashTrustContent,
   isTrustBypassEnabled,
-  isTrusted,
   listTrusted,
   normalizeTrustKey,
   readTrustStore,
@@ -48,6 +47,7 @@ import {
   TRUST_BYPASS_ENV,
   TRUST_SCHEMA_VERSION,
   TrustStoreUnreadableError,
+  trustedRecords,
   trustStatusFor,
   trustStorePath,
 } from "../trust.js";
@@ -365,6 +365,29 @@ describe("trust store grant / revoke / list round-trip", () => {
     const res = await revokeTrust(join(synthCwd, "nope", "bundles.json"), { home: synthHome });
     expect(res.removed).toBe(false);
     expect(res.storeWasMalformed).toBe(false);
+    expect(res.malformedKind).toBeNull();
+    expect(res.malformedReason).toBeNull();
+  });
+
+  it("trustedRecords is the pure half of listTrusted -- the same rows from a store already in hand", async () => {
+    // trust-cmd's --list reads the store once to name a failure kind and then
+    // used listTrusted to render the rows, which read it AGAIN. The rows come
+    // from the loaded store now, so the two views cannot disagree.
+    writeBundles(synthCwd, HOSTILE);
+    const a = projectBundlesPath(synthCwd);
+    const otherDir = mkdtempSync(join(synthHome, "cwd-"));
+    writeBundles(otherDir, HOSTILE);
+    const b = projectBundlesPath(otherDir);
+    await grantTrust(b, readFileSync(b), { home: synthHome });
+    await grantTrust(a, readFileSync(a), { home: synthHome });
+
+    const store = await readTrustStore(synthHome);
+    const rows = trustedRecords(store);
+    expect(rows).toEqual(await listTrusted({ home: synthHome }));
+    // Sorted by display path, whatever order the grants landed in.
+    expect(rows.map((r) => r.path)).toEqual([a, b].sort((x, y) => x.localeCompare(y)));
+    // A malformed store lists nothing, exactly like listTrusted does.
+    expect(trustedRecords({ ...store, malformed: true, malformedKind: "parse", malformedReason: "x" })).toEqual([]);
   });
 
   it("revokes a physically-keyed grant when the user spells the path logically", async () => {
@@ -439,6 +462,31 @@ describe("trust store grant / revoke / list round-trip", () => {
     expect(res.removed).toBe(false);
     expect(res.storeWasMalformed).toBe(true);
     expect(readFileSync(trustStorePath(synthHome), "utf8")).toBe("nope");
+  });
+
+  it("a refused revoke names WHICH kind of unusable store it met, so the caller need not read it again", async () => {
+    // trust-cmd prints a different remedy per kind (fix permissions / upgrade /
+    // delete). A bare boolean forced it to re-read the store to recover the
+    // kind -- a second read that could classify a DIFFERENT failure than the
+    // one that actually refused the revoke.
+    const store = trustStorePath(synthHome);
+    mkdirSync(join(synthHome, CONFIG_DIRNAME), { recursive: true });
+    writeFileSync(store, "nope");
+    const parse = await revokeTrust(projectBundlesPath(synthCwd), { home: synthHome });
+    expect(parse.storeWasMalformed).toBe(true);
+    expect(parse.malformedKind).toBe("parse");
+    expect(parse.malformedReason).toContain(store);
+
+    writeFileSync(store, JSON.stringify({ version: TRUST_SCHEMA_VERSION + 1, trusted: {} }));
+    const schema = await revokeTrust(projectBundlesPath(synthCwd), { home: synthHome });
+    expect(schema.malformedKind).toBe("schema");
+    expect(schema.malformedReason).toContain("newer yaw-mcp");
+
+    rmSync(store);
+    makeStoreUnreadable(synthHome);
+    const io = await revokeTrust(projectBundlesPath(synthCwd), { home: synthHome });
+    expect(io.malformedKind).toBe("io");
+    expect(io.malformedReason).toContain("could not read");
   });
 
   it("re-granting replaces the pinned hash rather than duplicating the entry", async () => {
@@ -941,7 +989,6 @@ async function expectOnlyKeepSurvives(g: TwoGrants): Promise<void> {
 
   // The survivor still authorizes, all the way through the loader.
   expect(trustStatusFor(g.keepPath, readFileSync(g.keepPath), store)).toBe("trusted");
-  expect(await isTrusted(g.keepPath, readFileSync(g.keepPath), { home: synthHome })).toBe(true);
   const kept = await loadLocalBundles({ home: synthHome, cwd: g.keepDir, env: {} });
   expect(kept.config?.servers.map((s) => s.namespace)).toEqual(["slack"]);
   expect(kept.warnings).toEqual([]);
@@ -949,7 +996,6 @@ async function expectOnlyKeepSurvives(g: TwoGrants): Promise<void> {
 
   // The dropped one denies -- fail closed, and via the "never approved" path.
   expect(trustStatusFor(g.dropPath, readFileSync(g.dropPath), store)).toBe("untrusted");
-  expect(await isTrusted(g.dropPath, readFileSync(g.dropPath), { home: synthHome })).toBe(false);
   const denied = await loadLocalBundles({ home: synthHome, cwd: g.dropDir, env: {} });
   expect(denied.config?.servers.map((s) => s.namespace)).toEqual(["github"]);
   expect(denied.warnings.some((w) => w.includes("untrusted project bundles.json"))).toBe(true);
@@ -1089,23 +1135,27 @@ describe("hashing and status helpers", () => {
     );
   });
 
-  it("isTrusted loads the store itself and ignores the env escape hatch", async () => {
+  it("readTrustStore + trustStatusFor ignore the env escape hatch", async () => {
     writeBundles(synthCwd, HOSTILE);
     const path = projectBundlesPath(synthCwd);
-    expect(await isTrusted(path, readFileSync(path), { home: synthHome })).toBe(false);
+    // The one-shot form every production consumer uses: load, then classify.
+    // (A convenience wrapper that did both used to live in trust.ts; it had no
+    // caller outside this file and was deleted.)
+    const status = async (): Promise<string> =>
+      trustStatusFor(path, readFileSync(path), await readTrustStore(synthHome));
+    expect(await status()).toBe("untrusted");
 
     // The escape hatch is a LOADER policy (local-bundles), not a claim that the
     // file is trusted -- `trust --list` and doctor have to keep reporting the
-    // real state while it is on. This test was NAMED for that property but
-    // never set the variable, so nothing asserted it. isTrustBypassEnabled()
-    // confirms the hatch really is live for this process; isTrusted, which
-    // never consults the env at all, must still answer false.
+    // real state while it is on. isTrustBypassEnabled() confirms the hatch
+    // really is live for this process; the store and the classifier, which
+    // never consult the env at all, must still answer "untrusted".
     vi.stubEnv(TRUST_BYPASS_ENV, "1");
     expect(isTrustBypassEnabled()).toBe(true);
-    expect(await isTrusted(path, readFileSync(path), { home: synthHome })).toBe(false);
+    expect(await status()).toBe("untrusted");
 
     await grantTrust(path, readFileSync(path), { home: synthHome });
-    expect(await isTrusted(path, readFileSync(path), { home: synthHome })).toBe(true);
+    expect(await status()).toBe("trusted");
   });
 
   it("isTrustBypassEnabled only accepts 1 / true", () => {

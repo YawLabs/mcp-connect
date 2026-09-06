@@ -45,11 +45,13 @@
 // the note at the update call for the measurement behind that.
 
 import { type StdioOptions, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, utimesSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { atomicWriteFile } from "./atomic-write.js";
+import { acquireUpgradeLock } from "./auto-upgrade.js";
 import { describeDefaultRuntime, describeServerRuntime } from "./default-runtime.js";
+import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { type LoadLocalBundlesResult, loadLocalBundles, localBundlesPath } from "./local-bundles.js";
 import {
   isRegistrySpec,
@@ -172,8 +174,9 @@ export function collectSidecarSpecs(servers: Array<Partial<UpstreamServerConfig>
     // install/spawn drift this module's header says must not happen.
     // collectRangeSpecs reports it instead.
     if (specConstraint(spec).kind === "range") continue;
+    // Never empty: isRegistrySpec above only passes a spec whose name part
+    // matched a non-empty name pattern, so there is nothing to guard here.
     const pkg = packageName(spec);
-    if (!pkg) continue;
     const existing = byPkg.get(pkg);
     if (existing) {
       if (s.namespace && !existing.namespaces.includes(s.namespace)) existing.namespaces.push(s.namespace);
@@ -365,6 +368,13 @@ export interface SidecarsInstallOptions {
    *  whether anything will READ the tree this command fills. Defaults to the
    *  real (process-cached) probe. */
   oamProbe?: () => Promise<OamProbe>;
+  /** The lock that serializes every writer of the managed tree; defaults to
+   *  {@link acquireSidecarsLock} on the sidecars root. Null means another live
+   *  process is mid-refresh on this tree and the install must not run.
+   *  Injected in tests, and by sidecar-refresh -- which already HOLDS that lock
+   *  when it calls this command, so it hands over a no-op rather than contend
+   *  with itself (see backgroundInstallOptions there). */
+  acquireLock?: (dir: string) => (() => void) | null;
 }
 
 export interface SidecarsInstallResult {
@@ -482,6 +492,17 @@ export interface RunNpmOptions {
    *  for a BACKGROUND install: from inside `serve` the default sprays npm's
    *  progress into the stream the MCP client reads diagnostics from. */
   stdio?: StdioOptions;
+  /** Hide the console window Windows allocates for a console child of a
+   *  process that has none. Off by default and on for the BACKGROUND install
+   *  only, because the two callers want opposite things. `serve` under a
+   *  GUI-launched MCP client has no console, so without the flag cmd.exe and
+   *  npm pop a blank window onto the desktop for the 10-60s the two runs take
+   *  -- once a day, from a process the user never sees (the oam probe hides
+   *  for the same reason, oam-spawn.ts). The CLI is attached to a terminal,
+   *  and there the flag is CREATE_NO_WINDOW: it detaches npm from that console,
+   *  so a Ctrl-C that kills the CLI no longer reaches npm and the install
+   *  keeps running, half-owned, after the user thought they stopped it. */
+  windowsHide?: boolean;
 }
 
 /** Spawn npm so the user sees progress on a long install.
@@ -489,9 +510,9 @@ export interface RunNpmOptions {
  *  Exported because this is the one spawn shape in the package that must not be
  *  re-derived by hand: the Windows-shell concession below is safe only under
  *  conditions a second copy cannot be trusted to keep. sidecar-refresh's
- *  background install needs the same shape with silent stdio, which is what
- *  `stdio` is for -- a caller differing on output must not have to restate the
- *  security-sensitive part. */
+ *  background install needs the same shape with silent stdio and a hidden
+ *  window, which is what `stdio` and `windowsHide` are for -- a caller differing
+ *  on output must not have to restate the security-sensitive part. */
 export function defaultRunNpm(args: string[], cwd: string, opts: RunNpmOptions = {}): Promise<number> {
   return new Promise((resolve) => {
     // npm on Windows is a .cmd shim, and since the CVE-2024-27980 fix Node
@@ -517,6 +538,15 @@ export function defaultRunNpm(args: string[], cwd: string, opts: RunNpmOptions =
         // progress overrides it (see RunNpmOptions.stdio).
         stdio: opts.stdio ?? ["ignore", 2, "inherit"],
         shell: isWindows,
+        // Always an explicit boolean so BOTH shapes are pinned by the spawn
+        // test rather than one of them reading as "unset"; ignored off Windows.
+        windowsHide: opts.windowsHide ?? false,
+        // npm runs arbitrary lifecycle scripts from the registry, and the
+        // in-server daily refresh reaches this spawn with the vault passphrase
+        // sitting in process.env. README promises yaw-mcp strips its own
+        // secrets from EVERY child it starts; this was the one npm run that
+        // did not (upstream.ts and auto-upgrade.ts already do).
+        env: stripInternalSecretsFromEnv(process.env),
       });
     } catch {
       // spawn can fail SYNCHRONOUSLY rather than emitting 'error' -- an option
@@ -533,6 +563,80 @@ export function defaultRunNpm(args: string[], cwd: string, opts: RunNpmOptions =
   });
 }
 
+/** Name of the lockfile that serializes every writer of the managed tree --
+ *  this command and sidecar-refresh's background refresh -- in the sidecars
+ *  root. Passed to acquireUpgradeLock explicitly rather than leaning on its
+ *  default, so the heartbeat below touches the SAME file the take created by
+ *  construction and not because two modules agree on a string. The value
+ *  still equals auto-upgrade's historical default on purpose: a `serve` from
+ *  a build before this constant existed holds the lock under that name, and a
+ *  rename would let this build run npm beside it during the one mixed-version
+ *  window an upgrade creates. Free to rename once that window is past. */
+export const SIDECARS_LOCK_NAME = ".yaw-mcp-upgrade.lock";
+
+/** How often a held lock's mtime is refreshed while an install runs. An order
+ *  of magnitude inside auto-upgrade's ten-minute stale window, so a heartbeat
+ *  that is merely late (a loaded machine, a paused VM) still lands well before
+ *  the lock reads as abandoned. */
+export const SIDECAR_LOCK_HEARTBEAT_MS = 60 * 1000;
+
+/** The lock every writer of the managed tree takes: this command's install and
+ *  sidecar-refresh's background refresh. Two npm reify passes rewriting one
+ *  node_modules at once retire and extract the same package dirs concurrently
+ *  -- ENOTEMPTY/EPERM mid-reify, or a torn package dir -- and each reports its
+ *  own exit code with no idea the other ran.
+ *
+ *  auto-upgrade's acquireUpgradeLock, not a second implementation of it: the
+ *  O_EXCL take, the stale-steal window and the backwards-clock skew margin are
+ *  subtle enough that a copy would drift. It is keyed on the DIRECTORY, so a
+ *  lock in the sidecars root cannot contend with a lock in a global npm prefix
+ *  -- the two features serialize independently even though they share the
+ *  primitive. Null means another live process holds it. A directory the lock
+ *  cannot be CREATED in yields a no-op release and the install runs
+ *  unserialized, exactly as before the lock existed: it is advisory.
+ *
+ *  What IS added on top: a heartbeat. auto-upgrade's ten-minute stale-steal
+ *  window was sized for its own hold -- one `npm install -g` of one package,
+ *  seconds long -- and an unstealable lock there would disable self-upgrade
+ *  forever, so ten minutes is generous for THAT caller. This lock is held
+ *  across a whole-tree `npm install` plus `npm update` that this module's
+ *  header calls "network and minutes", and on a cold cache or a slow link
+ *  minutes can pass ten of them. A second writer starting inside a live
+ *  install would then read the lock as abandoned, steal it, and run a second
+ *  npm into the same tree -- the exact concurrent install the lock exists to
+ *  prevent. Touching the file every minute keeps the mtime acquireUpgradeLock
+ *  measures inside the window for as long as the holder is alive, so only a
+ *  lock whose owner really is gone gets stolen. The timer is unref'd (it must
+ *  never hold the process open) and cleared by the release callback, and a
+ *  failed touch stops the heartbeat rather than logging once a minute. */
+export function acquireSidecarsLock(dir: string): (() => void) | null {
+  const release = acquireUpgradeLock(dir, SIDECARS_LOCK_NAME);
+  // Null is "someone else holds it": nothing was taken, so there is nothing to
+  // keep warm. (acquireUpgradeLock's other degraded answer -- a no-op release
+  // for a directory it could not write -- is indistinguishable from a real
+  // take here, and needs no special case: the first touch fails ENOENT and
+  // switches the heartbeat off.)
+  if (release === null) return null;
+  const lockPath = join(dir, SIDECARS_LOCK_NAME);
+  const beat = setInterval(() => {
+    try {
+      const now = new Date();
+      utimesSync(lockPath, now, now);
+    } catch {
+      // Gone (stolen as stale after all, or the tree was cleaned up) or not
+      // writable. Nothing to keep alive; stop rather than retry every minute.
+      clearInterval(beat);
+    }
+  }, SIDECAR_LOCK_HEARTBEAT_MS);
+  // Guarded the way settledWithin (server.ts) guards its own: under an embedded
+  // host whose global setInterval is the browser one, there is no unref to call.
+  if (typeof beat.unref === "function") beat.unref();
+  return () => {
+    clearInterval(beat);
+    release();
+  };
+}
+
 export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--json]
 
   Install the MCP servers from your bundles.json into ~/.yaw-mcp/sidecars,
@@ -546,7 +650,8 @@ export const SIDECARS_USAGE = `Usage: yaw-mcp sidecars install [--json]
 
   Only npx-launched servers naming a registry package are installed. docker,
   uvx, and native commands are left alone, as are node launches that already
-  name a file and npx launches pointing at a git or path target.`;
+  name a file and npx launches pointing at a git or path target or pinning
+  a version range.`;
 
 export function parseSidecarsArgs(
   argv: string[],
@@ -742,137 +847,192 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   // and the dispatcher printed `yaw-mcp sidecars: <errno>` on stderr with
   // NOTHING on stdout -- breaking the one-shape-on-every-path --json contract
   // the MCP panel relies on (it shells out to `sidecars install --json`).
-  try {
-    mkdirSync(root, { recursive: true });
-    await atomicWriteFile(join(root, "package.json"), sidecarsManifest(specs));
-  } catch (err) {
+  const couldNotPrepare = (err: unknown): SidecarsInstallResult => {
     const msg = err instanceof Error ? err.message : String(err);
     print(`Could not prepare ${root}: ${msg}. Servers keep resolving from the npx cache.`);
     if (opts.json) write(jsonDocument(root, { error: `manifest write failed: ${msg}`, conflicts, skipped }));
     return { exitCode: 1, installed: [], lines };
+  };
+  try {
+    mkdirSync(root, { recursive: true });
+  } catch (err) {
+    return couldNotPrepare(err);
   }
 
-  print(`Installing ${specs.length} server package(s) into ${root}`);
-  // Name the config the list came from. The managed tree is keyed on HOME
-  // alone, while the server list can come from an approved PROJECT
-  // bundles.json -- so an install run in project A writes A's dependency set
-  // into the one directory every project shares, and npm prunes whatever B put
-  // there. The broker in B then resolves out of that same tree (managed wins
-  // over the npx cache, oam-spawn.ts), on A's versions, with nothing in B to
-  // say why. The in-config conflict note below cannot see this: it compares
-  // specs WITHIN one config. Naming the source is the cheap half of the fix.
-  if (bundles.path !== null) {
-    print(`  from ${bundles.path}`);
-    if (bundles.path !== localBundlesPath(userConfigDir(home))) {
-      print(`  note: ${root} is shared by every project on this machine; installing from a project`);
-      print("        bundles.json replaces what another project's install put there.");
+  // Serialize against the OTHER writer of this tree -- sidecar-refresh's
+  // background refresh, which runs this very command from inside `serve` --
+  // before the first byte of the tree changes. AFTER the mkdir, because the
+  // lockfile lives in the root and an O_EXCL open cannot create it in a
+  // directory that is not there yet; BEFORE the manifest write, because that
+  // write already changes what the other npm is reifying against. Null is a
+  // live holder: say so and stop rather than put a second npm on the tree (see
+  // acquireSidecarsLock for what two reify passes do to one node_modules).
+  // Exit 1 with `error` set, not exit 0 with a note: nothing was installed and
+  // the caller has to come back, which a script cannot learn from a clean
+  // document.
+  const release = (opts.acquireLock ?? acquireSidecarsLock)(root);
+  if (release === null) {
+    // Name the lock: what holds it is a live refresh, or one whose serve was
+    // killed mid-install and whose npm child may still be reifying the tree
+    // (the lock is honoured until its mtime goes stale for exactly that
+    // reason), and the one thing an operator can do with either is look at
+    // the file.
+    print(
+      `Another yaw-mcp process is refreshing ${root} right now (lock: ${join(root, SIDECARS_LOCK_NAME)}); try again once it finishes.`,
+    );
+    if (opts.json) {
+      write(
+        jsonDocument(root, {
+          reason: "locked",
+          error: "another yaw-mcp process is refreshing the managed tree",
+          conflicts,
+          skipped,
+        }),
+      );
     }
-  }
-  for (const s of specs) print(`  ${s.spec}${s.namespaces.length ? `  (${s.namespaces.join(", ")})` : ""}`);
-  printSkipped();
-  // A flat tree holds one version per package, so a second spec for the same
-  // package cannot be honoured. Say which one won rather than letting a server
-  // pinned to an exact version quietly start on something else.
-  if (conflicts.length > 0) {
-    print();
-    for (const c of conflicts) {
-      print(`  note: ${c.pkg} is also configured as ${c.ignored.join(", ")}; installing ${c.used}`);
-    }
-  }
-  print();
-
-  const runNpm =
-    opts.runNpm ?? ((args: string[], cwd: string) => defaultRunNpm(args, cwd, { platform: opts.platform }));
-  // `--no-audit --no-fund` keep the output about the install; `--install-
-  // strategy=nested` is NOT used -- a flat tree is what resolveNpmEntry walks.
-  const code = await runNpm(["install", "--no-audit", "--no-fund"], root);
-  if (code !== 0) {
-    print(`npm install failed (exit ${code}). Servers keep resolving from the npx cache.`);
-    if (opts.json) write(jsonDocument(root, { error: `npm exited ${code}`, conflicts, skipped }));
     return { exitCode: 1, installed: [], lines };
   }
-
-  // Record which platform/arch just filled the tree (see installedPlatform for
-  // why). AFTER the install-succeeded gate, so a failed install leaves the
-  // marker describing whatever tree is actually still on disk -- and this
-  // process's own platform/arch, because that is the node npm resolved native
-  // bindings for. That last claim holds only because npmBin prefers the npm
-  // beside THIS node over whatever `npm` PATH resolves to; where there is no
-  // such sibling it stays an assumption, documented there. Guarded like the
-  // manifest write: the tree itself is installed at this point, so a
-  // marker-write failure does not undo the install (exit 0) -- but it is
-  // reported on stderr (visible under --json, where `print` is suppressed) AND
-  // carried as `markerError` in the --json document, so the panel never reads a
-  // clean install that doctor will later call pre-marker with no trail to why.
-  let markerError: string | null = null;
+  // Released on EVERY path out of the install below -- a failed manifest
+  // write, a failed npm, an exception -- via the one `finally`; a lock left
+  // behind would hold the background refresh off this tree for auto-upgrade's
+  // whole stale window over a failure that has already been reported.
   try {
-    await atomicWriteFile(
-      sidecarsPlatformPath(home),
-      `${JSON.stringify({ platform: process.platform, arch: process.arch }, null, 2)}\n`,
-    );
-  } catch (err) {
-    markerError = err instanceof Error ? err.message : String(err);
-    printErr(`note: could not record the platform marker (${markerError}); doctor will read this tree as pre-marker.`);
-  }
+    try {
+      await atomicWriteFile(join(root, "package.json"), sidecarsManifest(specs));
+    } catch (err) {
+      return couldNotPrepare(err);
+    }
 
-  // The second step is what makes "re-run this command to move them forward"
-  // true. `npm install` CANNOT re-resolve a dist-tag against an existing tree:
-  // with a lockfile present, arborist's dep-valid treats a `tag` spec as
-  // satisfied by ANY node that already carries a `resolved` URL, so a package
-  // locked at 0.3.6 under a `latest` range reports "up to date" and stays
-  // there. Measured against npm on a real tree -- dep at 3.0.0 with the spec
-  // rewritten to `latest` and 3.0.1 published: `install` printed "up to date"
-  // and left 3.0.0; `update` moved it to 3.0.1. Without this the version pins
-  // itself permanently, which is the exact failure this module exists to fix.
-  //
-  // `update` honours the manifest's ranges, so an exact-pinned spec
-  // (`pkg@1.0.0`) still cannot drift -- only the ranges that asked to float do.
-  // Fixed literals only, like the install above: see defaultRunNpm on why the
-  // Windows shell is safe here, and do not interpolate a package name.
-  const updateCode = await runNpm(["update", "--no-audit", "--no-fund"], root);
-  const updateError = updateCode === 0 ? null : `npm update exited ${updateCode}`;
-
-  const installed = specs.map((s) => ({
-    pkg: s.pkg,
-    version: installedVersion(s.pkg, home),
-    namespaces: s.namespaces,
-  }));
-  const missing = installed.filter((i) => i.version === null);
-
-  print("Installed:");
-  for (const i of installed) print(`  ${i.pkg}  ${i.version ?? "NOT FOUND"}`);
-  if (missing.length > 0) {
+    print(`Installing ${specs.length} server package(s) into ${root}`);
+    // Name the config the list came from. The managed tree is keyed on HOME
+    // alone, while the server list can come from an approved PROJECT
+    // bundles.json -- so an install run in project A writes A's dependency set
+    // into the one directory every project shares, and npm prunes whatever B
+    // put there. The broker in B then resolves out of that same tree (managed
+    // wins over the npx cache, oam-spawn.ts), on A's versions, with nothing in
+    // B to say why. The in-config conflict note below cannot see this: it
+    // compares specs WITHIN one config. Naming the source is the cheap half of
+    // the fix.
+    if (bundles.path !== null) {
+      print(`  from ${bundles.path}`);
+      if (bundles.path !== localBundlesPath(userConfigDir(home))) {
+        print(`  note: ${root} is shared by every project on this machine; installing from a project`);
+        print("        bundles.json replaces what another project's install put there.");
+      }
+    }
+    for (const s of specs) print(`  ${s.spec}${s.namespaces.length ? `  (${s.namespaces.join(", ")})` : ""}`);
+    printSkipped();
+    // A flat tree holds one version per package, so a second spec for the same
+    // package cannot be honoured. Say which one won rather than letting a
+    // server pinned to an exact version quietly start on something else.
+    if (conflicts.length > 0) {
+      print();
+      for (const c of conflicts) {
+        print(`  note: ${c.pkg} is also configured as ${c.ignored.join(", ")}; installing ${c.used}`);
+      }
+    }
     print();
-    print(`${missing.length} package(s) did not land; those servers keep resolving from the npx cache.`);
-  }
-  if (updateError !== null) {
-    print();
-    print(`npm update failed (exit ${updateCode}). The installed copies are usable, but a server`);
-    print('configured "@latest" may still be on the version it was already on.');
-  }
-  print();
-  print("These versions are now fixed. Re-run this command to move them forward.");
-  const unhosted = await unhostedReasons(servers, opts, home, bundles);
-  if (unhosted.length > 0) {
-    print();
-    print("Nothing reads these copies yet:");
-    for (const reason of unhosted) print(`  ${reason}`);
-    print("Those servers keep resolving through the npx cache; the managed copies are read only");
-    print("on the oam runtime.");
-  }
 
-  // npm exited 0 but not one requested package resolved in the tree. A
-  // scripted caller has to be able to tell that from a real install, so it
-  // exits non-zero AND fills in `error` -- the field this document exists to
-  // make the single success/failure discriminator. Reporting exit 1 with
-  // `error: null` meant a consumer branching on `error` read it as clean.
-  const nothingLanded = missing.length === installed.length;
-  const error = nothingLanded ? "npm exited 0 but no requested package resolved in the managed tree" : null;
+    const runNpm =
+      opts.runNpm ?? ((args: string[], cwd: string) => defaultRunNpm(args, cwd, { platform: opts.platform }));
+    // `--no-audit --no-fund` keep the output about the install; `--install-
+    // strategy=nested` is NOT used -- a flat tree is what resolveNpmEntry walks.
+    const code = await runNpm(["install", "--no-audit", "--no-fund"], root);
+    if (code !== 0) {
+      print(`npm install failed (exit ${code}). Servers keep resolving from the npx cache.`);
+      if (opts.json) write(jsonDocument(root, { error: `npm exited ${code}`, conflicts, skipped }));
+      return { exitCode: 1, installed: [], lines };
+    }
 
-  if (opts.json) {
-    write(jsonDocument(root, { installed, conflicts, skipped, error, updateError, unhosted, markerError }));
+    // Record which platform/arch just filled the tree (see installedPlatform
+    // for why). AFTER the install-succeeded gate, so a failed install leaves
+    // the marker describing whatever tree is actually still on disk -- and
+    // this process's own platform/arch, because that is the node npm resolved
+    // native bindings for. That last claim holds only because npmBin prefers
+    // the npm beside THIS node over whatever `npm` PATH resolves to; where
+    // there is no such sibling it stays an assumption, documented there.
+    // Guarded like the manifest write: the tree itself is installed at this
+    // point, so a marker-write failure does not undo the install (exit 0) --
+    // but it is reported on stderr (visible under --json, where `print` is
+    // suppressed) AND carried as `markerError` in the --json document, so the
+    // panel never reads a clean install that doctor will later call pre-marker
+    // with no trail to why.
+    let markerError: string | null = null;
+    try {
+      await atomicWriteFile(
+        sidecarsPlatformPath(home),
+        `${JSON.stringify({ platform: process.platform, arch: process.arch }, null, 2)}\n`,
+      );
+    } catch (err) {
+      markerError = err instanceof Error ? err.message : String(err);
+      printErr(
+        `note: could not record the platform marker (${markerError}); doctor will read this tree as pre-marker.`,
+      );
+    }
+
+    // The second step is what makes "re-run this command to move them forward"
+    // true. `npm install` CANNOT re-resolve a dist-tag against an existing
+    // tree: with a lockfile present, arborist's dep-valid treats a `tag` spec
+    // as satisfied by ANY node that already carries a `resolved` URL, so a
+    // package locked at 0.3.6 under a `latest` range reports "up to date" and
+    // stays there. Measured against npm on a real tree -- dep at 3.0.0 with
+    // the spec rewritten to `latest` and 3.0.1 published: `install` printed
+    // "up to date" and left 3.0.0; `update` moved it to 3.0.1. Without this
+    // the version pins itself permanently, which is the exact failure this
+    // module exists to fix.
+    //
+    // `update` honours the manifest's ranges, so an exact-pinned spec
+    // (`pkg@1.0.0`) still cannot drift -- only the ranges that asked to float
+    // do. Fixed literals only, like the install above: see defaultRunNpm on
+    // why the Windows shell is safe here, and do not interpolate a package
+    // name.
+    const updateCode = await runNpm(["update", "--no-audit", "--no-fund"], root);
+    const updateError = updateCode === 0 ? null : `npm update exited ${updateCode}`;
+
+    const installed = specs.map((s) => ({
+      pkg: s.pkg,
+      version: installedVersion(s.pkg, home),
+      namespaces: s.namespaces,
+    }));
+    const missing = installed.filter((i) => i.version === null);
+
+    print("Installed:");
+    for (const i of installed) print(`  ${i.pkg}  ${i.version ?? "NOT FOUND"}`);
+    if (missing.length > 0) {
+      print();
+      print(`${missing.length} package(s) did not land; those servers keep resolving from the npx cache.`);
+    }
+    if (updateError !== null) {
+      print();
+      print(`npm update failed (exit ${updateCode}). The installed copies are usable, but a server`);
+      print('configured "@latest" may still be on the version it was already on.');
+    }
+    print();
+    print("These versions are now fixed. Re-run this command to move them forward.");
+    const unhosted = await unhostedReasons(servers, opts, home, bundles);
+    if (unhosted.length > 0) {
+      print();
+      print("Nothing reads these copies yet:");
+      for (const reason of unhosted) print(`  ${reason}`);
+      print("Those servers keep resolving through the npx cache; the managed copies are read only");
+      print("on the oam runtime.");
+    }
+
+    // npm exited 0 but not one requested package resolved in the tree. A
+    // scripted caller has to be able to tell that from a real install, so it
+    // exits non-zero AND fills in `error` -- the field this document exists to
+    // make the single success/failure discriminator. Reporting exit 1 with
+    // `error: null` meant a consumer branching on `error` read it as clean.
+    const nothingLanded = missing.length === installed.length;
+    const error = nothingLanded ? "npm exited 0 but no requested package resolved in the managed tree" : null;
+
+    if (opts.json) {
+      write(jsonDocument(root, { installed, conflicts, skipped, error, updateError, unhosted, markerError }));
+    }
+    return { exitCode: nothingLanded ? 1 : 0, installed, lines };
+  } finally {
+    release();
   }
-  return { exitCode: nothingLanded ? 1 : 0, installed, lines };
 }
 
 /** True when a managed install exists. Lets a caller skip the per-package

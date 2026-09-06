@@ -408,6 +408,20 @@ describe("findProjectConfigDir outside $HOME", () => {
     expect(await findProjectConfigDir(project, home)).toBe(realpathSync(cfgDir));
   });
 
+  it("reads the opt-in from the INJECTED env, not from process.env", async () => {
+    // doctor and guide thread their own env into the walk so a synthetic run
+    // can be probed. The gate used to read process.env regardless, which made
+    // that injection a silent no-op -- and the tests above only passed because
+    // they stub the real environment as well.
+    const cfgDir = join(project, CONFIG_DIRNAME);
+    mkdirSync(cfgDir);
+    stubNoGeteuid();
+    vi.stubEnv(ALLOW_UNOWNED_ENV, "");
+    expect(await findProjectConfigDir(project, home, { [ALLOW_UNOWNED_ENV]: "1" })).toBe(realpathSync(cfgDir));
+    vi.stubEnv(ALLOW_UNOWNED_ENV, "1");
+    expect(await findProjectConfigDir(project, home, {})).toBeNull();
+  });
+
   it("does not let the env opt-in bypass a real POSIX ownership mismatch", async () => {
     // The opt-in exists only for platforms with NO ownership probe; where
     // geteuid exists, a uid mismatch stays fatal regardless of the env.

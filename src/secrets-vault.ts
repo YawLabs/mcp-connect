@@ -11,7 +11,11 @@
 //     "kdf": { "N": 32768, "r": 8, "p": 1 },   // scrypt cost, vault-level
 //     "entries": {
 //       "<secret-name>": { iv, ciphertext, authTag }  // per-entry
-//     }
+//     },
+//     "check": { iv, ciphertext, authTag }  // vault-level verification marker
+//                                           // (VAULT_CHECK_PLAINTEXT under the
+//                                           // derived key; absent on a vault
+//                                           // written before it existed)
 //   }
 //
 // SCHEMA HISTORY
@@ -293,7 +297,10 @@ function passphraseFingerprint(passphrase: string, salt: string): Buffer {
 }
 
 export function lock(): void {
-  if (cachedKey) cachedKey.fill(0); // best-effort zeroize
+  // Best-effort zeroize of the MODULE's copy only. Callers hold their own
+  // copies (see unlock), so this cannot reach -- or corrupt -- a key a
+  // caller is still using.
+  if (cachedKey) cachedKey.fill(0);
   cachedKey = null;
   cachedSalt = null;
   cachedFingerprint = null;
@@ -302,6 +309,16 @@ export function lock(): void {
 /** Derive the key for the given vault if not cached, else return the
  *  cached one. The salt must match -- if the vault was rotated and the
  *  salt changed, the caller must lock() first to clear the stale key.
+ *
+ *  Returns the caller's OWN copy of the key, never the cached Buffer
+ *  itself. lock() zero-fills the cached one in place, and a caller that
+ *  held that same object across a lock() went on encrypting under 32 zero
+ *  bytes -- which encryptEntry accepts, since it only checks the length --
+ *  and saved entries no passphrase could ever decrypt, with a green exit
+ *  code. No shipped caller sequenced things that way, but the aliasing made
+ *  it a one-line refactor away (a lock() added to a shutdown path, rotate's
+ *  lock() hoisted above its save). The copy costs 32 bytes per unlock, and
+ *  a caller may fill(0) it when done without disturbing the cache.
  *
  *  Verifies the passphrase BEFORE caching the key, so a wrong passphrase
  *  is rejected loudly instead of silently writing entries under a bad key:
@@ -327,7 +344,7 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
     cachedFingerprint.length === fingerprint.length &&
     timingSafeEqual(cachedFingerprint, fingerprint)
   ) {
-    return cachedKey;
+    return Buffer.from(cachedKey);
   }
   const salt = Buffer.from(vault.salt, "base64");
   // The vault's OWN parameters, not this build's default: a vault written
@@ -360,7 +377,7 @@ export async function unlock(vault: VaultFile, passphrase: string): Promise<Buff
   cachedKey = key;
   cachedSalt = vault.salt;
   cachedFingerprint = fingerprint;
-  return key;
+  return Buffer.from(key);
 }
 
 /** May this vault still hold ciphertexts written WITHOUT the entry-name
@@ -551,12 +568,21 @@ export function listKeys(vault: VaultFile): string[] {
   return Object.keys(vault.entries).sort();
 }
 
+/** The ONE spelling of the character class a secret name is drawn from.
+ *  SECRET_NAME_RE (anchored, for setSecret and the CLI parser) and
+ *  SECRET_REF_RE (the capture group inside `${secret:...}`) are both built
+ *  from it below. They used to be two regex literals kept in sync by hand --
+ *  the same drift secrets-cmd.ts's name check was pulled back from re-spelling
+ *  -- and a class that widened in one and not the other would let a name be
+ *  STORED that no reference could ever address, or vice versa. */
+const SECRET_NAME_CLASS = "[a-zA-Z0-9_.-]+";
+
 /** Names a `${secret:NAME}` reference can actually address -- the same
  *  character class SECRET_REF_RE captures, anchored. A name outside this
  *  set (spaces, colons, braces) can be stored, but no bundles.json env
  *  value could ever reference it, so setSecret rejects it up front rather
  *  than leaving a permanently-unreachable entry in the vault. */
-export const SECRET_NAME_RE = /^[a-zA-Z0-9_.-]+$/;
+export const SECRET_NAME_RE = new RegExp(`^${SECRET_NAME_CLASS}$`);
 
 export function setSecret(vault: VaultFile, key: Buffer, name: string, value: string): VaultFile {
   if (!name) throw new Error("secret name is required");
@@ -631,6 +657,26 @@ export function newVault(): VaultFile {
  *   - The vault entry decrypts cleanly: replace the entire env value
  *     with the secret. Inline composition (e.g. `Bearer ${secret:GH}`)
  *     also works -- the regex replaces just the reference span.
+ *   - The value carries a `${secret:` that SECRET_REF_RE cannot parse (a
+ *     space in the name, a missing `}`, an empty name): the literal stays
+ *     in place and the MALFORMED SPAN is reported in `malformed`, so the
+ *     spawn caller refuses exactly as it would for an absent name.
+ *     hasSecretRefs gates on the `${secret:` substring, so such a value
+ *     passes the gate, demands a passphrase, unlocks the vault -- and used
+ *     to come out of `replace` untouched with `missing` EMPTY, because the
+ *     strict regex simply never matched it. The child was then spawned
+ *     with the literal `${secret:gh token}` as its token, and no "missing"
+ *     audit event was written either (collectSecretRefNames found no
+ *     name). A one-character typo silently broke the fail-closed promise;
+ *     a value that passes the gate must now either resolve or be reported.
+ *     `malformed` is its OWN list, never folded into `missing`: `missing`
+ *     holds secret NAMES and every consumer treats it that way (the audit
+ *     trail records each entry as a names-only `secret` field, the refusal
+ *     joins it into an error), whereas a malformed span is an arbitrary
+ *     slice of an env VALUE -- an unterminated `${secret:DB_PASS@db.host/`
+ *     runs to the end of the value and can carry a URL, a password, a
+ *     newline. So the span is never returned raw: see MalformedSecretRef
+ *     for the two bounded forms it is reduced to.
  */
 /** Matches a `${secret:NAME}` reference. Consumed by resolveSecretRefs
  *  below, and exported for the callers that only need the NAMES referenced
@@ -649,18 +695,21 @@ export function newVault(): VaultFile {
  *  collectSecretRefNames below does; name-only callers should go through that
  *  helper rather than re-deriving the rule. `String.replace` is the one safe
  *  sharer: on a global regex it zeroes lastIndex before matching and again
- *  after, which is why resolveSecretRefs below can pass this object directly. */
-export const SECRET_REF_RE = /\$\{secret:([a-zA-Z0-9_.-]+)\}/g;
+ *  after, which is why resolveSecretRefs below can pass this object directly.
+ *  Built from SECRET_NAME_CLASS (see SECRET_NAME_RE) rather than spelled as
+ *  a literal, so the two can no longer drift apart. */
+export const SECRET_REF_RE = new RegExp(`\\$\\{secret:(${SECRET_NAME_CLASS})\\}`, "g");
 export function resolveSecretRefs(
   env: Record<string, string>,
   vault: VaultFile,
   key: Buffer,
-): { resolved: Record<string, string>; missing: string[] } {
+): { resolved: Record<string, string>; missing: string[]; malformed: MalformedSecretRef[] } {
   const missing: string[] = [];
+  const malformed: MalformedSecretRef[] = [];
   const decrypted = new Map<string, string>();
   const resolved: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
-    if (typeof v !== "string" || !v.includes("${secret:")) {
+    if (typeof v !== "string" || !v.includes(SECRET_REF_OPENER)) {
       resolved[k] = v;
       continue;
     }
@@ -682,8 +731,143 @@ export function resolveSecretRefs(
         return full;
       }
     });
+    // Scanned on the ORIGINAL value, not the resolved one: a decrypted
+    // secret could itself contain "${secret:" and must not be mistaken for
+    // an unparsed reference. Deduped on the bounded `display` form, which is
+    // what every consumer reports.
+    for (const span of malformedSecretRefSpans(v)) {
+      const ref = describeMalformedSecretRef(span);
+      if (!malformed.some((m) => m.display === ref.display)) malformed.push(ref);
+    }
   }
-  return { resolved, missing };
+  return { resolved, missing, malformed };
+}
+
+/** The substring hasSecretRefs gates on, and every malformed reference
+ *  still starts with. */
+const SECRET_REF_OPENER = "${secret:";
+
+/** Prefix on every reported malformed reference, so a reader (or a grep over
+ *  the audit log) can tell "this ref failed to PARSE" from "this NAME is not
+ *  in the vault" without inspecting the rest of the string. */
+export const MALFORMED_REF_MARKER = "<malformed ref>";
+
+/** Cap on how much of a malformed span `display` quotes. An unterminated
+ *  reference runs to the end of the env value, which is unbounded; 40
+ *  characters is enough to show the opener and the typo next to it. */
+export const MALFORMED_REF_MAX_CHARS = 40;
+
+/** A `${secret:...}` span SECRET_REF_RE could not parse, reduced to the two
+ *  bounded forms the callers need. The raw span is deliberately NOT a field:
+ *  it is a slice of an env VALUE, not a name, and can carry whatever followed
+ *  the opener -- a URL, a password, a newline. */
+export interface MalformedSecretRef {
+  /** For an error message or a diagnostic: MALFORMED_REF_MARKER, then the
+   *  span as written with control characters stripped, cut at
+   *  MALFORMED_REF_MAX_CHARS (with a `...` when it was). Quotes the typo so
+   *  the user can find it in their config. */
+  display: string;
+  /** For the audit trail, whose `secret` field is a names-only contract:
+   *  MALFORMED_REF_MARKER plus the longest prefix of the span's body that IS
+   *  legal name text (SECRET_NAME_CLASS), and nothing past it. For
+   *  `${secret:gh token}` that is `<malformed ref> gh`; for
+   *  `${secret:DB_PASS@db.internal/prod` it is `<malformed ref> DB_PASS`
+   *  -- the host never reaches the log. Just the marker when no prefix
+   *  parses (`${secret:}`). */
+  auditName: string;
+}
+
+/** Leading run of legal name characters, for MalformedSecretRef.auditName.
+ *  Anchored and non-global, so it carries no lastIndex state. */
+const SECRET_NAME_PREFIX_RE = new RegExp(`^${SECRET_NAME_CLASS}`);
+
+/** How much of the name-shaped prefix of a malformed span the audit name and
+ *  the display keep. The realistic typo this feature exists for is a VALUE
+ *  pasted where a name belongs (`${secret:ghp_...` with the brace dropped):
+ *  every character of a classic token is in the name class, so an unbounded
+ *  prefix put the whole token into the names-only audit log. Sixteen chars
+ *  is enough to recognise which reference is meant and too few to be the
+ *  credential. */
+const MALFORMED_REF_NAME_CHARS = 16;
+
+function describeMalformedSecretRef(span: string): MalformedSecretRef {
+  // Control characters dropped rather than escaped: this string is headed
+  // for a terminal, a log line and an MCP error payload, and a raw ESC or
+  // newline in any of them can forge a line or a cursor move. C0, DEL and C1
+  // by code range, plus Unicode format controls (bidi overrides and isolates,
+  // zero-width joiners, BOM) by property -- a right-to-left override in the
+  // quoted typo would otherwise redraw the rest of the doctor line.
+  let printable = "";
+  for (const ch of span) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || /\p{Cf}/u.test(ch)) continue;
+    printable += ch;
+  }
+  const body = span.startsWith(SECRET_REF_OPENER) ? span.slice(SECRET_REF_OPENER.length) : "";
+  const namePrefix = (SECRET_NAME_PREFIX_RE.exec(body)?.[0] ?? "").slice(0, MALFORMED_REF_NAME_CHARS);
+  // Display shows the opener, the bounded name prefix and the first
+  // character AFTER it -- the typo itself (`${secret:gh token`, `${secret:DB`
+  // with no brace) -- and nothing further: past that point is env-value text
+  // that may be a credential. The cut is on code points so it can never end
+  // on half of a surrogate pair.
+  const printableBody = printable.startsWith(SECRET_REF_OPENER) ? printable.slice(SECRET_REF_OPENER.length) : "";
+  const shown = Array.from(printableBody)
+    .slice(0, namePrefix.length + 1)
+    .join("");
+  const truncated = Array.from(printableBody).length > namePrefix.length + 1;
+  const clipped = `${SECRET_REF_OPENER}${shown}${truncated ? "..." : ""}`.slice(0, MALFORMED_REF_MAX_CHARS + 3);
+  return {
+    display: `${MALFORMED_REF_MARKER} ${clipped}`,
+    auditName: namePrefix.length > 0 ? `${MALFORMED_REF_MARKER} ${namePrefix}` : MALFORMED_REF_MARKER,
+  };
+}
+
+/** Every `${secret:` in `value` that is NOT the start of a well-formed
+ *  SECRET_REF_RE match, returned as the literal span the user wrote -- from
+ *  the opener through the next `}`, or to the end of the value when there is
+ *  none. Module-private on purpose: the raw span is unbounded env-value text
+ *  (see MalformedSecretRef), so every exported surface goes through
+ *  describeMalformedSecretRef first. Fresh RegExp for the same reason
+ *  collectSecretRefNames uses one. */
+function malformedSecretRefSpans(value: string): string[] {
+  const wellFormedAt = new Set<number>();
+  const re = new RegExp(SECRET_REF_RE.source, SECRET_REF_RE.flags);
+  for (;;) {
+    const m = re.exec(value);
+    if (!m) break;
+    wellFormedAt.add(m.index);
+  }
+  const spans: string[] = [];
+  let at = value.indexOf(SECRET_REF_OPENER);
+  while (at !== -1) {
+    if (!wellFormedAt.has(at)) {
+      const close = value.indexOf("}", at);
+      spans.push(close === -1 ? value.slice(at) : value.slice(at, close + 1));
+    }
+    at = value.indexOf(SECRET_REF_OPENER, at + SECRET_REF_OPENER.length);
+  }
+  return spans;
+}
+
+/** Distinct malformed `${secret:...}` references across an env map, in their
+ *  bounded `display` form (see MalformedSecretRef) -- the values-free
+ *  companion to collectSecretRefNames, for the diagnostics that report on
+ *  refs without a passphrase: meta-tools.ts's `mcp_connect_secrets` report
+ *  (its `malformed` column) and doctor's vault section. Those scan with the
+ *  strict regex, so a reference a typo has put outside it is invisible to
+ *  them while resolveSecretRefs refuses the spawn over it; this is how they
+ *  can name it. */
+export function collectMalformedSecretRefs(env: Record<string, string> | undefined): string[] {
+  const displays: string[] = [];
+  if (!env) return displays;
+  for (const v of Object.values(env)) {
+    if (typeof v !== "string") continue;
+    for (const span of malformedSecretRefSpans(v)) {
+      const { display } = describeMalformedSecretRef(span);
+      if (!displays.includes(display)) displays.push(display);
+    }
+  }
+  return displays;
 }
 
 /** Distinct `${secret:NAME}` names referenced across an env map -- the
@@ -710,11 +894,17 @@ export function collectSecretRefNames(env: Record<string, string> | undefined): 
   return names;
 }
 
-/** True iff any env value carries a `${secret:NAME}` reference. */
+/** True iff any env value carries the `${secret:` opener. Deliberately
+ *  LOOSER than SECRET_REF_RE: a reference a typo has put outside the strict
+ *  shape must still trip the gate, because the gate is what routes the value
+ *  to resolveSecretRefs -- which then reports what it cannot parse in
+ *  `malformed` (see MalformedSecretRef) so the spawn fails closed. A gate
+ *  built on the strict regex would wave the malformed literal straight
+ *  through to the child instead. */
 export function hasSecretRefs(env: Record<string, string> | undefined): boolean {
   if (!env) return false;
   for (const v of Object.values(env)) {
-    if (typeof v === "string" && v.includes("${secret:")) return true;
+    if (typeof v === "string" && v.includes(SECRET_REF_OPENER)) return true;
   }
   return false;
 }

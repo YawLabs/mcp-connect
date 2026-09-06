@@ -19,6 +19,11 @@ import {
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { defaultRuntime } from "./default-runtime.js";
+import {
+  INTERNAL_SECRET_ENV_KEYS,
+  scrubInternalSecretsFromProcessEnv,
+  stripInternalSecretsFromEnv,
+} from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import { oamHeapOomHint, probeOam, resolveOamSpawn } from "./oam-spawn.js";
 import { appendAuditEvent } from "./secrets-audit.js";
@@ -26,6 +31,7 @@ import {
   collectSecretRefNames,
   hasSecretRefs,
   loadVault,
+  type MalformedSecretRef,
   resolveSecretRefs,
   unlock,
   VAULT_CHECK_CORRUPT_ERROR,
@@ -240,50 +246,70 @@ export async function resolveServerEnv(
       "invalid",
     );
   }
-  const { resolved, missing } = resolveSecretRefs(env, vault, key);
+  const { resolved, missing, malformed } = resolveSecretRefs(env, vault, key);
   // Audit which secrets were consumed for this spawn -- NAME + namespace
   // only, never a value. Wrapped in try/catch (and each append is itself
   // fail-open) so a broken audit log can never block the spawn.
   //
-  // Recorded BEFORE the missing-refs throw below: a FAILED spawn is exactly
-  // the case an operator goes looking for in `yaw-mcp secrets audit`, and
-  // the "missing" event kind is already advertised by that renderer. Audit
+  // Recorded BEFORE the refusal below: a FAILED spawn is exactly the case
+  // an operator goes looking for in `yaw-mcp secrets audit`, and the
+  // "missing" event kind is already advertised by that renderer. Audit
   // first, then refuse. recordResolveAudit itself suppresses "injected" on
   // the refusal path -- nothing reaches a child env when the spawn is
   // refused, so "injected" would be a lie (see its doc comment).
   try {
-    await recordResolveAudit(namespace, env, missing);
+    await recordResolveAudit(namespace, env, missing, malformed);
   } catch (auditErr) {
     log("warn", "Failed to record secret-resolve audit (non-fatal)", {
       namespace,
       error: auditErr instanceof Error ? auditErr.message : String(auditErr),
     });
   }
-  if (missing.length > 0) {
-    throw new Error(`vault: missing or undecryptable secret refs: ${missing.join(", ")}`);
+  // A malformed ref refuses exactly like an absent name -- the literal must
+  // never reach a child -- but it is reported in its own clause and in its
+  // bounded `display` form: `missing` holds NAMES, while a malformed span is a
+  // slice of an env VALUE (an unterminated `${secret:` runs to the end of the
+  // value), so it goes through secrets-vault's sanitizer, never raw.
+  if (missing.length > 0 || malformed.length > 0) {
+    const problems: string[] = [];
+    if (missing.length > 0) problems.push(`missing or undecryptable secret refs: ${missing.join(", ")}`);
+    if (malformed.length > 0) problems.push(`malformed secret refs: ${malformed.map((m) => m.display).join(", ")}`);
+    throw new Error(`vault: ${problems.join("; ")}`);
   }
   return resolved;
 }
 
 /**
  * Append one audit event per secret reference this spawn touched:
- *   - "missing" for each name the vault lacked,
+ *   - "missing" for each name the vault lacked, and for each reference that
+ *     could not be PARSED -- recorded under its `auditName`, which is the
+ *     marker plus whatever prefix of the span was legal name text
+ *     (`<malformed ref> gh` for `${secret:gh token}`), never the span
+ *     itself. The audit log's `secret` field is a names-only contract
+ *     (secrets-audit.ts), and a malformed span is env-VALUE text that can
+ *     carry a URL or a password past the typo. The schema has no
+ *     "malformed" event kind, so the marker is what tells the two apart.
  *   - "injected" for each distinct secret NAME that was referenced AND
  *     actually reaches the child env.
  * Names only -- the value is never read here, let alone written.
  *
  * The two kinds are mutually exclusive per call, and that is the whole
- * point: resolution is all-or-nothing. When ANY ref is missing, the caller
- * refuses the spawn, so NOTHING is injected -- not even the refs that
- * resolved fine. Recording those as "injected" anyway told an operator
+ * point: resolution is all-or-nothing. When ANY ref is missing or malformed,
+ * the caller refuses the spawn, so NOTHING is injected -- not even the refs
+ * that resolved fine. Recording those as "injected" anyway told an operator
  * asking "did this server ever receive my prod token?" a false yes.
- * So: missing refs present -> record ONLY the "missing" events (a refused
- * spawn must still leave a trail); otherwise -> record "injected", which
- * keeps meaning "went into a spawn env".
+ * So: refused -> record ONLY the "missing" events (a refused spawn must
+ * still leave a trail); otherwise -> record "injected", which keeps meaning
+ * "went into a spawn env".
  */
-async function recordResolveAudit(namespace: string, env: Record<string, string>, missing: string[]): Promise<void> {
-  if (missing.length > 0) {
-    for (const name of new Set(missing)) {
+async function recordResolveAudit(
+  namespace: string,
+  env: Record<string, string>,
+  missing: string[],
+  malformed: MalformedSecretRef[],
+): Promise<void> {
+  if (missing.length > 0 || malformed.length > 0) {
+    for (const name of new Set([...missing, ...malformed.map((m) => m.auditName)])) {
       await appendAuditEvent({ server: namespace, secret: name, event: "missing" });
     }
     return;
@@ -436,6 +462,20 @@ export class ActivationError extends Error {
  * The redactor is conservative: short values (<8 chars) are skipped to
  * avoid mangling unrelated substrings; the goal is to catch the high-
  * entropy tokens that look like secrets, not redact the entire output.
+ *
+ * SCOPE -- documented rather than widened. Every call site hands this the
+ * RESOLVED SERVER ENV only (the values yaw-mcp itself injected from bundles.json
+ * and the vault). The child ALSO receives the whole inherited parent env
+ * (`stripInternalSecretsFromEnv(process.env)`, spread under serverEnv at the
+ * spawn), and nothing here scans that: a credential the user exported in their
+ * shell or put in the CLIENT's env block (GITHUB_TOKEN, AWS_SECRET_ACCESS_KEY,
+ * NPM_TOKEN) that a crashing child echoes on stderr reaches the
+ * ActivationError -- and so the LLM and the log -- unredacted. That is the
+ * contract README promises (redaction of what yaw-mcp injects), not an
+ * oversight in the loop below. The natural hardening, should it be wanted, is
+ * to pass a merged map: resolvedServerEnv plus the parent entries whose KEY
+ * matches /(TOKEN|SECRET|PASS|API_?KEY|CREDENTIAL)/i, keeping the >=8-char
+ * guard so PATH / HOME are never mangled.
  */
 function redactSecretsInOutput(text: string, env: Record<string, string>): string {
   let out = text;
@@ -471,7 +511,10 @@ function redactSecretsInOutput(text: string, env: Record<string, string>): strin
  */
 function withConfigPointer(message: string, config: UpstreamServerConfig): string {
   if (!config.namespace) return message;
-  return `${message} → Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then restart this MCP client.`;
+  // ASCII arrow on purpose: this suffix rides every activation error into the
+  // stderr log, and a `->` survives a Windows console codepage where the
+  // Unicode arrow renders as mojibake and then gets pasted into bug reports.
+  return `${message} -> Fix in ~/.yaw-mcp/bundles.json under "${config.namespace}", then restart this MCP client.`;
 }
 
 function categorizeSpawnError(err: unknown): ActivationFailureCategory {
@@ -646,6 +689,14 @@ export async function connectToUpstream(
     // while doctor still reports "oam". The respawn itself does not need the
     // memo -- it passes disableOamRewrite = true, which bypasses the gate
     // directly.
+    //
+    // The respawn runs the WHOLE of connectToUpstreamOnce again, resolveServerEnv
+    // included, so `yaw-mcp secrets audit` records a second "injected" event per
+    // secret name for this one logical activation. Accepted, not threaded
+    // around: two child envs really did receive the value (the oam child and
+    // the node child), and "injected" is defined as "went into a spawn env" --
+    // suppressing the second event would make the audit under-report exactly
+    // the spawn that ended up serving traffic.
     try {
       const connection = await connectToUpstreamOnce(config, onDisconnect, onListChanged, bridge, attempt, true);
       // node booted where oam did not: oam IS implicated, so make it stick.
@@ -672,55 +723,12 @@ export async function connectToUpstream(
   }
 }
 
-// Env keys that are for THIS process only and must never leak into spawned
-// upstream servers:
-//   YAW_MCP_TOKEN                — RETIRED. It authenticated the hosted Yaw
-//     MCP backend, which is decommissioned; nothing in this process reads it
-//     any more. Kept in the strip list purely for hygiene: an operator whose
-//     shell still exports the old key must not have it forwarded into every
-//     spawned upstream.
-//   YAW_MCP_VAULT_PASSPHRASE     — unlocks the local secret vault
-//   YAW_MCP_VAULT_PASSPHRASE_NEW — the incoming passphrase during a rotate
-//     (secrets-cmd.ts), i.e. the LIVE passphrase once the rotate lands
-export const INTERNAL_SECRET_ENV_KEYS: ReadonlySet<string> = new Set([
-  "YAW_MCP_TOKEN",
-  "YAW_MCP_VAULT_PASSPHRASE",
-  "YAW_MCP_VAULT_PASSPHRASE_NEW",
-]);
-
-/** Delete yaw-mcp's own secrets from THIS process's env, in place. For the
- *  one-shot CLI paths that hand `process.env` to a third party that spawns a
- *  server with it (`yaw-mcp audit` -> @yawlabs/mcp-compliance spreads
- *  process.env into the child): the broker's spawn path strips these via
- *  stripInternalSecretsFromEnv, and a CLI that requires the passphrase to be
- *  SET (audit resolving vault refs) must not then forward it to the audited
- *  server. Same case-insensitive match, for the same Windows reason. */
-export function scrubInternalSecretsFromProcessEnv(): void {
-  for (const key of Object.keys(process.env)) {
-    if (INTERNAL_SECRET_ENV_KEYS.has(key.toUpperCase())) delete process.env[key];
-  }
-}
-
-/** `process.env` minus yaw-mcp's own secrets, for spawning upstream servers.
- *
- *  Matched case-INSENSITIVELY, and that is load-bearing on Windows: env
- *  lookups there are case-insensitive, so `process.env.YAW_MCP_VAULT_PASSPHRASE`
- *  happily reads a `yaw_mcp_vault_passphrase=` set in PowerShell or Git Bash
- *  — the vault unlocks fine — while a byte-exact strip (the previous
- *  rest-destructure) would miss the lowercase key and hand the passphrase to
- *  every spawned child. POSIX env IS case-sensitive, but these names are
- *  yaw-internal enough that stripping a differently-cased twin there costs
- *  nothing and keeps one code path on every platform.
- *
- *  Exported for tests. */
-export function stripInternalSecretsFromEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (INTERNAL_SECRET_ENV_KEYS.has(key.toUpperCase())) continue;
-    out[key] = value;
-  }
-  return out;
-}
+// The internal-secret strip (INTERNAL_SECRET_ENV_KEYS and the two helpers
+// built on it) lives in internal-secret-env.ts now, so the self-upgrade spawns
+// in auto-upgrade.ts / upgrade-cmd.ts can share it without loading the MCP
+// SDK. Re-exported under the same names: server.ts, audit-cmd.ts and the tests
+// import them from here.
+export { INTERNAL_SECRET_ENV_KEYS, scrubInternalSecretsFromProcessEnv, stripInternalSecretsFromEnv };
 
 async function connectToUpstreamOnce(
   config: UpstreamServerConfig,
@@ -812,7 +820,7 @@ async function connectToUpstreamOnce(
     // try/catch further down wraps client.connect() ONLY -- so classify and
     // wrap here. Without this the failure escapes connectToUpstreamOnce as a
     // bare Error: no category, no stderr tail, and none of the
-    // `→ Fix in ~/.yaw-mcp/bundles.json` pointer every other local spawn
+    // `-> Fix in ~/.yaw-mcp/bundles.json` pointer every other local spawn
     // failure carries (server.ts's activation handler adds nothing on the
     // raw-Error branch).
     let resolved: { command: string; args: string[] };

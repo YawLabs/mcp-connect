@@ -1,13 +1,32 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CATALOG_SLUG_RE,
   CATALOG_STALE_AFTER_DAYS,
   type CatalogServer,
   DEFAULT_CATALOG_URL,
   defaultFetchCatalog,
+  FETCH_TIMEOUT_MS,
   type FetchCatalog,
   resolveCatalogSlug,
   tokenizeCommand,
 } from "../catalog.js";
+
+// The one slug gate `add` and `try` share. Each verb used to carry a private
+// copy of this regex; the exit-2 behaviour at each gate is pinned in the
+// verbs' own suites, this pins the SHAPE so a drift shows up here first.
+describe("CATALOG_SLUG_RE", () => {
+  it("accepts lowercase letters, digits and dashes with a leading alphanumeric, up to 64 chars", () => {
+    for (const slug of ["fetch", "brave-search", "a", "0", "a1-b2", "a".repeat(64)]) {
+      expect(CATALOG_SLUG_RE.test(slug), slug).toBe(true);
+    }
+  });
+
+  it("rejects an empty, uppercase, leading-dash, underscore, whitespace or over-long slug", () => {
+    for (const slug of ["", "Fetch", "-leading", "under_score", "has space", "dot.slug", "a".repeat(65)]) {
+      expect(CATALOG_SLUG_RE.test(slug), JSON.stringify(slug)).toBe(false);
+    }
+  });
+});
 
 describe("tokenizeCommand", () => {
   it("parses a simple command with no quotes", () => {
@@ -351,7 +370,9 @@ describe("defaultFetchCatalog", () => {
       );
       const p = defaultFetchCatalog("https://cat.example/c.json");
       const assertion = expect(p).rejects.toThrow("timed out fetching");
-      await vi.advanceTimersByTimeAsync(10_000);
+      // Derived from the constant, not a literal: a change to the timeout
+      // used to leave this clock silently out of step with it.
+      await vi.advanceTimersByTimeAsync(FETCH_TIMEOUT_MS);
       await assertion;
       expect(captured?.aborted).toBe(true);
     } finally {

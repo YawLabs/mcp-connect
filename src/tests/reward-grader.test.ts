@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { computeOutcomeReward } from "../reward.js";
 import {
   buildGraderPrompt,
+  capForPrompt,
   firstResultText,
   gradeOutcomeViaSampling,
   isRewardGraderEnabled,
@@ -99,6 +100,44 @@ describe("firstResultText", () => {
     expect(out.endsWith("...")).toBe(true);
     expect(out.length).toBeLessThan(long.length);
   });
+
+  it("never cuts a surrogate pair in half, whatever the tool returned", () => {
+    // Third-party tool output is where an emoji or CJK-extension character
+    // most plausibly straddles the 600-char boundary. A plain slice left the
+    // high half alone in the string, the SDK serialized it as a lone escape,
+    // and a strict client-side decoder rejected the sampling request -- a
+    // null vote nobody could see in the prompt text.
+    const text = `${"x".repeat(599)}${String.fromCodePoint(0x1f511)} tail`;
+    const out = firstResultText({ content: [{ type: "text", text }] });
+    expect(hasLoneSurrogate(out), out.slice(-8)).toBe(false);
+    expect(out.endsWith("...")).toBe(true);
+  });
+});
+
+/** A high half with no low half after it, or a low half with no high half
+ *  before it -- the shape String.prototype.isWellFormed rejects (this
+ *  project's TS lib target predates that method). */
+function hasLoneSurrogate(s: string): boolean {
+  return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(s);
+}
+
+describe("capForPrompt", () => {
+  it("leaves a string under the cap alone, marker and all", () => {
+    expect(capForPrompt("short", 200)).toBe("short");
+    expect(capForPrompt("y".repeat(200), 200)).toBe("y".repeat(200));
+  });
+
+  it("backs off one unit when the cut lands inside a surrogate pair", () => {
+    // The whole reason the three cuts in this file share one helper.
+    const s = `${"a".repeat(199)}${String.fromCodePoint(0x1f600)}b`;
+    const cut = capForPrompt(s, 200);
+    expect(hasLoneSurrogate(cut)).toBe(false);
+    expect(cut).toBe(`${"a".repeat(199)}...`);
+  });
+
+  it("cuts at the cap when the boundary is not a surrogate", () => {
+    expect(capForPrompt("z".repeat(250), 200)).toBe(`${"z".repeat(200)}...`);
+  });
 });
 
 describe("buildGraderPrompt", () => {
@@ -137,6 +176,22 @@ describe("buildGraderPrompt", () => {
     expect(p).toContain("A".repeat(4000));
     // Char 4001 onwards must NOT be present (they were cut off).
     expect(p).not.toContain("A".repeat(4001));
+  });
+
+  it("keeps the fenced cut off a surrogate pair, and the goal line too", () => {
+    // The two remaining cuts in this prompt. Both feed the same sampling
+    // request the snippet does, so both can put a lone surrogate in front of
+    // the client's decoder; the fenced one carries third-party tool text,
+    // where an emoji at 4000 chars is the likelier accident of the two.
+    const key = String.fromCodePoint(0x1f511);
+    const p = buildGraderPrompt({
+      intent: `${"z".repeat(199)}${key} rest`,
+      toolName: "t",
+      resultText: `${"A".repeat(3999)}${key} rest`,
+    });
+    expect(hasLoneSurrogate(p)).toBe(false);
+    expect(p).toContain("...<truncated>");
+    expect(p).toContain(`Goal: ${"z".repeat(199)}...`);
   });
 });
 

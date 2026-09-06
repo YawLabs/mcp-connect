@@ -17,7 +17,7 @@ export const FLAG_ALIASES = ["--help", "-h", "--version", "-V"] as const;
 // Known subcommands for fuzzy-match feedback on typos. Anything not in
 // this list and not a flag (leading `-`) falls through to "unknown
 // subcommand" before runServer, so `yaw-mcp instal` fails loud instead of
-// starting as an MCP server and opaquely erroring on the missing token.
+// silently booting a stdio MCP server on a dead prompt.
 //
 // HAND-MAINTAINED: this list MUST track the dispatch chain in
 // src/index.ts. The completion drift guard compares SUBCOMMAND_SPEC

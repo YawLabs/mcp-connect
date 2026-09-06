@@ -1,6 +1,7 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { CreateMessageRequestParamsBase } from "@modelcontextprotocol/sdk/types.js";
 import { log } from "./logger.js";
+import { capForPrompt, INTENT_MAX } from "./reward-grader.js";
 import type { UpstreamServerConfig } from "./types.js";
 
 // Top-2 scores within this ratio of each other trigger a sampling
@@ -74,8 +75,26 @@ export function shouldTiebreak(
   return second.score / top.score >= ratio;
 }
 
+// Cap on each candidate description interpolated into the tiebreak prompt.
+// Descriptions arrive from local-bundles.ts with no length bound of their own,
+// and the prompt asks for one namespace word back, so a paragraph-long
+// description is tokens the vote cannot use.
+export const CANDIDATE_DESCRIPTION_MAX = 300;
+
+// The cut helper is reward-grader's capForPrompt (imported above): one rule
+// for both sampling prompts, and one that never leaves a lone surrogate.
+
 // Build a compact prompt describing the candidate servers. Keep it
 // under a few hundred tokens so the sampling round-trip is cheap.
+//
+// The intent and every description are length-capped HERE, not by the caller:
+// server.ts's handleDispatch rejects only an EMPTY intent and passes the rest
+// verbatim, and under the "aggressive" effort dial this prompt goes out up to
+// MAX_SAMPLES times per dispatch, each billed to the client's sampling budget.
+// A pasted document as the intent used to ride along in full on every one of
+// those calls, for a reply the prompt limits to a single namespace word.
+// INTENT_MAX is reward-grader.ts's, which closed the same gap for the same
+// field; the two prompts share one bound so they cannot drift apart.
 export function buildTiebreakPrompt(intent: string, candidates: TiebreakCandidate[]): string {
   const blocks = candidates.map((c, i) => {
     const toolLine =
@@ -85,11 +104,12 @@ export function buildTiebreakPrompt(intent: string, candidates: TiebreakCandidat
             .map((t) => t.name)
             .join(", ")
         : "(no tool metadata yet)";
-    return `${i + 1}. ${c.namespace}${c.description ? ` -- ${c.description}` : ""}\n   tools: ${toolLine}`;
+    const desc = c.description ? ` -- ${capForPrompt(c.description, CANDIDATE_DESCRIPTION_MAX)}` : "";
+    return `${i + 1}. ${c.namespace}${desc}\n   tools: ${toolLine}`;
   });
   return [
     "You are a router picking the best MCP server for a user task.",
-    `User intent: ${intent}`,
+    `User intent: ${capForPrompt(intent, INTENT_MAX)}`,
     "",
     "Candidates:",
     ...blocks,

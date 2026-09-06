@@ -65,9 +65,26 @@
 // version they were already on for another day.
 //
 // Concurrent runs are serialized, best-effort, by a lockfile in the sidecars
-// root (auto-upgrade's acquireUpgradeLock, reused rather than re-derived).
-// N MCP clients starting at once -- several Claude Code panes -- would
-// otherwise each fire an `npm install` at one tree.
+// root: sidecars-cmd's acquireSidecarsLock, which wraps auto-upgrade's
+// acquireUpgradeLock rather than re-deriving it. N MCP clients starting at
+// once -- several Claude Code panes -- would otherwise each fire an `npm
+// install` at one tree. The manual `yaw-mcp sidecars install` takes the SAME
+// lock, so a human running it inside a live refresh is told to wait rather
+// than put a second npm on the tree.
+//
+// It also does not start AT startup. server.ts fires the check the moment the
+// transport connects, which is exactly when the client's first tools/list
+// activates servers -- spawned from the very tree a refresh rewrites. The
+// check therefore sleeps SIDECAR_REFRESH_START_DELAY_MS past its cheap gates
+// before touching the registry or the tree; see KNOWN GAPS for the window that
+// leaves open. When it wakes it reads the throttle stamp a SECOND time, so a
+// pane that wakes after another pane's whole check has stamped stops there
+// instead of probing again. Panes that wake within a few seconds of each
+// other (a burst of restored tabs) still all probe: each sleeps exactly the
+// same delay and the stamp lands only after the probes -- the same window
+// auto-upgrade's check memo leaves open. The lock below covers only the
+// install, and a pane that finds nothing stale never takes it, so without the
+// second read every pane that woke later would probe too.
 //
 // KNOWN GAPS (documented rather than papered over):
 //   - The refresh action is WHOLE-TREE, not per-package. runSidecarsInstall
@@ -85,11 +102,26 @@
 //     `npm ci`, so nothing already in the tree is removed.
 //   - The lock is advisory: a sidecars root we cannot write to yields a no-op
 //     lock and the old unserialized behavior, and a lock left behind by a
-//     killed process is stolen once it goes stale (auto-upgrade owns both
-//     rules and the constants behind them). A lock this process still HOLDS is
-//     kept out of that stale window by a heartbeat -- see defaultAcquireLock,
-//     which is why the reused ten-minute window does not have to cover a
-//     whole-tree install.
+//     killed process is stolen once it goes stale BY MTIME (auto-upgrade owns
+//     both rules and the constants behind them) -- deliberately not on the
+//     holder's death, because the npm child it guards outlives a plain
+//     parent exit and a second reify on that tree is the collision the lock
+//     exists to prevent. A lock this process still HOLDS is
+//     kept out of that stale window by a heartbeat -- see acquireSidecarsLock
+//     in sidecars-cmd, which is why the reused ten-minute window does not have
+//     to cover a whole-tree install.
+//   - The refresh rewrites the tree THIS process spawns servers from, and it
+//     cannot pause activations while npm runs. A server activated mid-reify
+//     can meet a package.json whose bin is not on disk yet (resolveNpmEntry
+//     then quietly falls to an older cache copy) or a bin whose dependencies
+//     are half-extracted (the oam boot fails, upstream burns its one-shot node
+//     respawn and pins that namespace to node for the session -- nothing can
+//     tell that failure from a real one). The start delay moves the refresh
+//     off the connect-time activation burst, where nearly every spawn of a
+//     session happens; a mid-session re-spawn (the idle reaper) that lands
+//     inside the minute or so npm runs still races. On Windows a RUNNING
+//     sidecar holding a native .node open also makes `npm update` fail EPERM
+//     until that server is reaped, once a day, with nothing on screen.
 //   - The npm child is not detached, so an MCP client that tears down the
 //     process tree takes a half-finished install with it. Recovery is a manual
 //     `yaw-mcp sidecars install`; nothing here repairs a partial tree.
@@ -97,15 +129,16 @@
 // Opt-out: YAW_MCP_SIDECAR_REFRESH=0 (or =false), parsed exactly like
 // auto-upgrade's YAW_MCP_AUTO_UPGRADE.
 
-import { mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { acquireUpgradeLock } from "./auto-upgrade.js";
+import { join } from "node:path";
+import { atomicWriteFile } from "./atomic-write.js";
 import { loadLocalBundles } from "./local-bundles.js";
 import { log } from "./logger.js";
 import { compareVersions } from "./oam-spawn.js";
 import { CONFIG_DIRNAME, sidecarsRoot } from "./paths.js";
 import {
+  acquireSidecarsLock,
   collectSidecarSpecs,
   configuredRange,
   defaultRunNpm,
@@ -131,6 +164,18 @@ export const SIDECAR_REFRESH_THROTTLE_MS = 24 * 60 * 60 * 1000;
  *  a timer open behind a long-lived server process. The probes run in parallel,
  *  so N packages cost ONE budget, not N. */
 export const SIDECAR_REGISTRY_TIMEOUT_MS = 2000;
+
+/** How long past its cheap gates the check sleeps before it probes the
+ *  registry or touches the tree. server.ts fires maybeRefreshSidecars the
+ *  instant the transport connects, and the client's first tools/list follows
+ *  within seconds -- activating servers, i.e. spawning them from the managed
+ *  tree an npm reify pass is about to rewrite (see the header's KNOWN GAPS for
+ *  what a spawn that lands mid-reify sees). A minute is past that burst on any
+ *  client, and costs nothing that matters: a `serve` that exits sooner just
+ *  runs the check on its next start, since nothing is recorded until the check
+ *  actually completes. Sits AFTER the opt-out, managed-tree and throttle gates
+ *  so the common no-op start holds no timer at all. */
+export const SIDECAR_REFRESH_START_DELAY_MS = 60 * 1000;
 
 /** State file, beside the other ~/.yaw-mcp state.
  *
@@ -192,8 +237,14 @@ export interface SidecarRefreshDeps {
   specsImpl?: () => Promise<SidecarSpec[]>;
   /** Test hook: the clock. */
   nowImpl?: () => number;
+  /** Test hook: the start delay (see SIDECAR_REFRESH_START_DELAY_MS). Resolves
+   *  when the check may go on to the registry and the tree. */
+  delayImpl?: (ms: number) => Promise<void>;
   /** Test hook: read the throttle state. Null means unreadable or absent,
-   *  which reads as "never checked" (fail-open).
+   *  which reads as "never checked" (fail-open). Called TWICE on a start that
+   *  gets past the cheap gates: once before the start delay and once after it
+   *  (steps 3 and 3c of maybeRefreshSidecars) -- the second read is how a pane
+   *  notices a check another pane completed while this one slept.
    *
    *  Typed via SidecarRefreshState rather than re-declaring its shape inline:
    *  that interface is read-modify-written precisely so a key a later build
@@ -201,8 +252,10 @@ export interface SidecarRefreshDeps {
    *  here would silently fail to carry such a key -- with no type error to
    *  catch the drift, which is the exact failure the interface guards against. */
   readStateImpl?: () => SidecarRefreshState | null;
-  /** Test hook: persist the throttle state. Best-effort; never throws. */
-  writeStateImpl?: (patch: SidecarRefreshStatePatch) => void;
+  /** Test hook: persist the throttle state. Best-effort; never throws. May be
+   *  async -- the default is, because it writes atomically -- and the check
+   *  awaits it, so "resolves once the check completes" holds for the write. */
+  writeStateImpl?: (patch: SidecarRefreshStatePatch) => void | Promise<void>;
   /** Home directory the managed tree lives under. Defaults to homedir(). */
   home?: string;
 }
@@ -325,76 +378,34 @@ async function defaultFetchLatest(pkg: string): Promise<string | null> {
   }
 }
 
-/** The lockfile auto-upgrade's acquireUpgradeLock creates, by name. A second
- *  copy of a constant that module does not export -- deliberate, and safe in
- *  ONE direction only: it is used solely to keep an mtime fresh (below), so if
- *  auto-upgrade ever renames its lock, the touch fails ENOENT, the heartbeat
- *  quietly stops and the behavior degrades to what it was before the heartbeat
- *  existed. It can never touch, or delete, the wrong file. */
-const UPGRADE_LOCK_NAME = ".yaw-mcp-upgrade.lock";
-
-/** How often a held lock's mtime is refreshed while the refresh runs. An order
- *  of magnitude inside auto-upgrade's ten-minute stale window, so a heartbeat
- *  that is merely late (a loaded machine, a paused VM) still lands well before
- *  the lock reads as abandoned. */
-export const SIDECAR_LOCK_HEARTBEAT_MS = 60 * 1000;
-
-/** The lock the serve path actually uses.
- *
- *  auto-upgrade's acquireUpgradeLock, not a second implementation of it: the
- *  O_EXCL take, the stale-steal window and the backwards-clock skew margin are
- *  subtle enough that a copy would drift. It is keyed on the DIRECTORY, so a
- *  lock in the sidecars root cannot contend with a lock in a global npm prefix
- *  -- the two features serialize independently even though they share the
- *  primitive. (Wart, called out so nobody hunts for a bug: the file it creates
- *  is named `.yaw-mcp-upgrade.lock` even here. Renaming it per-caller would
- *  mean parameterizing auto-upgrade, for a filename nothing reads.)
- *
- *  What IS added on top: a heartbeat. auto-upgrade's ten-minute stale-steal
- *  window was sized for its own hold -- one `npm install -g` of one package,
- *  seconds long -- and an unstealable lock there would disable self-upgrade
- *  forever, so ten minutes is generous for THAT caller. This caller holds the
- *  same lock across a whole-tree `npm install` plus `npm update` that this
- *  module's header calls "network and minutes", and on a cold cache or a slow
- *  link minutes can pass ten of them. A second pane starting inside a live
- *  refresh would then read the lock as abandoned, steal it, and run a second
- *  npm into the same tree -- the exact concurrent-install the lock exists to
- *  prevent. Touching the file every minute keeps the mtime acquireUpgradeLock
- *  measures inside the window for as long as this process is alive, so only a
- *  lock whose owner really is gone gets stolen. The timer is unref'd (it must
- *  never hold the process open) and cleared by the release callback, and a
- *  failed touch stops the heartbeat rather than logging once a minute. */
+/** The lock the serve path actually uses: sidecars-cmd's acquireSidecarsLock,
+ *  the SAME lock a manual `sidecars install` takes, so the two writers of the
+ *  managed tree serialize against each other and not merely against
+ *  themselves. It lives there, beside the install it guards, together with
+ *  the heartbeat that keeps a whole-tree install out of auto-upgrade's
+ *  ten-minute stale-steal window; this module used to carry both, plus a
+ *  hand-copied lockfile name that the heartbeat could drift from. */
 function defaultAcquireLock(dir: string): (() => void) | null {
   if (inUnitTest()) return () => {};
-  const release = acquireUpgradeLock(dir);
-  // Null is "someone else holds it": nothing was taken, so there is nothing to
-  // keep warm. (acquireUpgradeLock's other degraded answer -- a no-op release
-  // for a directory it could not write -- is indistinguishable from a real
-  // take here, and needs no special case: the first touch fails ENOENT and
-  // switches the heartbeat off.)
-  if (release === null) return null;
-  const lockPath = join(dir, UPGRADE_LOCK_NAME);
-  const beat = setInterval(() => {
-    try {
-      const now = new Date();
-      utimesSync(lockPath, now, now);
-    } catch {
-      // Gone (stolen as stale after all, or the tree was cleaned up) or not
-      // writable. Nothing to keep alive; stop rather than retry every minute.
-      clearInterval(beat);
-    }
-  }, SIDECAR_LOCK_HEARTBEAT_MS);
-  // Guarded the way settledWithin (server.ts) guards its own: under an embedded
-  // host whose global setInterval is the browser one, there is no unref to call.
-  if (typeof beat.unref === "function") beat.unref();
-  return () => {
-    clearInterval(beat);
-    release();
-  };
+  return acquireSidecarsLock(dir);
+}
+
+/** The start delay (see SIDECAR_REFRESH_START_DELAY_MS). The timer is unref'd:
+ *  a `serve` that exits inside the delay must not be held open by a background
+ *  nicety, and the promise then simply never settles -- nothing awaits it but
+ *  the fire-and-forget check. Guarded the way the lock heartbeat guards its
+ *  interval: under an embedded host whose global setTimeout is the browser
+ *  one, there is no unref to call. */
+function defaultDelay(ms: number): Promise<void> {
+  if (inUnitTest()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === "function") timer.unref();
+  });
 }
 
 /** The options the background install runs with. Exported (and pure) so the
- *  two properties that matter are pinned by a test rather than by a comment:
+ *  properties that matter are pinned by a test rather than by a comment:
  *
  *  - `cwd` is the HOME dir, so the install rewrites the shared manifest from
  *    the USER-GLOBAL bundles.json and never from whatever project the MCP
@@ -407,21 +418,34 @@ function defaultAcquireLock(dir: string): (() => void) | null {
  *    a child whose own output goes to fd 2 -- which from inside serve is the
  *    stream the MCP client reads our diagnostics from, sprayed with "added 220
  *    packages in 12s" and every npm warning.
+ *  - the npm child's console window is hidden. `serve` under a GUI-launched
+ *    MCP client has no console of its own, and a console child of such a
+ *    process (cmd.exe running npm.cmd) is given a brand-new window on the
+ *    user's desktop for as long as it runs -- a blank box for the length of
+ *    an install plus an update, once a day, from a process the user never
+ *    started by hand. The CLI deliberately does NOT hide (see
+ *    RunNpmOptions.windowsHide), so this is set here and not in the default.
+ *  - the lock is a no-op. maybeRefreshSidecars takes the real sidecars lock,
+ *    heartbeat and all, BEFORE it spawns this install (step 7), and the
+ *    command's own default would take that same lock again: an O_EXCL take
+ *    against a file this very process created reads as "held by someone
+ *    else", and the refresh would refuse the install it took the lock for.
  *
- *  The runner is sidecars-cmd's defaultRunNpm with the ONE thing this caller
- *  differs on -- `stdio` -- rather than a second spawn of its own. The rest of
- *  that shape is security-sensitive: npm on Windows is a .cmd shim Node refuses
- *  to spawn without a shell (post-CVE-2024-27980), which is safe ONLY because
- *  every argument is a fixed literal and `cwd` travels as a spawn option rather
- *  than in the command line. A hand-copied runner is how that condition comes
- *  to be kept in one place and forgotten in the other. */
+ *  The runner is sidecars-cmd's defaultRunNpm with the two things this caller
+ *  differs on -- `stdio` and `windowsHide` -- rather than a second spawn of its
+ *  own. The rest of that shape is security-sensitive: npm on Windows is a .cmd
+ *  shim Node refuses to spawn without a shell (post-CVE-2024-27980), which is
+ *  safe ONLY because every argument is a fixed literal and `cwd` travels as a
+ *  spawn option rather than in the command line. A hand-copied runner is how
+ *  that condition comes to be kept in one place and forgotten in the other. */
 export function backgroundInstallOptions(home: string): SidecarsInstallOptions {
   return {
     home,
     cwd: home,
-    runNpm: (args, cwd) => defaultRunNpm(args, cwd, { stdio: "ignore" }),
+    runNpm: (args, cwd) => defaultRunNpm(args, cwd, { stdio: "ignore", windowsHide: true }),
     out: () => {},
     err: () => {},
+    acquireLock: () => () => {},
   };
 }
 
@@ -534,16 +558,22 @@ function defaultReadState(home: string): SidecarRefreshState | null {
 /** Persist the throttle state. Read-modify-write so an unknown key written by
  *  a newer build survives this one's write. Best-effort: a write failure costs
  *  at most one extra check on the next startup, so it is swallowed at debug --
- *  the same trade install-nudge makes. Plain writeFileSync rather than an
- *  atomic rename: a torn write reads back as corrupt, which defaultReadState
- *  already treats as "never checked". */
-function defaultWriteState(home: string, patch: SidecarRefreshStatePatch): void {
+ *  the same trade install-nudge makes.
+ *
+ *  Atomic (write-then-rename, the helper sidecars-cmd already uses for the
+ *  manifest), and that is not fussiness: the read-modify-write above is what
+ *  makes a torn write expensive. A torn STAMP alone would be cheap -- it reads
+ *  back as corrupt, which defaultReadState treats as "never checked", one
+ *  extra check -- but a torn FILE loses every foreign key with it, the very
+ *  keys parseSidecarRefreshState goes out of its way to carry a newer build's
+ *  state through this build's save. atomicWriteFile creates the parent
+ *  directory too, so a fresh ~/.yaw-mcp needs no mkdir here. */
+async function defaultWriteState(home: string, patch: SidecarRefreshStatePatch): Promise<void> {
   if (inUnitTest()) return;
   try {
     const path = sidecarRefreshStatePath(home);
     const next = mergeSidecarRefreshState(defaultReadState(home), patch);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    await atomicWriteFile(path, `${JSON.stringify(next, null, 2)}\n`);
   } catch (err) {
     log("debug", "sidecar-refresh: failed to record the check timestamp", {
       error: err instanceof Error ? err.message : String(err),
@@ -666,15 +696,43 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
       const age = now - last;
       if (age >= 0 && age < SIDECAR_REFRESH_THROTTLE_MS) return;
     }
-    const recordCheck = (): void =>
-      (deps.writeStateImpl ?? ((patch: SidecarRefreshStatePatch) => defaultWriteState(home, patch)))({
-        lastSidecarRefreshCheck: now,
-      });
+    // Awaited wherever it is called: the default write is atomic and therefore
+    // async, and "resolves once the check completes" has to include the write
+    // -- a caller (or test) that sees this promise settle must be able to read
+    // the stamp back.
+    const writeState = deps.writeStateImpl ?? ((patch: SidecarRefreshStatePatch) => defaultWriteState(home, patch));
+    const recordCheck = async (): Promise<void> => {
+      await writeState({ lastSidecarRefreshCheck: now });
+    };
+
+    // 3b. Wait out the connect-time activation burst. Everything above was a
+    // local read; everything below reads the config, probes the registry and
+    // -- if anything is stale -- rewrites the tree the burst is spawning
+    // servers from (see SIDECAR_REFRESH_START_DELAY_MS and the header's KNOWN
+    // GAPS). `now` stays the pre-delay clock on purpose: the throttle was
+    // decided against it, and a stamp a minute early only makes the next
+    // window a minute shorter. A `serve` that exits inside the delay has
+    // recorded nothing and simply checks again on its next start.
+    await (deps.delayImpl ?? defaultDelay)(SIDECAR_REFRESH_START_DELAY_MS);
+
+    // 3c. Re-check the throttle now that a minute has passed. The stamp was
+    // read BEFORE the delay, so a pane that started while another pane's
+    // check was already under way passed the gate at step 3 and would go on
+    // to load the config and probe the registry. One more cheap read: a pane
+    // whose check finished while this one slept has stamped, and this one
+    // stops here. (Panes that woke within seconds of each other still all
+    // probe -- see the header; the stamp lands after the probes.)
+    const afterDelay = (deps.readStateImpl ?? (() => defaultReadState(home)))();
+    const lastAfterDelay = afterDelay?.lastSidecarRefreshCheck;
+    if (typeof lastAfterDelay === "number") {
+      const age = (deps.nowImpl ?? Date.now)() - lastAfterDelay;
+      if (age >= 0 && age < SIDECAR_REFRESH_THROTTLE_MS) return;
+    }
 
     // 4. What is configured.
     const specs = await (deps.specsImpl ?? (() => defaultSpecs(home)))();
     if (specs.length === 0) {
-      recordCheck();
+      await recordCheck();
       return;
     }
 
@@ -725,7 +783,7 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
       // is precisely the storm the throttle exists to prevent; the cost of
       // getting it "wrong" is one day of staleness on a background nicety.
       log("debug", "sidecar refresh: nothing stale", { skipped: plan.skipped });
-      recordCheck();
+      await recordCheck();
       return;
     }
 
@@ -775,7 +833,7 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
         error: err instanceof Error ? err.message : String(err),
       });
     }
-    recordCheck();
+    await recordCheck();
   } catch (err) {
     // The contract is "never throws". Anything unanticipated -- an injected dep
     // that misbehaves, a clock impl that blows up -- degrades to a skipped

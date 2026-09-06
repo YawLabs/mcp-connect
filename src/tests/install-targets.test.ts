@@ -312,16 +312,6 @@ describe("resolveClaudeCodeSettingsPath", () => {
     });
     expect(p).toBe(join("/home/alice", ".claude", "settings.json"));
   });
-
-  it("ignores `os` entirely -- every os spelling resolves to the same path", () => {
-    // Pins the dead parameter as dead: if a future change starts reading it,
-    // this case fails instead of the option quietly becoming load-bearing.
-    const expected = join("/home/alice", ".claude", "settings.json");
-    for (const os of ["macos", "linux", "windows"] as const) {
-      expect(resolveClaudeCodeSettingsPath("user", { home: "/home/alice", os }), os).toBe(expected);
-    }
-    expect(resolveClaudeCodeSettingsPath("user", { home: "/home/alice" })).toBe(expected);
-  });
 });
 
 describe("resolveInstallPath — Claude Desktop", () => {
@@ -661,6 +651,22 @@ describe("buildLaunchEntry", () => {
     });
     expect(e.command).toBe("cmd");
     expect(e.args).toEqual(["/c", "uvx", "mcp-server-x", "--url", "https://api/x?a=1^&b=2"]);
+  });
+
+  it("single-caret-escapes for a uv-hosted server (uv.exe is direct, like the uvx.exe beside it)", () => {
+    // Bare `uv` (a catalog entry launching `uv run <srv>`) is the native exe
+    // the bootstrap itself installs (uv-bootstrap.ts), reached after ONE cmd
+    // parse. It was missing from the direct-binary set, so isCmdShimLauncher
+    // failed it safe to "shim" and triple-caret escaped the arg -- uv.exe
+    // received `^&` for `&`, the same defect the uvx case above was written
+    // to stop.
+    expect(isCmdShimLauncher("uv")).toBe(false);
+    const e = buildLaunchEntry({
+      os: "windows",
+      upstream: { command: "uv", args: ["run", "srv", "--url", "https://x?a=1&b=2"] },
+    });
+    expect(e.command).toBe("cmd");
+    expect(e.args).toEqual(["/c", "uv", "run", "srv", "--url", "https://x?a=1^&b=2"]);
   });
 
   it("refuses an upstream command containing whitespace on Windows", () => {

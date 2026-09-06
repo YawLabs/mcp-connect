@@ -160,10 +160,11 @@ describe("uvTarget", () => {
 describe("UV_VERSION freshness floor", () => {
   it("has moved off the 0.11.x generation (POLICY: track the latest uv release)", () => {
     // The install dir is keyed by UV_VERSION, so a stale pin keeps every user
-    // on that build indefinitely. 0.12.5 was current when the floor landed;
-    // raise the floor when bumping the pin, never lower the pin below it.
+    // on that build indefinitely. 0.12.10 was the latest astral-sh/uv release
+    // when the floor last moved (2026-09-05); raise the floor when bumping the
+    // pin, never lower the pin below it.
     expect(UV_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
-    expect(compareVersions(UV_VERSION, "0.12.5")).toBeGreaterThanOrEqual(0);
+    expect(compareVersions(UV_VERSION, "0.12.10")).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -176,21 +177,16 @@ describe("resolveUvSpawn with uv present", () => {
     __resetUvBootstrap();
   });
 
-  // resolveUvSpawn (uv-bootstrap.ts:349) returns uvBin from ensureUv(),
-  // which is either the literal "uv" (PATH) or the absolute path to the
-  // managed cache copy. The previous shape asserted `command: "uv"`
-  // exactly, which failed after a prior run bootstrapped a managed copy
-  // (now the resolve target is `C:\...\Cache\uv\<ver>\uv.exe` even on a
-  // box that also has `uv` on PATH, because ensureUv() memoizes the
-  // first resolution for the process lifetime). The spawn target is
-  // correct in both cases -- what's load-bearing is "the command points
-  // at a uv binary and the args are rewritten to `uv tool run ...`."
-  // isUvSpawnTarget accepts either form.
-  const isUvSpawnTarget = (cmd: string): boolean => cmd === "uv" || /uv(\.exe)?$/.test(cmd);
+  // resolveUv checks onPath("uv") FIRST, so with uv reachable the resolve
+  // target is always the literal "uv" -- the managed cache copy is never
+  // consulted on that branch, and __resetUvBootstrap in beforeEach clears the
+  // memo between tests. The exact command is what pins the PATH-hit branch: a
+  // widened "bare or bootstrapped path" matcher used here would have stayed
+  // green through a regression that downloaded despite uv being on PATH.
 
-  it.skipIf(!UV_PRESENT)("returns a uv spawn target (bare or bootstrapped path) when uv is reachable", async () => {
+  it.skipIf(!UV_PRESENT)("returns the bare `uv` when uv is on PATH", async () => {
     const result = await resolveUvSpawn("uv", ["--version"]);
-    expect(isUvSpawnTarget(result.command)).toBe(true);
+    expect(result.command).toBe("uv");
     expect(result.args).toEqual(["--version"]);
   });
 
@@ -201,19 +197,19 @@ describe("resolveUvSpawn with uv present", () => {
     // partial installs). Always-rewriting means the spawn target is
     // always uv, which we've already confirmed is reachable.
     const result = await resolveUvSpawn("uvx", ["mcp-server-fetch"]);
-    expect(isUvSpawnTarget(result.command)).toBe(true);
+    expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run", "mcp-server-fetch"]);
   });
 
   it.skipIf(!UV_PRESENT)("preserves additional args when rewriting uvx", async () => {
     const result = await resolveUvSpawn("uvx", ["--from", "mcp-server-fetch", "--transport", "stdio"]);
-    expect(isUvSpawnTarget(result.command)).toBe(true);
+    expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run", "--from", "mcp-server-fetch", "--transport", "stdio"]);
   });
 
   it.skipIf(!UV_PRESENT)("rewrites uvx with empty args", async () => {
     const result = await resolveUvSpawn("uvx", []);
-    expect(isUvSpawnTarget(result.command)).toBe(true);
+    expect(result.command).toBe("uv");
     expect(result.args).toEqual(["tool", "run"]);
   });
 
@@ -222,15 +218,18 @@ describe("resolveUvSpawn with uv present", () => {
     // string equality used to pass it through untouched -- no bootstrap when
     // uv was missing, and no `uv tool run` rewrite.
     const exe = await resolveUvSpawn("uvx.exe", ["mcp-server-fetch"]);
-    expect(isUvSpawnTarget(exe.command)).toBe(true);
+    expect(exe.command).toBe("uv");
     expect(exe.args).toEqual(["tool", "run", "mcp-server-fetch"]);
 
     const upper = await resolveUvSpawn("UVX.EXE", ["mcp-server-fetch"]);
-    expect(isUvSpawnTarget(upper.command)).toBe(true);
+    expect(upper.command).toBe("uv");
     expect(upper.args).toEqual(["tool", "run", "mcp-server-fetch"]);
 
+    // The bare name, not the `uv.exe` spelling the config carried: the spawn
+    // target is whatever ensureUv resolved, and on the PATH-hit branch that is
+    // the literal "uv".
     const uvExe = await resolveUvSpawn("uv.exe", ["--version"]);
-    expect(isUvSpawnTarget(uvExe.command)).toBe(true);
+    expect(uvExe.command).toBe("uv");
     expect(uvExe.args).toEqual(["--version"]);
   });
 });

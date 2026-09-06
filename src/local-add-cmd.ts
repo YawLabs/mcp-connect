@@ -18,15 +18,18 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
-import { type FetchCatalog, resolveCatalogSlug } from "./catalog.js";
+import { CATALOG_SLUG_RE, type FetchCatalog, resolveCatalogSlug } from "./catalog.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 // The removal gate must see the same files the WRITE path can modify, so it
 // parses with the loader's JSONC parser (comments + trailing commas) rather
 // than a stricter JSON.parse. See findRemovalTarget.
 import { parseJsonc } from "./jsonc.js";
 import {
+  BundleCollisionError,
   deriveNamespace,
   findShadowingProjectBundles,
+  formatBundleCollision,
+  type LaunchChange,
   loadLocalBundles,
   localBundlesPath,
   previewUpsertUserBundle,
@@ -34,6 +37,7 @@ import {
   upsertUserBundle,
 } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
+import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 // The removal preview renders command / args / url / name straight out of
 // bundles.json immediately above a [y/N] prompt, so it needs the same
 // control-byte neutering the `trust` gate uses. IMPORTED, never re-spelled:
@@ -41,8 +45,6 @@ import { userConfigDir } from "./paths.js";
 // trust-cmd's tests actually cover.
 import { displayArg, displaySafe } from "./trust-cmd.js";
 import type { UpstreamServerConfig } from "./types.js";
-
-const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 // --- add --------------------------------------------------------------------
 
@@ -56,11 +58,24 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
 
   --env KEY=value   Provide a required env var's value. Repeatable. Required
                     vars not given here AND not in your shell block the add.
+                    The value lands in your shell history and process argv
+                    like any argument, and is stored in plain text (file mode
+                    0600) in bundles.json. For a real credential, store it
+                    with \`yaw-mcp secrets set NAME\` and pass
+                    --env KEY='\${secret:NAME}' instead: the vault resolves it
+                    at launch and only the reference is written. The single
+                    quotes stop bash/zsh/PowerShell expanding it to nothing;
+                    in cmd.exe use no quotes ($ is not special there --
+                    cmd.exe keeps single quotes as part of the value, and the
+                    server would receive a quoted token). Or leave it
+                    out to keep a shell-resident secret off disk entirely --
+                    the server inherits it at launch.
   --dry-run         Print what would be written without writing.
   --json            Emit the written entry as JSON (implies success on stdout).
                     Env vars appear as \`envKeys\` -- key NAMES only, never the
                     stored values.
-  --catalog <url>   Override the catalog URL (default the public catalog).`;
+  --catalog <url>   Override the catalog URL. Precedence: --catalog, then
+                    $YAW_MCP_CATALOG_URL, then the public catalog.`;
 
 export interface AddCommandOptions {
   slug?: string;
@@ -131,7 +146,7 @@ export function parseAddArgs(
         // instead of becoming a positional and failing later with the
         // misleading "invalid slug" / "Expected exactly one server slug". Same
         // posture parseRemoveArgs already takes, and no valid slug starts with
-        // "-" (SLUG_RE requires a leading alphanumeric).
+        // "-" (CATALOG_SLUG_RE requires a leading alphanumeric).
         if (a.startsWith("-")) return { ok: false, error: `Unknown flag: ${a}\n${ADD_USAGE}` };
         positional.push(a);
     }
@@ -167,6 +182,65 @@ function jsonEntry(entry: Partial<UpstreamServerConfig>): Record<string, unknown
   return out;
 }
 
+/** Required keys with no stored value while the shell HAS one: the value
+ *  came from the ambient env, not --env, and was deliberately not persisted
+ *  (see the seeding note in runAdd). Computed from the entry as written -- or
+ *  as the dry run would write it -- never from the flags, so a re-add over an
+ *  entry that already carries a stored value stays quiet instead of claiming
+ *  nothing was persisted. */
+function ambientOnlyRequiredKeys(
+  requiredKeys: string[],
+  entry: Partial<UpstreamServerConfig>,
+  env: NodeJS.ProcessEnv,
+): string[] {
+  const stored = (entry.env ?? {}) as Record<string, string>;
+  return requiredKeys.filter((k) => (stored[k] ?? "").trim() === "" && (env[k] ?? "").trim() !== "");
+}
+
+/** The two stderr notes that follow a write -- in the conditional voice for a
+ *  dry run. The preview's stated purpose is to describe the run it previews,
+ *  and it used to return before either note, so `add --dry-run` said nothing
+ *  about the ambient var the server would depend on, nor about the project
+ *  file that would shadow the write. stderr so both survive --json. */
+async function printPostWriteNotes(
+  printErr: (s: string) => void,
+  opts: { ambientOnly: string[]; cwd: string; home: string; env: NodeJS.ProcessEnv; dryRun: boolean },
+): Promise<void> {
+  const { ambientOnly, dryRun } = opts;
+  if (ambientOnly.length > 0) {
+    const one = ambientOnly.length === 1;
+    const verb = dryRun ? "would be" : one ? "was" : "were";
+    printErr(
+      `Note: ${ambientOnly.join(", ")} ${verb} read from your shell env and NOT persisted; the server depends on ${
+        one ? "that var" : "those vars"
+      } being present wherever yaw-mcp launches. Pass --env ${ambientOnly[0]}=... to persist a value.`,
+    );
+  }
+  // Honest warning: a project-local bundles.json shadows the user-global file.
+  //
+  // `env` is passed explicitly: the shadow verdict is trust-aware, and
+  // YAW_MCP_TRUST_PROJECT is the documented opt-out. Defaulting it to
+  // process.env read a DIFFERENT environment than the one this command was
+  // told to run under, so an embedded/test caller that injected the bypass got
+  // the un-bypassed answer.
+  const shadow = await findShadowingProjectBundles(opts.cwd, opts.home, opts.env).catch(() => null);
+  if (shadow) {
+    printErr(
+      `Note: ${displaySafe(shadow)} overrides your user-global bundles.json, so this entry ${
+        dryRun ? "would not" : "won't"
+      } load until you add it there or remove that file.`,
+    );
+  }
+}
+
+/** Both halves of a launch swap, rendered like the removal preview: through
+ *  renderLaunch, so a stored url-only entry reads as `HTTP <url>` instead of
+ *  nothing, and control bytes or whitespace in a stored arg are neutered the
+ *  same way every other bundles.json field this file prints is. */
+function renderLaunchChange(change: LaunchChange): string {
+  return `  from: ${renderLaunch(change.from)}\n    to: ${renderLaunch(change.to)}`;
+}
+
 export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult> {
   const out = opts.out ?? ((s: string) => process.stdout.write(s));
   const err = opts.err ?? ((s: string) => process.stderr.write(s));
@@ -178,7 +252,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     return { exitCode: 2, written: [] };
   }
   const slug = opts.slug;
-  if (!SLUG_RE.test(slug)) {
+  if (!CATALOG_SLUG_RE.test(slug)) {
     printErr(`yaw-mcp add: invalid slug "${slug}" (lowercase letters, digits, and dashes only).`);
     return { exitCode: 2, written: [] };
   }
@@ -283,12 +357,17 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
       printErr(`yaw-mcp add: ${(e as Error).message}`);
       return { exitCode: 1, written: [] };
     }
+    // The same read diagnostics the real run prints (see readRawUserBundles):
+    // a preview that hid them described a quieter run than the real one.
+    for (const w of preview.warnings) printErr(`warning: ${w}`);
     if (preview.refusal) {
       // stderr text under --json too: that is what the REAL refusal (the
       // catch around upsertUserBundle below) emits, and every other error
       // exit in this command. A {ok:false} body on stdout here would be the
       // one place the preview's channel differed from the run it previews.
-      printErr(`yaw-mcp add (dry-run): would refuse: ${preview.refusal}`);
+      // Rendered through displaySafe: the stored half of the collision (name,
+      // slug) comes straight out of bundles.json.
+      printErr(`yaw-mcp add (dry-run): would refuse: ${formatBundleCollision(preview.refusal, displaySafe)}`);
       return { exitCode: 1, written: [] };
     }
     const previewNamespace = preview.namespace ?? namespace;
@@ -302,7 +381,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     const previewPath = localBundlesPath(userConfigDir(home));
     if (preview.launchChanged) {
       printErr(
-        `Note: this would CHANGE the entry's launch command:\n  from: ${preview.launchChanged.from}\n    to: ${preview.launchChanged.to}\nIf the existing entry is a different server you meant to keep, remove/re-add via the app or edit bundles.json instead.`,
+        `Note: this would CHANGE the entry's launch command:\n${renderLaunchChange(preview.launchChanged)}\nIf the existing entry is a different server you meant to keep, remove/re-add via the app or edit bundles.json instead.`,
       );
     }
     if (opts.json) {
@@ -347,6 +426,13 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
         );
       }
     }
+    await printPostWriteNotes(printErr, {
+      ambientOnly: ambientOnlyRequiredKeys(server.requiredEnvKeys, previewEntry, env),
+      cwd,
+      home,
+      env,
+      dryRun: true,
+    });
     return { exitCode: 0, written: [] };
   }
 
@@ -354,9 +440,23 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   try {
     res = await upsertUserBundle(entry, { home });
   } catch (e) {
-    printErr(`yaw-mcp add: ${(e as Error).message}`);
+    // The collision refusal quotes the STORED entry's name and slug -- fields
+    // out of bundles.json -- so it is re-rendered through displaySafe rather
+    // than printed as the Error's verbatim message.
+    // Read diagnostics FIRST, exactly as the success path and the dry run
+    // print them: the user is about to open bundles.json to resolve the
+    // collision, and a malformed entry the loader skipped is what they most
+    // need to know about before they do.
+    if (e instanceof BundleCollisionError) for (const w of e.warnings) printErr(`warning: ${w}`);
+    const msg =
+      e instanceof BundleCollisionError ? formatBundleCollision(e.collision, displaySafe) : (e as Error).message;
+    printErr(`yaw-mcp add: ${msg}`);
     return { exitCode: 1, written: [] };
   }
+  // Read diagnostics first, before the success line they qualify -- an
+  // invalid `defaultRuntime` this write just dropped from the file is the
+  // usual one (see readRawUserBundles).
+  for (const w of res.warnings) printErr(`warning: ${w}`);
 
   // Report the entry AS WRITTEN, not the one built above: an update folds onto
   // whatever was already on disk (env values, an explicit isActive:false, a
@@ -372,7 +472,7 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // SILENT though: name what changed, on stderr so it survives --json.
   if (res.launchChanged) {
     printErr(
-      `Note: the entry's launch command changed:\n  from: ${res.launchChanged.from}\n    to: ${res.launchChanged.to}\nIf the previous entry was a different server you meant to keep, restore it from the app or edit bundles.json.`,
+      `Note: the entry's launch command changed:\n${renderLaunchChange(res.launchChanged)}\nIf the previous entry was a different server you meant to keep, restore it from the app or edit bundles.json.`,
     );
   }
 
@@ -406,42 +506,17 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     }
   }
 
-  // Required keys that passed the gate but landed on disk EMPTY: the value came
-  // from the ambient shell (not --env) and was deliberately not persisted, so
-  // the server depends on that shell var still being set wherever yaw-mcp
-  // launches. Computed from the WRITTEN entry rather than from the flags, so a
-  // re-add over an entry that already carries a stored value stays quiet
-  // instead of claiming nothing was persisted. Warned on stderr so it survives
-  // --json.
-  const writtenEnv = (written.env ?? {}) as Record<string, string>;
-  const ambientOnlyRequired = server.requiredEnvKeys.filter(
-    (k) => (writtenEnv[k] ?? "").trim() === "" && (env[k] ?? "").trim() !== "",
-  );
-  if (ambientOnlyRequired.length > 0) {
-    printErr(
-      `Note: ${ambientOnlyRequired.join(", ")} ${
-        ambientOnlyRequired.length === 1 ? "was" : "were"
-      } read from your shell env and NOT persisted; the server depends on ${
-        ambientOnlyRequired.length === 1 ? "that var" : "those vars"
-      } being present wherever yaw-mcp launches. Pass --env ${ambientOnlyRequired[0]}=... to persist a value.`,
-    );
-  }
-
-  // Honest warning: a project-local bundles.json shadows the user-global file.
-  // Goes to stderr, so it surfaces even under --json without corrupting the
-  // JSON on stdout that a script is parsing.
-  //
-  // `env` is passed explicitly: the shadow verdict is trust-aware, and
-  // YAW_MCP_TRUST_PROJECT is the documented opt-out. Defaulting it to
-  // process.env read a DIFFERENT environment than the one this command was
-  // told to run under, so an embedded/test caller that injected the bypass got
-  // the un-bypassed answer.
-  const shadow = await findShadowingProjectBundles(cwd, home, env).catch(() => null);
-  if (shadow) {
-    printErr(
-      `Note: ${shadow} overrides your user-global bundles.json, so this entry won't load until you add it there or remove that file.`,
-    );
-  }
+  // Required keys that passed the gate but landed on disk EMPTY (the value
+  // came from the ambient shell, not --env), and the project file that would
+  // shadow this write -- see printPostWriteNotes. Computed from the WRITTEN
+  // entry, never the pre-merge input.
+  await printPostWriteNotes(printErr, {
+    ambientOnly: ambientOnlyRequiredKeys(server.requiredEnvKeys, written, env),
+    cwd,
+    home,
+    env,
+    dryRun: false,
+  });
   return { exitCode: 0, written: [res.path] };
 }
 
@@ -466,7 +541,7 @@ export const REMOVE_USAGE = `Usage: yaw-mcp remove <slug-or-namespace> [--force]
 // Deliberately NOT case-insensitive. Both lookups downstream are exact and
 // case-sensitive (namespacesForStoredSlug compares `slug === target`,
 // removeUserBundle filters on the exact namespace) and both stored forms are
-// lowercase by construction (SLUG_RE is lowercase-only; deriveNamespace
+// lowercase by construction (CATALOG_SLUG_RE is lowercase-only; deriveNamespace
 // lowercases). An /i here therefore accepted `remove GA`, matched nothing, and
 // exited 0 with "nothing to do" -- while `add GA` is rejected at the gate. Same
 // input, opposite verdicts. Reject it here so the two verbs agree.
@@ -490,8 +565,10 @@ export interface RemoveCommandOptions {
   isTTY?: boolean;
   /** Test hook: answer the confirmation without a real TTY read. */
   promptAnswer?: string;
-  /** Test hook: replaces process.stdin/stdout for the interactive prompt. */
-  io?: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream };
+  /** Test hook: replaces process.stdin/stdout for the interactive prompt.
+   *  `terminal` forces readline's keypress mode (what a real TTY gets), so a
+   *  test can deliver Ctrl+C the way a terminal does. */
+  io?: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream; terminal?: boolean };
 }
 
 export function parseRemoveArgs(
@@ -640,8 +717,10 @@ function namespacesForStoredSlug(target: string, servers: unknown[] | null): str
 
 /** How the entry would be launched, as one reviewable line. Mirrors
  *  trust-cmd's renderLaunch, but reads an UNVALIDATED raw entry (see
- *  findRemovalTarget) so every field is type-checked before use. */
-function renderLaunch(entry: Record<string, unknown>): string {
+ *  findRemovalTarget) so every field is type-checked before use. The
+ *  parameter is typed loosely so a raw bundles.json record and a LaunchShape
+ *  (see renderLaunchChange) both fit; the checks below are the contract. */
+function renderLaunch(entry: { command?: unknown; args?: unknown; url?: unknown }): string {
   const command = typeof entry.command === "string" ? entry.command : "";
   const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
   const parts = [command, ...args].filter((p) => p.length > 0);
@@ -678,14 +757,23 @@ function isInteractive(opts: RemoveCommandOptions): boolean {
 }
 
 /** Ask the confirmation. Defaults to NO -- only an explicit y/yes proceeds, so
- *  a bare Enter (or ^D, or a stray keystroke) leaves bundles.json untouched. */
-async function askYesNo(opts: RemoveCommandOptions, question: string): Promise<string> {
+ *  a bare Enter, a stray keystroke, or EOF (^D, a piped stdin running dry)
+ *  leaves bundles.json untouched. EOF is questionOrEmpty's job: a bare
+ *  rl.question() never settles once its input closes, which left this promise
+ *  pending forever -- no "Aborted", no exit 1, the process ending by
+ *  event-loop drain at status 0 with a wrapper reading the decline as
+ *  success. */
+async function askYesNo(opts: RemoveCommandOptions, question: string): Promise<string | QuestionCancelled> {
   if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
   const input = opts.io?.stdin ?? process.stdin;
   const output = opts.io?.stdout ?? process.stdout;
-  const rl = createInterface({ input, output });
+  // `terminal` is readline's own default (output.isTTY) unless a test forces
+  // it; on a real TTY that is what makes readline own the Ctrl+C keypress.
+  const rl = createInterface({ input, output, terminal: opts.io?.terminal });
   try {
-    return (await rl.question(question)).trim().toLowerCase();
+    const raw = await questionOrEmpty(rl, question);
+    // Ctrl+C is not "no": it is the user leaving, and the exit code says so.
+    return raw === QUESTION_CANCELLED ? raw : raw.trim().toLowerCase();
   } finally {
     rl.close();
   }
@@ -757,6 +845,12 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
         return { exitCode: 2, written: [] };
       }
       const answer = await askYesNo(opts, `  Remove "${doomed.namespace}"? [y/N] `);
+      if (answer === QUESTION_CANCELLED) {
+        // Ctrl+C at the prompt: exit 130, like every other prompt in the
+        // product, rather than the decline's exit 1.
+        printErr("yaw-mcp remove: Cancelled. Nothing was removed.");
+        return { exitCode: 130, written: [] };
+      }
       if (answer !== "y" && answer !== "yes") {
         printErr("yaw-mcp remove: Aborted. Nothing was removed.");
         return { exitCode: 1, written: [] };
@@ -766,9 +860,13 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
 
   let res: Awaited<ReturnType<typeof removeUserBundle>> | null = null;
   let matched = "";
+  // One file, several candidate namespaces: every attempt re-reads it and
+  // reports the same diagnostics, so they are deduped before printing.
+  const warnings = new Set<string>();
   try {
     for (const ns of candidates) {
       res = await removeUserBundle(ns, { home });
+      for (const w of res.warnings) warnings.add(w);
       if (res.removed) {
         matched = ns;
         break;
@@ -778,6 +876,7 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
     printErr(`yaw-mcp remove: ${(e as Error).message}`);
     return { exitCode: 1, written: [] };
   }
+  for (const w of warnings) printErr(`warning: ${w}`);
 
   if (!res?.removed) {
     // No-op exits 0 (like try-cleanup): "make it absent" succeeded. The file is
@@ -849,11 +948,19 @@ export interface ListCommandOptions {
  * same reason: describe what is ON DISK, not what the loader would spawn with.
  *
  * Best-effort: an unreadable or unparseable file yields an empty map and the
- * caller keeps the validated-entry derivation as its fallback. First entry
- * wins on a duplicated namespace, matching the write path's findIndex.
+ * caller keeps the validated-entry derivation as its fallback.
+ *
+ * One QUEUE of key lists per namespace, in file order, because a namespace
+ * can be duplicated and each entry must report its OWN keys. The pairing is
+ * exact: validateEntry rejects only non-object entries and invalid
+ * namespaces, and a namespace either passes NAMESPACE_RE for every entry
+ * that carries it or for none, so the n-th validated entry under a namespace
+ * is the n-th raw object entry under it. The caller shifts the queue as it
+ * walks the validated list in order. (First-entry-wins used to copy the first
+ * duplicate's keys onto the second, misreporting the second's.)
  */
-async function rawEnvKeysByNamespace(path: string | null): Promise<Map<string, string[]>> {
-  const out = new Map<string, string[]>();
+async function rawEnvKeysByNamespace(path: string | null): Promise<Map<string, string[][]>> {
+  const out = new Map<string, string[][]>();
   if (!path) return out;
   // Note the path is whichever file the LOADER won with (project-local can
   // beat user-global), unlike the removal lookups which are user-global only.
@@ -861,9 +968,11 @@ async function rawEnvKeysByNamespace(path: string | null): Promise<Map<string, s
   if (servers === null) return out;
   for (const s of servers) {
     const e = s as { namespace?: unknown; env?: unknown } | null;
-    if (!e || typeof e.namespace !== "string" || out.has(e.namespace)) continue;
+    if (!e || typeof e.namespace !== "string") continue;
     const env = e.env && typeof e.env === "object" && !Array.isArray(e.env) ? (e.env as Record<string, unknown>) : {};
-    out.set(e.namespace, Object.keys(env));
+    const queue = out.get(e.namespace) ?? [];
+    queue.push(Object.keys(env));
+    out.set(e.namespace, queue);
   }
   return out;
 }
@@ -895,9 +1004,10 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   const servers = loaded.config?.servers ?? [];
 
   // Always surface load warnings so malformed-file problems aren't silently
-  // swallowed. In --json mode they go into the response body; in text mode
-  // they go to stderr before the listing/empty-state so a script can still
-  // parse stdout cleanly while a human sees the diagnostic.
+  // swallowed. They go to stderr in BOTH modes, before the listing / empty
+  // state, so a script can still parse stdout cleanly while a human sees the
+  // diagnostic; --json ALSO embeds them in the response body, for a consumer
+  // that captured stdout alone.
   for (const w of loaded.warnings) printErr(`warning: ${w}`);
 
   // Overlay the compliance grades `yaw-mcp audit` cached in ~/.yaw-mcp/
@@ -930,7 +1040,9 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
     const rawEnvKeys = await rawEnvKeysByNamespace(loaded.path);
     const jsonServers = graded.map((s) => {
       const entry = jsonEntry(s);
-      const keys = rawEnvKeys.get(s.namespace);
+      // `graded` is the validated list in file order, so shifting pairs each
+      // entry with its own raw keys even when the namespace is duplicated.
+      const keys = rawEnvKeys.get(s.namespace)?.shift();
       if (keys !== undefined && keys.length > 0) entry.envKeys = keys;
       const cached = grades[s.namespace];
       if (cached) {

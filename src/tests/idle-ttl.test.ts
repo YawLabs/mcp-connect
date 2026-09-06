@@ -62,8 +62,10 @@ describe("adaptiveThreshold", () => {
   });
 
   it("snaps a non-finite base to ADAPTIVE_MIN instead of returning NaN", () => {
-    // The realistic source is Number(process.env.MCP_CONNECT_IDLE_THRESHOLD)
-    // over a non-numeric value. NaN fails BOTH clamp comparisons, so before
+    // resolveIdleThreshold (server.ts) no longer produces one -- it parses the
+    // env var with a strict digit-run test -- but `base` is a plain parameter
+    // on an exported pure function, so a future caller computing a baseline
+    // some other way could. NaN fails BOTH clamp comparisons, so before
     // the guard this returned NaN -- and `idleCalls >= NaN` is always false,
     // i.e. the namespace never deactivated at all. That is the opposite of
     // the documented "never deactivate faster than ADAPTIVE_MIN" floor.

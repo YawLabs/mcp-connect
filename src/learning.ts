@@ -60,9 +60,14 @@ export interface NamespaceUsage {
 export class LearningStore {
   // Growth bound: the map keys on namespace, and every recorder is only
   // reached with validated/bounded namespaces from the dispatch path, so
-  // cardinality is capped by the number of distinct configured namespaces.
-  // No explicit cap is needed unless untrusted strings can reach
-  // recordOutcome / recordMiss (they cannot today).
+  // cardinality is bounded by the number of distinct namespaces ever
+  // dispatched OR persisted -- not by the currently configured set.
+  // loadSnapshot admits every namespace state.json carries, so a row for a
+  // server that was since removed or renamed is restored, re-saved on the
+  // next flush, and can still surface in health/doctor flaky lists; nothing
+  // prunes against the installed set on load. No explicit cap is needed
+  // unless untrusted strings can reach recordOutcome / recordMiss (they
+  // cannot today).
   private usage = new Map<string, NamespaceUsage>();
 
   /**
@@ -243,6 +248,19 @@ export class LearningStore {
   loadSnapshot(snapshot: Record<string, NamespaceUsage>): void {
     this.usage.clear();
     for (const [ns, usage] of Object.entries(snapshot)) {
+      // The signature promises NamespaceUsage rows, but the point of the
+      // coercions below is to enforce the store's OWN invariants rather than
+      // trust the caller -- and a null row threw on the first dereference,
+      // aborting the whole restore (good rows included) for one bad entry,
+      // while a primitive row coerced into a phantom all-zero entry that then
+      // round-tripped to disk forever. Only an object can be a row -- and an
+      // array or an empty object is `typeof "object"` too, coercing to the
+      // very same all-zero phantom, so the row also has to CARRY a numeric
+      // dispatched count (persistence.ts's sanitizeLearning draws the line in
+      // the same place).
+      if (!usage || typeof usage !== "object" || Array.isArray(usage) || typeof usage.dispatched !== "number") {
+        continue;
+      }
       // Enforce the store's own invariants rather than trusting upstream
       // sanitization: reject negatives/NaN (coerce to 0), then clamp
       // succeeded DOWN to dispatched.

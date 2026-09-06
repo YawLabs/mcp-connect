@@ -181,11 +181,17 @@ vi.mock("@modelcontextprotocol/sdk/client/stdio.js", () => {
 // the failure surfaces as "err is not an ActivationError" in unrelated redaction
 // tests rather than as a missing mock. Keeping the pure helpers real also means
 // the OOM-hint branch below is exercised against the shipped wording.
-vi.mock("../oam-spawn.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../oam-spawn.js")>()),
-  resolveOamSpawn: vi.fn((command: string, args: string[]) => ({ command, args })),
-  probeOam: vi.fn(() => ({ bin: "/usr/bin/oam", version: "0.6.0", belowMin: false })),
-}));
+vi.mock("../oam-spawn.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../oam-spawn.js")>();
+  return {
+    ...actual,
+    resolveOamSpawn: vi.fn((command: string, args: string[]) => ({ command, args })),
+    // belowMin:false paired with a version AT the floor. upstream.ts reads only
+    // belowMin, so any version would pass -- but a fixture that contradicts
+    // MIN_OAM_VERSION reads as a bug to whoever bumps the floor next.
+    probeOam: vi.fn(() => ({ bin: "/usr/bin/oam", version: actual.MIN_OAM_VERSION, belowMin: false })),
+  };
+});
 
 // Config-level default runtime (feature knob) -- mocked so connectToUpstream
 // never reads the developer machine's real ~/.yaw-mcp/bundles.json, and so
@@ -213,7 +219,7 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
 // Import the mocked modules so the wiring tests can configure/assert them.
 import { defaultRuntime } from "../default-runtime.js";
 import { log } from "../logger.js";
-import { resolveOamSpawn } from "../oam-spawn.js";
+import { MIN_OAM_VERSION, resolveOamSpawn } from "../oam-spawn.js";
 import { appendAuditEvent } from "../secrets-audit.js";
 // Import the mocked secrets-vault module so individual tests can configure it.
 import { hasSecretRefs, loadVault, resolveSecretRefs, unlock, VAULT_CHECK_CORRUPT_ERROR } from "../secrets-vault.js";
@@ -1028,6 +1034,7 @@ describe("resolveServerEnv", () => {
     vi.mocked(resolveSecretRefs).mockReturnValue({
       resolved: { API_KEY: resolvedValue },
       missing: [],
+      malformed: [],
     });
 
     // Connect will fail -- we only need resolveServerEnv to complete without throwing.
@@ -1077,6 +1084,7 @@ describe("resolveServerEnv", () => {
     vi.mocked(resolveSecretRefs).mockReturnValue({
       resolved: { API_KEY: "${secret:MISSING_NAME}" },
       missing: ["MISSING_NAME"],
+      malformed: [],
     });
 
     const config = makeLocalConfig({ env: { API_KEY: "${secret:MISSING_NAME}" } });
@@ -1103,6 +1111,7 @@ describe("resolveServerEnv", () => {
     vi.mocked(resolveSecretRefs).mockReturnValue({
       resolved: { API_KEY: "${secret:MISSING_NAME}", OTHER: "resolved-cleartext" },
       missing: ["MISSING_NAME"],
+      malformed: [],
     });
 
     const config = makeLocalConfig({
@@ -1121,12 +1130,102 @@ describe("resolveServerEnv", () => {
     expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledTimes(1);
   });
 
+  it("refuses the spawn over a MALFORMED ref, keeps the span out of the audit log and bounds it in the error", async () => {
+    // Through the REAL resolveSecretRefs: the point is what upstream does
+    // with what it returns. A malformed span used to be folded into
+    // `missing`, so recordResolveAudit wrote it as the `secret` NAME of a
+    // "missing" event -- and an unterminated ref runs to the end of the env
+    // value, so `${secret:DB_PASS@db.internal:5432/prod?x=y` put the host,
+    // port and query string into a log whose contract is names only, and the
+    // thrown error quoted the whole value with no bound.
+    const actual = await vi.importActual<typeof import("../secrets-vault.js")>("../secrets-vault.js");
+    vi.mocked(resolveSecretRefs).mockImplementation(actual.resolveSecretRefs);
+    try {
+      vi.mocked(hasSecretRefs).mockReturnValue(true);
+      process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+      // No entries at all: nothing decrypts, so the run exercises only the
+      // malformed path (a well-formed ref would be reported missing instead).
+      vi.mocked(loadVault).mockResolvedValue({ version: 2, salt: "abc", entries: {} } as any);
+      vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+
+      const tail = `DB_PASS@db.internal:5432/prod?x=y&pw=${"z".repeat(300)}`;
+      const config = makeLocalConfig({ env: { GH: "${secret:gh token}", DB: `\${secret:${tail}` } });
+      let err: unknown;
+      try {
+        await connectToUpstream(config);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(Error);
+      const message = (err as Error).message;
+      expect(message).toContain("vault: malformed secret refs: <malformed ref> ${secret:gh ...");
+      // Bounded: each span is capped by secrets-vault, so the 300-char tail
+      // never reaches the message (an MCP error payload and a log line).
+      expect(message).not.toContain("pw=");
+      expect(message.length).toBeLessThan(300);
+      // Nothing was spawned.
+      expect(_sdkBehavior.lastStdioArgs).toBeNull();
+
+      // The audit trail got a "missing" event per malformed ref under its
+      // names-only form -- the marker plus the legal-name prefix -- and never
+      // the host, the port or the query string.
+      expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledWith({
+        server: "test",
+        secret: "<malformed ref> gh",
+        event: "missing",
+      });
+      expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledWith({
+        server: "test",
+        secret: "<malformed ref> DB_PASS",
+        event: "missing",
+      });
+      for (const [input] of vi.mocked(appendAuditEvent).mock.calls) {
+        expect(input.secret).not.toContain("@db.internal");
+        expect(input.secret).not.toContain("gh token");
+        expect(input.event).toBe("missing");
+      }
+    } finally {
+      // Back to the bare vi.fn() the rest of the suite configures per case.
+      vi.mocked(resolveSecretRefs).mockReset();
+    }
+  });
+
+  it("keeps the missing-only refusal message unchanged and adds a malformed clause after it", async () => {
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
+    vi.mocked(loadVault).mockResolvedValue({ version: 2, salt: "abc", entries: {} } as any);
+    vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { A: "${secret:MISSING_NAME}", B: "${secret:gh token}" },
+      missing: ["MISSING_NAME"],
+      malformed: [{ display: "<malformed ref> ${secret:gh ...", auditName: "<malformed ref> gh" }],
+    });
+    const config = makeLocalConfig({ env: { A: "${secret:MISSING_NAME}", B: "${secret:gh token}" } });
+    await expect(connectToUpstream(config)).rejects.toThrow(
+      "vault: missing or undecryptable secret refs: MISSING_NAME; malformed secret refs: <malformed ref> ${secret:gh ...",
+    );
+    // Both kinds land in the trail as "missing" -- the malformed one under
+    // its names-only form -- and nothing as "injected": the spawn was refused.
+    expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledWith({
+      server: "test",
+      secret: "MISSING_NAME",
+      event: "missing",
+    });
+    expect(vi.mocked(appendAuditEvent)).toHaveBeenCalledWith({
+      server: "test",
+      secret: "<malformed ref> gh",
+      event: "missing",
+    });
+    expect(vi.mocked(appendAuditEvent)).not.toHaveBeenCalledWith(expect.objectContaining({ event: "injected" }));
+  });
+
   it("records an 'injected' audit event per resolved secret NAME (never a value)", async () => {
     vi.mocked(hasSecretRefs).mockReturnValue(true);
     process.env.YAW_MCP_VAULT_PASSPHRASE = "test-passphrase";
     vi.mocked(loadVault).mockResolvedValue({ version: 1, salt: "abc", entries: { MY_SECRET: {} } } as any);
     vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
-    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { API_KEY: "cleartext" }, missing: [] });
+    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { API_KEY: "cleartext" }, missing: [], malformed: [] });
     _sdkBehavior.clientConnect = () => Promise.reject(new Error("transport error"));
 
     const config = makeLocalConfig({ env: { API_KEY: "${secret:MY_SECRET}" } });
@@ -1186,7 +1285,7 @@ describe("resolveServerEnv", () => {
     const fakeKey = Buffer.from("fakekey");
     vi.mocked(loadVault).mockResolvedValue(fakeVault);
     vi.mocked(unlock).mockResolvedValue(fakeKey);
-    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { TOKEN: "cleartext" }, missing: [] });
+    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { TOKEN: "cleartext" }, missing: [], malformed: [] });
 
     const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
     await connectToUpstream(config).catch(() => {});
@@ -1205,7 +1304,7 @@ describe("resolveServerEnv", () => {
     const fakeVault = { version: 1, salt: "abc", entries: { MY_TOKEN: {} } } as any;
     vi.mocked(loadVault).mockResolvedValue(fakeVault);
     vi.mocked(unlock).mockResolvedValue(Buffer.from("fakekey"));
-    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { TOKEN: "cleartext" }, missing: [] });
+    vi.mocked(resolveSecretRefs).mockReturnValue({ resolved: { TOKEN: "cleartext" }, missing: [], malformed: [] });
 
     const config = makeLocalConfig({ env: { TOKEN: "${secret:MY_TOKEN}" } });
     await connectToUpstream(config).catch(() => {});
@@ -1595,7 +1694,7 @@ describe("connectToUpstream runtime reporting", () => {
       namespace: "test",
       type: "local",
       runtime: "oam",
-      oamVersion: "0.6.0",
+      oamVersion: MIN_OAM_VERSION,
     });
   });
 
@@ -1615,7 +1714,7 @@ describe("connectToUpstream runtime reporting", () => {
       "oam-hosted server failed to boot; downgrading to node for this session",
       {
         namespace: "test",
-        oamVersion: "0.6.0",
+        oamVersion: MIN_OAM_VERSION,
         category: "unknown",
         error: expect.stringContaining("oam crashed on boot"),
       },

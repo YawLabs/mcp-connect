@@ -5,7 +5,7 @@
 // the word "PR". BM25 fixes that by treating every configured server as a
 // document, computing proper IDF across the corpus, and summing per-term
 // scores over weighted fields. The corpus is tiny (<100s of servers per
-// account), so the O(N*M) prep cost is negligible.
+// install), so the O(N*M) prep cost is negligible.
 //
 // We deliberately skip stemming / synonyms / embeddings here -- BM25 with
 // good field weights captures the 80% case. This used to promise "a semantic

@@ -4,7 +4,7 @@ import { parseCompletionArgs, runCompletion } from "./completion-cmd.js";
 import { runComplianceCommand } from "./compliance-cmd.js";
 import { loadYawMcpConfig } from "./config-loader.js";
 import { parseDoctorArgs, runDoctor } from "./doctor-cmd.js";
-import { FOUNDRY_USAGE, parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
+import { parseFoundryArgs, runFoundryExport } from "./foundry-cmd.js";
 import { INSTALL_USAGE, parseInstallArgs, runInstall } from "./install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs, runAdd, runList, runRemove } from "./local-add-cmd.js";
 import { log } from "./logger.js";
@@ -96,10 +96,12 @@ if (subcommand === "compliance") {
 } else if (subcommand === "audit") {
   run("audit", parseAuditArgs(process.argv.slice(3)), runAudit);
 } else if (subcommand === "foundry") {
-  // foundry's parser signals --help by returning USAGE as the error rather
-  // than by setting a `help` flag; normalize it onto the shared tail.
-  const parsed = parseFoundryArgs(process.argv.slice(3));
-  run("foundry", parsed.ok ? parsed : { ...parsed, help: parsed.error === FOUNDRY_USAGE }, runFoundryExport);
+  // Plain shared tail: parseFoundryArgs sets `help: true` on --help like every
+  // other parser here. This branch used to re-derive help by comparing the
+  // error against FOUNDRY_USAGE and spread that verdict OVER the parser's
+  // flag, so the flag was dead and any byte of drift between the two strings
+  // sent `foundry --help` to stderr with exit 2.
+  run("foundry", parseFoundryArgs(process.argv.slice(3)), runFoundryExport);
 } else if (subcommand === "install") {
   const parsed = parseInstallArgs(process.argv.slice(3));
   // --help is now a successful parse with helpRequested=true (parser
@@ -162,7 +164,7 @@ if (subcommand === "compliance") {
   run("trust", parseTrustArgs(process.argv.slice(3)), runTrust);
 } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
   process.stdout.write(`
-  yaw-mcp — one install, every MCP server, managed from one place.
+  yaw-mcp -- one install, every MCP server, managed from one place.
 
   Quickstart:
     1. Install yaw-mcp      yaw-mcp install claude-code
@@ -353,8 +355,6 @@ if (subcommand === "compliance") {
                                intents that carry names or other PII.
     YAW_MCP_CATALOG_URL          Override the catalog \`add\`/\`try\` resolve slugs
                                against (default https://yaw.sh/data/mcp-catalog.json).
-    YAW_MCP_BASE_URL              Base URL \`yaw-mcp try\` resolves its links
-                               against (default https://yaw.sh/mcp).
 
   Environment variables without the YAW_MCP_ prefix (they name things yaw-mcp
   does not own):
@@ -363,6 +363,12 @@ if (subcommand === "compliance") {
                                or an absolute path; set it when oam is installed
                                somewhere PATH does not reach. Default: \`oam\`
                                (\`oam.exe\` on Windows).
+    OAM_MAX_HEAP_MB               Read by oam, not by yaw-mcp: raises the V8
+                               heap cap oam applies to a hosted server (4 GiB
+                               by default since oam 0.9.2). Set it in that
+                               server's \`env\` in bundles.json when a hosted
+                               sidecar dies with a heap out-of-memory error,
+                               or give that server \`"runtime": "node"\`.
     MCP_CONNECT_TIMEOUT           Milliseconds to wait for a server's MCP
                                handshake (default 15000). This is the FALLBACK
                                only -- a server's own \`connectTimeoutMs\` in
@@ -381,10 +387,11 @@ if (subcommand === "compliance") {
                                slow server is otherwise down-ranked in the
                                reliability lines \`discover\` renders.
     CLAUDE_CONFIG_DIR             Claude Code's config directory, honored by
-                               \`yaw-mcp install claude-code\` so a non-default
-                               location is written instead of ~/.claude. Read
-                               only at install time; it is Claude Code's knob,
-                               not yaw-mcp's.
+                               \`install\`, \`try\` and \`doctor\` whenever they
+                               locate Claude Code's config, so a non-default
+                               location is read and written instead of
+                               ~/.claude. It is Claude Code's knob, not
+                               yaw-mcp's; the server itself never reads it.
     LOG_LEVEL                     Verbosity of yaw-mcp's own JSON log lines on
                                stderr: \`debug\` | \`info\` | \`warn\` | \`error\`
                                (default info). \`debug\` is what to set when
@@ -423,7 +430,8 @@ if (subcommand === "compliance") {
 } else if (subcommand !== undefined && !subcommand.startsWith("-")) {
   // Bare positional first arg that isn't a known subcommand — almost
   // always a typo. Surface a "did you mean?" instead of falling through
-  // to runServer, which would then fail opaquely on the missing token.
+  // to runServer, which would silently boot a stdio MCP server on a dead
+  // prompt (there is no token to fail on -- yaw-mcp is local-only).
   //
   // The test is `!== undefined`, NOT truthiness: `yaw-mcp ""` passes an
   // empty first argument, which is a bare positional with no leading dash
@@ -514,7 +522,10 @@ async function runServer(): Promise<void> {
 
   // Surface non-fatal config warnings on startup so the user sees them
   // (e.g., loose file perms, schema-version mismatch). Doctor shows the
-  // full picture; this is just a heads-up.
+  // full picture; this is just a heads-up. The resolved config is handed to
+  // server.start() below so the files are read ONCE and each warning is
+  // logged once -- start() used to re-load them and drop its copy of the
+  // warnings on the floor.
   for (const w of config.warnings) {
     log("warn", "Config warning", { warning: w });
   }
@@ -545,7 +556,7 @@ async function runServer(): Promise<void> {
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
 
-  server.start().catch((err: unknown) => {
+  server.start({ config }).catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
     log("error", "Fatal startup error", { error: msg });
     process.exit(1);

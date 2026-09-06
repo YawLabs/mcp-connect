@@ -128,7 +128,11 @@ export async function atomicWriteFile(
   let preserved: number | undefined;
   if (mode === undefined && process.platform !== "win32") {
     try {
-      preserved = (await stat(target)).mode & 0o7777;
+      // 0o777, not 0o7777: the PERMISSION bits are what "carry the perms
+      // forward" means. setuid / setgid / sticky describe the old inode's
+      // role (a target that inherited setgid from its directory, say) and a
+      // tmp file BORN with them is a surprise nobody asked for.
+      preserved = (await stat(target)).mode & 0o777;
     } catch {
       // ENOENT (fresh file) or an unstattable target -- nothing to carry.
     }

@@ -5,7 +5,8 @@
 `src/tests/foundry-routing.test.ts` is a BM25 routing-regression gate that
 consumes a corpus of **real harvested dispatches**. That corpus has never been
 produced, so the gate has never run. It reports itself as a `todo` plus a
-stderr banner on every `npm test`; it does not fail CI.
+stderr banner on every `npm test`; it does not fail `npm test` (there is no CI
+by policy -- the local gates `release.sh` runs are the release check).
 
 **The fixture is deliberately absent, not missing by accident.** Read the
 "Do not hand-write this file" section before you try to make the gate green.
@@ -40,7 +41,7 @@ This gate exists only to add the thing that file cannot have: real traffic.
    Harvesting is off by default and no other value enables it.
 
    Traces append to `~/.yaw-mcp/foundry.jsonl` (one JSON line per dispatch:
-   redacted tokens, candidate namespaces, chosen namespace). The file is
+   redacted tokens, chosen namespace, redacted-token count). The file is
    capped at 5 MiB; past that, new traces are dropped rather than rotated.
    Collect enough dispatches that the corpus is worth gating on -- a handful
    of entries makes a floor that measures noise.
@@ -68,6 +69,17 @@ This gate exists only to add the thing that file cannot have: real traffic.
 5. **Commit it.** The gate activates on the next `npm test` with no code
    change: the test file loads this path at module scope and branches on it.
 
+   You are not betting the harvest on that handoff working. The export -> load
+   contract -- that what `runFoundryExport` writes is something
+   `loadFoundryCorpus` accepts, i.e. that the export lands the gate in state 3
+   rather than its hard-fail state 2 -- is asserted end to end in
+   `src/tests/foundry-activation.test.ts`, against a temp home and a temp
+   `--out`. It drives the real writer and the real export (no `readTraces`
+   hook, so the traces come off disk exactly as they do here); only the
+   server-catalog load is injected. What it cannot tell you is anything about
+   YOUR traffic: whether the corpus is big enough to gate on, and whether its
+   token bags are safe to commit, are still step 2 and step 4 above.
+
 6. **Ratchet the floor.** The export prints the measured BM25-floor top-1 and
    top-3 for the corpus it just wrote. Raise `FOUNDRY_TOP3_FLOOR` in
    `src/foundry-corpus.ts` toward (just under) the measured top-3, so the gate
@@ -91,9 +103,19 @@ A synthetic corpus at this path would be worse than the honest skip:
   `yaw-mcp foundry export`, so the first real export overwrites it without
   warning.
 
-If you want to exercise the gate's machinery without harvesting, the
-self-check at the bottom of `src/tests/foundry-routing.test.ts` already does
-that with an inline probe corpus that never touches disk.
+If you want to exercise the gate's machinery without harvesting, two tests
+already do, and neither one writes to this directory:
+
+- the self-check at the bottom of `src/tests/foundry-routing.test.ts` proves
+  the gate can go RED, using an inline probe corpus that never touches disk;
+- `src/tests/foundry-activation.test.ts` proves an exported corpus reaches the
+  gate at all -- harvest, export off disk, load, score -- against a temp home
+  and a temp `--out`.
+
+Both are mechanism tests over invented intents and an invented catalog, and
+both say so in their headers. Neither measures routing, and neither is a
+substitute for the real corpus: they cover the plumbing, so that the only
+thing still missing from this directory is real traffic.
 
 ### If the fixture exists but the gate still says it is dormant
 

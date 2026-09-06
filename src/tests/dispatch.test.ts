@@ -99,15 +99,128 @@ describe("handleDispatch", () => {
     expect(result.content[0].text).toContain("intent is required");
   });
 
-  it("errors when no servers are configured", async () => {
+  it("errors when no servers are configured, naming the local add path", async () => {
     const priv = getPrivate(server);
     priv.config = { configVersion: "v1", servers: [] };
     const result = await priv.handleDispatch("do something", 1);
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("No servers installed");
+    const text = result.content[0].text;
+    expect(text).toContain("No servers installed");
+    // dispatch is the documented FIRST call, so this is the fresh-install
+    // path. The hosted add UI at yaw.sh/mcp it used to point at is gone
+    // (control plane retired); the CLI that works and where its result
+    // lands are the answer. Same text as discover's empty state, so the two
+    // cannot drift apart again.
+    expect(text).toContain("yaw-mcp add <slug>");
+    expect(text).toContain("~/.yaw-mcp/bundles.json");
+    expect(text).not.toContain("Add servers at yaw.sh/mcp");
+    expect(text).toEqual(priv.handleDiscover().content[0].text);
   });
 
-  it("errors when no installed server matches the intent", async () => {
+  it("errors when every installed server is disabled, naming the bundles.json toggle", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [makeServerConfig({ namespace: "gh", name: "GitHub", isActive: false })],
+    };
+    const result = await priv.handleDispatch("do something", 1);
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain("No servers enabled");
+    // "Enable servers at yaw.sh/mcp" named a hosted toggle that no longer
+    // exists; the fix is a local edit.
+    expect(text).toContain('"isActive": true');
+    expect(text).toContain("~/.yaw-mcp/bundles.json");
+    expect(text).not.toContain("yaw.sh/mcp");
+  });
+
+  it("names the blocked namespace and the profile's allow list when the profile keeps every server out", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [makeServerConfig({ namespace: "gh", name: "GitHub" })],
+    };
+    priv.profile = { path: "/proj/.yaw-mcp/config.json", servers: ["linear"] };
+    const result = await priv.handleDispatch("do something", 1);
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain("No servers enabled");
+    expect(text).toContain("project profile at /proj/.yaw-mcp/config.json");
+    expect(text).toContain('add "gh" to its "servers" allow list');
+    // gh is already active. The old text sent the model to bundles.json to
+    // flip a toggle that was already on, and to discover's disabled list,
+    // where a profile-blocked server never appears.
+    expect(text).not.toContain('"isActive": true');
+    expect(text).not.toContain("installed but disabled");
+    expect(text).not.toContain("yaw.sh/mcp");
+  });
+
+  it("points a block-listed namespace at the profile's blocked list, not its allow list", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [makeServerConfig({ namespace: "gh", name: "GitHub" })],
+    };
+    // An explicit "blocked" entry wins over the allow list (isAllowed), so
+    // adding gh to "servers" would change nothing -- the edit is the removal.
+    priv.profile = { path: "/proj/.yaw-mcp/config.json", blocked: ["gh"] };
+    const result = await priv.handleDispatch("do something", 1);
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain("project profile at /proj/.yaw-mcp/config.json");
+    expect(text).toContain('remove "gh" from its "blocked" list');
+    expect(text).not.toContain("allow list");
+    expect(text).not.toContain('"isActive": true');
+  });
+
+  it("names BOTH config files for a block-list edit when a user-global profile is layered under the project one", async () => {
+    // `blocked` is the UNION across scopes (config-loader's unionBlocked)
+    // while profile.path is only the primary file, so the entry that keeps
+    // the server out can live in the user-global config. Naming just the
+    // project file sent the model to edit a file with no "blocked" list in
+    // it -- it adds one there, nothing changes, and the server stays
+    // invisible.
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [makeServerConfig({ namespace: "gh", name: "GitHub" })],
+    };
+    priv.profile = {
+      path: "/proj/.yaw-mcp/config.json",
+      userPath: "/h/.yaw-mcp/config.json",
+      blocked: ["gh"],
+    };
+    const result = await priv.handleDispatch("do something", 1);
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain("/proj/.yaw-mcp/config.json");
+    expect(text).toContain("/h/.yaw-mcp/config.json");
+    expect(text).toContain("blocked lists merge across scopes");
+  });
+
+  it("names both fixes when one server is disabled and another is profile-blocked", async () => {
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({ namespace: "gh", name: "GitHub" }),
+        makeServerConfig({ namespace: "slack", name: "Slack", isActive: false }),
+      ],
+    };
+    priv.profile = { path: "/proj/.yaw-mcp/config.json", servers: ["linear"] };
+    const result = await priv.handleDispatch("do something", 1);
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain('add "gh" to its "servers" allow list');
+    expect(text).toContain('"isActive": true');
+    expect(text).toContain("~/.yaw-mcp/bundles.json");
+    // slack is disabled, not profile-blocked: the profile sentence must not
+    // name it, or the model edits the profile for a server bundles.json is
+    // keeping out.
+    expect(text).not.toContain('"slack"');
+  });
+
+  it("errors when no installed server matches the intent, pointing at the catalog + CLI", async () => {
     const priv = getPrivate(server);
     priv.config = {
       configVersion: "v1",
@@ -115,7 +228,13 @@ describe("handleDispatch", () => {
     };
     const result = await priv.handleDispatch("xylophone orchestration", 1);
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toMatch(/No installed server matches/);
+    const text = result.content[0].text;
+    expect(text).toMatch(/No installed server matches/);
+    // Same migration as the two empty states above: the browsable catalog
+    // plus the CLI, not the retired hosted add flow.
+    expect(text).toContain("https://yaw.sh/mcp/catalog/");
+    expect(text).toContain("yaw-mcp add <slug>");
+    expect(text).not.toContain("add a relevant server at yaw.sh/mcp");
   });
 
   it("activates only the top 1 by default", async () => {
@@ -412,6 +531,34 @@ describe("handleDiscoverWithAutoWarm", () => {
     // was already warm.
     expect(priv.sessionActivated.has("gh")).toBe(true);
     expect(result.content[0].text).toContain('Auto-loaded "gh"');
+  });
+
+  it("claims an already-connected winner away from prewarm, like activate and dispatch do", async () => {
+    // The already-connected shortcut bypasses activateOne, which is where an
+    // explicit activation deletes the prewarm claim. If the winner is a
+    // prewarm-owned connection at that instant (its teardown has not run
+    // yet), prewarm would close the very server this response calls
+    // "Auto-loaded".
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [
+        makeServerConfig({
+          id: "gh-id",
+          namespace: "gh",
+          name: "GitHub",
+          description: "Repos, issues, and pull requests on GitHub",
+        }),
+      ],
+    };
+    priv.connections.set("gh", makeConnection("gh", [{ name: "create_issue" }]));
+    priv.prewarmNamespaces.add("gh");
+
+    const result = await priv.handleDiscoverWithAutoWarm("file a github issue");
+
+    expect(result.content[0].text).toContain('Auto-loaded "gh"');
+    expect(priv.prewarmNamespaces.has("gh")).toBe(false);
+    expect(vi.mocked(connectToUpstream)).not.toHaveBeenCalled();
   });
 
   it("YAW_MCP_AUTO_ACTIVATE=0 disables the auto-warm entirely", async () => {

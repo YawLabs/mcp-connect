@@ -106,7 +106,7 @@ vi.mock("../local-bundles.js", async (importOriginal) => {
   };
 });
 
-import { CONFIG_FILENAME } from "../config-loader.js";
+import { CONFIG_FILENAME, type ResolvedConfig } from "../config-loader.js";
 import { gradesCachePath } from "../grades-cache.js";
 import { localBundlesPath } from "../local-bundles.js";
 import { CONFIG_DIRNAME } from "../paths.js";
@@ -277,8 +277,9 @@ async function driveInitialize(
  *  code is untouched) so the fire-and-forget call becomes awaitable. By
  *  default the downstream initialize handshake is driven too;
  *  `handshake: false` leaves the client un-initialized so the gating
- *  itself can be observed. */
-async function startServer(opts: { handshake?: boolean } = {}): Promise<Started> {
+ *  itself can be observed. `config` is handed to start() the way index.ts
+ *  hands its already-loaded ResolvedConfig in. */
+async function startServer(opts: { handshake?: boolean; config?: ResolvedConfig } = {}): Promise<Started> {
   const server = new ConnectServer();
   servers.push(server);
   const priv = server as any;
@@ -307,7 +308,7 @@ async function startServer(opts: { handshake?: boolean } = {}): Promise<Started>
     return autoLoadPromise;
   };
 
-  await server.start();
+  await server.start(opts.config ? { config: opts.config } : {});
   const transport = hoisted.transports[hoisted.transports.length - 1];
   if (opts.handshake !== false) {
     await driveInitialize(transport as any);
@@ -329,6 +330,38 @@ async function startServer(opts: { handshake?: boolean } = {}): Promise<Started>
 
 function namespacesOf(priv: any): string[] {
   return (priv.config?.servers ?? []).map((s: UpstreamServerConfig) => s.namespace);
+}
+
+/**
+ * Run `fn` with stderr captured, and hand back the JSON log lines logger.ts
+ * wrote while it ran (one object per line; a non-JSON line comes back as
+ * `{ raw }`). LOG_LEVEL is pinned blank for the duration so a developer
+ * running with LOG_LEVEL=warn does not silence the info line under test.
+ */
+async function captureLogs<T>(fn: () => Promise<T>): Promise<{ result: T; logs: Array<Record<string, unknown>> }> {
+  const written: string[] = [];
+  const spy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+    written.push(String(chunk));
+    return true;
+  }) as never);
+  vi.stubEnv("LOG_LEVEL", "");
+  try {
+    const result = await fn();
+    const logs = written
+      .flatMap((chunk) => chunk.split("\n"))
+      .filter((line) => line.length > 0)
+      .map((line): Record<string, unknown> => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return { raw: line };
+        }
+      });
+    return { result, logs };
+  } finally {
+    vi.unstubAllEnvs();
+    spy.mockRestore();
+  }
 }
 
 /** Namespaces connectToUpstream was actually asked to spawn, sorted. */
@@ -719,6 +752,24 @@ describe("ConnectServer.start() — opt-in auto-load of the recurring pack", () 
     expect((await listedUpstreamTools(priv)).sort()).toEqual(["gh_gh_live", "linear_linear_live"]);
   });
 
+  it("says why auto-load is skipped when persistence is disabled", async () => {
+    // The flag is set, but with YAW_MCP_DISABLE_PERSISTENCE there is no
+    // history to replay from, so the recurring pack never loads -- and
+    // nothing used to say so. `autoLoaded` is deliberately not awaited:
+    // autoLoadRecurringPack is never called on this path.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    process.env.YAW_MCP_AUTO_LOAD = "1";
+    process.env.YAW_MCP_DISABLE_PERSISTENCE = "1";
+
+    const { result, logs } = await captureLogs(() => startServer());
+    await result.prewarmed;
+
+    const skipped = logs.find((l) => typeof l.msg === "string" && l.msg.includes("skipping auto-load"));
+    expect(skipped).toBeDefined();
+    expect(String(skipped?.reason)).toContain("YAW_MCP_DISABLE_PERSISTENCE");
+    expect(result.priv.sessionActivated.size).toBe(0);
+  });
+
   it("auto-loads nothing when YAW_MCP_AUTO_LOAD is unset", async () => {
     // Negative control: identical history and servers, gate off. `autoLoaded`
     // is deliberately not awaited — start() never calls autoLoadRecurringPack
@@ -733,6 +784,49 @@ describe("ConnectServer.start() — opt-in auto-load of the recurring pack", () 
     // Pre-warm learned every server's tools and hung up; nothing stayed live.
     expect(priv.connections.size).toBe(0);
     expect(spawnedNamespaces()).toEqual(["gh", "linear", "solo"]);
+  });
+});
+
+describe("ConnectServer.start() — config warnings + handed-in config", () => {
+  it("logs the config loader's warnings when it loads the config itself", async () => {
+    // An embedded host constructs ConnectServer directly and never runs
+    // index.ts, which is where the CLI path logged these. A typo'd key fails
+    // OPEN to allow-all, so a silent load is the worst outcome.
+    writeBundles(synthHome, [serverEntry("gh")]);
+    writeUserConfigFile(CONFIG_FILENAME, { blocke: ["gh"] });
+
+    const { result, logs } = await captureLogs(() => startServer());
+    await result.prewarmed;
+
+    const warning = logs.find((l) => l.msg === "Config warning");
+    expect(warning).toBeDefined();
+    expect(String(warning?.warning)).toContain("'blocke'");
+    // ...and it did fail open: nothing is blocked.
+    expect(result.priv.profile).toBeNull();
+  });
+
+  it("uses a handed-in config without re-loading from disk or re-logging its warnings", async () => {
+    // index.ts loads the config before constructing the server (for the
+    // warnings, which it logs itself) and hands it in, so one read serves
+    // both. On disk: nothing blocked. Handed in: linear blocked. The profile
+    // must come from the argument, and its warnings are the caller's.
+    writeBundles(synthHome, [serverEntry("gh"), serverEntry("linear")]);
+    const configPath = join(synthHome, CONFIG_DIRNAME, CONFIG_FILENAME);
+    const config: ResolvedConfig = {
+      blocked: ["linear"],
+      projectConfigDir: null,
+      loadedFiles: [{ path: configPath, scope: "global", blocked: ["linear"] }],
+      warnings: ["already logged by the caller"],
+    };
+
+    const { result, logs } = await captureLogs(() => startServer({ config }));
+    await result.prewarmed;
+
+    expect(result.priv.profile?.blocked).toEqual(["linear"]);
+    expect(result.priv.profile?.path).toBe(configPath);
+    expect(logs.some((l) => l.msg === "Config warning")).toBe(false);
+    // The profile is really in effect: pre-warm skipped the blocked namespace.
+    expect(spawnedNamespaces()).toEqual(["gh"]);
   });
 });
 

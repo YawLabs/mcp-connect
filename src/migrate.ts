@@ -8,8 +8,12 @@
 //   <project>/.yaw-mcp.local.json   (machine-local, gitignored)
 //
 // 0.12 moved these under `.yaw-mcp/` so all yaw-mcp state lives in one
-// predictable dir. Existing 0.11.x users would otherwise see their token
-// silently disappear on upgrade. This migrator fixes that:
+// predictable dir. Existing 0.11.x users would otherwise see their
+// allow/deny lists (`servers` / `blocked`) silently disappear on upgrade --
+// the loader only discovers `.yaw-mcp/` dirs, so an unmigrated flat file is
+// read by nothing. (The flat file once also carried the hosted-backend
+// token; that backend is retired and the loader ignores the key, so the
+// lists are the whole surviving payload.) This migrator fixes that:
 //
 //   - Idempotent: if the new location already exists, DON'T overwrite.
 //   - Fail-open: a locked/unwritable path logs and continues — the
@@ -127,6 +131,20 @@ async function migrateFile(legacy: string, target: string, scope: string): Promi
       to: target,
     });
   } catch (err) {
+    // `exists(target)` above and the rename are a check-then-act pair, and
+    // config-loader memoizes the migration per PROCESS only: two yaw-mcp
+    // processes starting together (several MCP client panes) both pass the
+    // check, and the loser's rename ENOENTs on a file its sibling has already
+    // moved. That is the migration succeeding, not failing -- re-check both
+    // ends before warning about a file that is exactly where it should be.
+    if (!(await exists(legacy)) && (await exists(target))) {
+      log("info", "yaw-mcp config: legacy file was migrated by another yaw-mcp process meanwhile", {
+        scope,
+        from: legacy,
+        to: target,
+      });
+      return;
+    }
     log("warn", "yaw-mcp config: legacy migration failed -- leaving file in place", {
       scope,
       legacy,

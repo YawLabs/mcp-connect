@@ -24,11 +24,23 @@ describe("detectMissingCredentials", () => {
     expect(detectMissingCredentials("Missing required env var OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
   });
 
+  it("matches a colon directly after 'missing' or after 'env'", () => {
+    // Only the var/variable group tolerated a colon; "Missing env: X" and
+    // "missing: X" -- both common server phrasings -- matched nothing, because
+    // the `\s+` after "missing" and after "env" had no room for one.
+    expect(detectMissingCredentials("Missing env: OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
+    expect(detectMissingCredentials("missing: OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
+    expect(detectMissingCredentials("Missing environment: OPENAI_API_KEY")).toEqual(["OPENAI_API_KEY"]);
+  });
+
   it("does not eat a leading VAR out of the name itself", () => {
     // The var/variable group is optional, so it can match the NAME's own
     // first three letters. Without the mandatory whitespace after it, this
     // line elicits for "IANT_TOKEN" -- a name that does not exist.
     expect(detectMissingCredentials("Missing VARIANT_TOKEN")).toEqual(["VARIANT_TOKEN"]);
+    // Same trap for the env/environment group now that a colon may follow it:
+    // the group must not swallow the "ENV" of a name that starts with it.
+    expect(detectMissingCredentials("Missing ENV_TOKEN")).toEqual(["ENV_TOKEN"]);
   });
 
   it("matches 'X is not set'", () => {
@@ -100,6 +112,41 @@ describe("detectMissingCredentials -- only credential-shaped names elicit", () =
   it("does not match a credential word buried inside a longer segment", () => {
     // MONKEY_CAGE contains "KEY" as a substring but not as a segment.
     expect(detectMissingCredentials("MONKEY_CAGE is not set")).toEqual([]);
+  });
+
+  it("does not apply the substring fallback to a name that has underscores", () => {
+    // The fallback exists for names the segment split cannot see into
+    // (GITHUBTOKEN). Applied to every name, it made "TOKENIZER_PATH is
+    // required" pop a secret prompt for a file path: "TOKEN" is a whole word
+    // in the list, but it is also the head of an ordinary one.
+    expect(detectMissingCredentials("TOKENIZER_PATH is required")).toEqual([]);
+    expect(detectMissingCredentials("SECRETARY_EMAIL is not set")).toEqual([]);
+    // ...while the underscore-free shapes the fallback exists for still elicit.
+    expect(detectMissingCredentials("Missing env var GITHUBTOKEN")).toEqual(["GITHUBTOKEN"]);
+    expect(detectMissingCredentials("MYPASSWORD is required")).toEqual(["MYPASSWORD"]);
+  });
+
+  it("elicits for an underscored compound segment that ENDS in a credential noun", () => {
+    // The underscore gate above refused every underscored name whose
+    // credential word was glued into a longer segment, so these three -- all
+    // of which the substring test had caught before the gate -- stopped
+    // eliciting the day TOKENIZER_PATH was fixed.
+    expect(detectMissingCredentials("S3_SECRETKEY is required")).toEqual(["S3_SECRETKEY"]);
+    expect(detectMissingCredentials("SLACK_BOTTOKEN is not set")).toEqual(["SLACK_BOTTOKEN"]);
+    expect(detectMissingCredentials("Missing env var OAUTH_CLIENTSECRET")).toEqual(["OAUTH_CLIENTSECRET"]);
+    expect(detectMissingCredentials("DB_PASSWORDS must be set")).toEqual(["DB_PASSWORDS"]);
+    // A compound the set does not list still elicits on its suffix; AUTH on
+    // its own is deliberately not a credential segment (SSH_AUTH_SOCK), but
+    // AUTHTOKEN ends in TOKEN.
+    expect(detectMissingCredentials("MY_AUTHTOKEN is required")).toEqual(["MY_AUTHTOKEN"]);
+    // Suffix, not substring: the noun at the HEAD of a segment is an
+    // ordinary word, and these must keep refusing.
+    expect(detectMissingCredentials("TOKENIZER_PATH is required")).toEqual([]);
+    expect(detectMissingCredentials("SECRETARY_EMAIL is not set")).toEqual([]);
+    // KEY is kept off the suffix rule: English words end in it. -KEY
+    // compounds are enumerated instead (SECRETKEY above).
+    expect(detectMissingCredentials("MONKEY_CAGE is not set")).toEqual([]);
+    expect(detectMissingCredentials("TURKEY_MODE is required")).toEqual([]);
   });
 
   it("does not elicit for API_* configuration that is not a key", () => {

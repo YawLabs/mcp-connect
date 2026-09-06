@@ -139,15 +139,15 @@ describe("CLI dispatch -- help goes to stdout and exits 0", () => {
     expect(r.stderr).toBe("");
   });
 
-  it("prints foundry's usage, the one branch that recognizes help by string identity", () => {
-    // foundry's parser has no `help` flag: it signals --help by returning
-    // FOUNDRY_USAGE as the `error`, and index.ts re-labels that ONE exact
-    // string as help. Give the usage a prefix in foundry-cmd.ts the way its
-    // five siblings prefix theirs, or wrap it, and the identity check stops
-    // matching -- help moves to stderr with exit 2, `yaw-mcp foundry --help`
-    // prints nothing to stdout, `| less` shows a blank pager, and any script
-    // treating help as success starts failing. Nothing else in the repo
-    // covers this branch, so nothing else would go red.
+  it("prints foundry's usage on the shared tail, driven by the parser's help flag", () => {
+    // parseFoundryArgs returns `{ ok: false, error: FOUNDRY_USAGE, help: true }`
+    // and index.ts hands that straight to run(), like every sibling. It used
+    // to re-derive help by string identity (`error === FOUNDRY_USAGE`) and
+    // spread that verdict OVER the flag, so a prefix or a trailing newline on
+    // the usage body moved help to stderr with exit 2: `yaw-mcp foundry
+    // --help | less` showed a blank pager. Nothing else in the repo runs this
+    // branch, so this is the only thing that would go red if the identity
+    // check came back.
     const r = runCli(["foundry", "--help"]);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("Usage: yaw-mcp foundry export");

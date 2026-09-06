@@ -1,11 +1,13 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { describe, expect, it, vi } from "vitest";
+import { INTENT_MAX } from "../reward-grader.js";
 import {
   AGGRESSIVE_AMBIGUITY_THRESHOLD,
   BEST_OF_N_TEMPERATURE,
   bestOfNViaSampling,
   buildCandidates,
   buildTiebreakPrompt,
+  CANDIDATE_DESCRIPTION_MAX,
   computeAmbiguity,
   MAX_SAMPLES,
   parseRouteEffort,
@@ -81,6 +83,52 @@ describe("buildTiebreakPrompt", () => {
   it("tells the LLM to reply with just the namespace", () => {
     const prompt = buildTiebreakPrompt("x", candidates);
     expect(prompt.toLowerCase()).toContain("namespace");
+  });
+
+  it("caps a long intent at INTENT_MAX, the bound reward-grader.ts applies to the same field", () => {
+    // server.ts rejects only an EMPTY intent and passes the rest verbatim, and
+    // under "aggressive" this prompt goes out up to MAX_SAMPLES times per
+    // dispatch on the client's sampling budget -- for a one-word reply. A
+    // pasted document used to ride along in full on every one of those calls.
+    const prompt = buildTiebreakPrompt("z".repeat(INTENT_MAX + 300), candidates);
+    expect(prompt).toContain(`User intent: ${"z".repeat(INTENT_MAX)}...`);
+    expect(prompt).not.toContain("z".repeat(INTENT_MAX + 1));
+  });
+
+  it("leaves an intent exactly at the cap alone, with no marker", () => {
+    const prompt = buildTiebreakPrompt("y".repeat(INTENT_MAX), candidates);
+    expect(prompt).toContain(`User intent: ${"y".repeat(INTENT_MAX)}\n`);
+  });
+
+  it("never cuts a surrogate pair in half, in the intent or a description", () => {
+    // A pasted chat message with an emoji at the cap boundary. A lone high
+    // surrogate here reaches the client's LLM API as a lone escape, which a
+    // strict encoder rejects -- the tiebreak comes back a null vote for a
+    // reason nobody can see in the prompt.
+    const key = String.fromCodePoint(0x1f511);
+    const prompt = buildTiebreakPrompt(`${"z".repeat(INTENT_MAX - 1)}${key} rest`, [
+      {
+        namespace: "github",
+        score: 1,
+        description: `${"d".repeat(CANDIDATE_DESCRIPTION_MAX - 1)}${key} rest`,
+        tools: [],
+      },
+      { namespace: "gitlab", score: 0.95, description: "short", tools: [] },
+    ]);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(prompt)).toBe(false);
+    expect(prompt).toContain(`User intent: ${"z".repeat(INTENT_MAX - 1)}...`);
+  });
+
+  it("caps each candidate description at CANDIDATE_DESCRIPTION_MAX", () => {
+    // Descriptions come from local-bundles.ts with no bound of their own.
+    const prompt = buildTiebreakPrompt("x", [
+      { namespace: "github", score: 1, description: "d".repeat(CANDIDATE_DESCRIPTION_MAX + 100), tools: [] },
+      { namespace: "gitlab", score: 0.95, description: "short", tools: [] },
+    ]);
+    expect(prompt).toContain(`github -- ${"d".repeat(CANDIDATE_DESCRIPTION_MAX)}...`);
+    expect(prompt).not.toContain("d".repeat(CANDIDATE_DESCRIPTION_MAX + 1));
+    // An in-bounds description passes through untouched, no marker.
+    expect(prompt).toContain("gitlab -- short\n");
   });
 });
 

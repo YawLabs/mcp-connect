@@ -380,10 +380,11 @@ describe("rankServers (corpus-wide BM25)", () => {
     expect(rareQuery[0]?.score).toBeGreaterThan(commonQuery[0]?.score ?? 0);
   });
 
-  // Fix 5: bm25Score no longer accepts the dead `idf: Map<string,string>` param.
-  // rankServers must still produce correct scores after the signature cleanup.
-  it("produces the same scores before and after idf param removal (fix 5)", () => {
-    // Regression guard: removing the dead parameter must not change output.
+  // The two tests below started life as regression guards for the removal of
+  // a dead `idf` parameter from bm25Score. That parameter is long gone and
+  // there is nothing left to regress on, so they are named for what they
+  // actually assert.
+  it("returns a finite positive score for every server it ranks", () => {
     const servers = [
       {
         namespace: "gh",
@@ -401,16 +402,20 @@ describe("rankServers (corpus-wide BM25)", () => {
     const ranked = rankServers("create github issue", servers);
     // gh should rank first — create/issue both match gh fields.
     expect(ranked[0]?.namespace).toBe("gh");
-    // Both scores must be finite positive numbers (not NaN from a voided arg).
+    // Every ranked score must be a finite positive number: rankServers drops
+    // zero-scored servers, so a NaN or Infinity here is arithmetic gone wrong,
+    // not a legitimate "no match".
+    expect(ranked.length).toBeGreaterThan(0);
     for (const r of ranked) {
       expect(Number.isFinite(r.score)).toBe(true);
       expect(r.score).toBeGreaterThan(0);
     }
   });
 
-  it("rankServers scores are purely driven by idfValues, not the removed idf param (fix 5)", () => {
-    // A term unique to one server should score that server highly,
-    // confirming idfValues (the real Map<string,number>) is the active path.
+  it("a term unique to one server ranks only its owner", () => {
+    // Unlike "omits servers with zero score" above, this pins the single-match
+    // shape on a two-server corpus: the owner is the ONLY entry, and its score
+    // is positive rather than merely first.
     const servers = [
       { namespace: "only", name: "OnlyMatch", description: "xyzplonk unique term", tools: [] },
       { namespace: "other", name: "Other", description: "completely different", tools: [] },

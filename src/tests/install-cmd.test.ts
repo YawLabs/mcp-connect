@@ -9,10 +9,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Writable } from "node:stream";
+import { basename, join } from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  DRY_RUN_ENV_PLACEHOLDER,
   INSTALL_USAGE,
   mergeClientConfig,
   mergePermissionsAllow,
@@ -26,6 +27,27 @@ import { CLAUDE_CODE_ALLOW_PATTERN, CURRENT_OS, ENTRY_NAME } from "../install-ta
 import { parseJsonc } from "../jsonc.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH, type OamProbe, oamNoBinaryReason } from "../oam-spawn.js";
 
+/** Seam INSIDE install's settings.json read->write window. runInstall reads
+ *  settings.json AFTER the oam probe and the collision prompt, so the
+ *  `oamProbe` seam the client-config race tests use lands before that read
+ *  (a write there is simply merged onto). The one awaited step between the
+ *  read and the settings patch is the client-config publish, and this hook
+ *  runs ahead of every atomicWriteFile so a test can land a write exactly
+ *  there. Pass-through for every other test: the hook is null, and the real
+ *  write always follows. `vi.hoisted` so the object exists before the hoisted
+ *  mock factory closes over it; afterEach resets it. */
+const atomicWriteSeam = vi.hoisted(() => ({ beforeWrite: null as null | ((path: string) => void) }));
+vi.mock("../atomic-write.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../atomic-write.js")>();
+  return {
+    ...actual,
+    atomicWriteFile: async (...args: Parameters<typeof actual.atomicWriteFile>): Promise<void> => {
+      atomicWriteSeam.beforeWrite?.(args[0]);
+      return actual.atomicWriteFile(...args);
+    },
+  };
+});
+
 let synthHome: string;
 let synthCwd: string;
 
@@ -35,6 +57,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  atomicWriteSeam.beforeWrite = null;
   rmSync(synthHome, { recursive: true, force: true });
   rmSync(synthCwd, { recursive: true, force: true });
 });
@@ -357,34 +380,26 @@ describe("mergePermissionsAllow", () => {
     expect(perms.allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
   });
 
-  it("strips the pre-rename mcp__mcp_hosting__* legacy pattern on upgrade", () => {
-    const existing = { permissions: { allow: ["Bash(git *)", "mcp__mcp_hosting__*"] } };
-    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
-    const allow = (merged.permissions as { allow: string[] }).allow;
-    expect(allow).not.toContain("mcp__mcp_hosting__*");
-    expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
-    expect(allow).toContain("Bash(git *)");
-  });
-
-  it("strips every legacy brand's pattern — including mcp__mcph__*", () => {
-    // The strip table is derived from LEGACY_ENTRY_NAMES (mcp.hosting, mcph,
-    // yaw-mcp); a hand-kept copy silently omitted mcp__mcph__*, so the middle
-    // brand's dead wildcard survived every upgrade.
+  it("never strips a pre-rename legacy pattern, whichever brand spelled it", () => {
+    // This used to strip mcp__mcp_hosting__* / mcp__mcph__* / mcp__yaw_mcp__*
+    // unless the caller vouched for them. But the settings.json this feeds is
+    // GLOBAL at user scope and a run only ever sees the ONE container it is
+    // writing, so a legacy `yaw-mcp` entry still wired in a repo's .mcp.json
+    // (or another project's local scope) had its live grant revoked and Claude
+    // Code re-prompted on every tool call. Three dead wildcards are harmless;
+    // the strip is gone, and so is the `retain` escape hatch it needed.
     const existing = {
       permissions: { allow: ["mcp__mcp_hosting__*", "mcp__mcph__*", "mcp__yaw_mcp__*", "Read"] },
     };
     const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
     const allow = (merged.permissions as { allow: string[] }).allow;
-    expect(allow).toEqual(["Read", CLAUDE_CODE_ALLOW_PATTERN]);
-  });
-
-  it("retains mcp__mcph__* when the caller marks it still load-bearing", () => {
-    // Mirrors runInstall's behavior when the legacy `mcph` mcpServers entry is
-    // still wired: its grant is not dead, so `retain` protects it from the strip.
-    const existing = { permissions: { allow: ["mcp__mcph__*"] } };
-    const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN], ["mcp__mcph__*"]);
-    const allow = (merged.permissions as { allow: string[] }).allow;
-    expect(allow).toEqual(["mcp__mcph__*", CLAUDE_CODE_ALLOW_PATTERN]);
+    expect(allow).toEqual([
+      "mcp__mcp_hosting__*",
+      "mcp__mcph__*",
+      "mcp__yaw_mcp__*",
+      "Read",
+      CLAUDE_CODE_ALLOW_PATTERN,
+    ]);
   });
 
   it("REPLACES a non-array permissions.allow rather than preserving it", () => {
@@ -1176,6 +1191,67 @@ describe("runInstall — collision handling", () => {
     expect(readFileSync(join(synthHome, ".claude.json"), "utf8")).toBe(initial);
   });
 
+  it("takes the skip default when stdin hits EOF at the prompt, instead of hanging", async () => {
+    // A bare rl.question() never settles once its input closes (Ctrl+D, a
+    // pipe running dry), so a TTY run over an existing entry hung at the
+    // prompt forever. questionOrEmpty hands back "" on EOF -- the same answer
+    // a bare Enter gives, i.e. the documented `(default: skip)`.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
+    );
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, stdin, isTTY: true },
+      oamProbe: OAM_ABSENT,
+    });
+    // Close stdin without ever writing a line.
+    stdin.end();
+    const r = await pending;
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(cap.stdout()).toMatch(/left untouched/);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
+  });
+
+  it("Ctrl+C at the collision prompt is a cancel: 'Cancelled', exit 130, nothing written", async () => {
+    // Distinct from EOF: on a TTY readline owns the keypress, closes the
+    // interface and raises no process signal, so a close-only handler turned
+    // a cancel into the DEFAULT answer -- the run printed "left untouched"
+    // and exited 0 on a cancel. Every other prompt in the product exits 130.
+    // terminal:true is what makes readline own the keypress; ETX is built
+    // from its code so no control byte sits in this source file.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
+    );
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, stdin, isTTY: true, terminal: true },
+      oamProbe: OAM_ABSENT,
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write(String.fromCharCode(3));
+    const r = await pending;
+    expect(r.exitCode).toBe(130);
+    expect(r.written).toEqual([]);
+    expect(cap.stderr()).toMatch(/Cancelled/);
+    expect(cap.stdout()).not.toMatch(/left untouched/);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
+  });
+
   it("promptAnswer `skip` exits 0 and leaves the entry alone", async () => {
     // The interactive [s]kip answer -- also promptCollision's DEFAULT for a
     // bare Enter -- lands on the same branch as the --skip flag, but by a
@@ -1554,6 +1630,218 @@ describe("runInstall — --dry-run", () => {
     // Nothing renders the token any more -- the config.json dump is gone.
     expect(cap.stdout()).not.toContain("mcp_pat_super_secret_value");
     expect(cap.stderr()).not.toContain("mcp_pat_super_secret_value");
+  });
+
+  it("prints only the entry being added, never a sibling entry's env or the rest of settings.json", async () => {
+    // ~/.claude.json carries every server's env (a GitHub PAT here; a `yaw-mcp
+    // try` entry's inline API key in the wild) and settings.json has an `env`
+    // block of its own. The preview used to dump both files WHOLE, so a user
+    // who pasted the transcript into a bug report disclosed every one of them
+    // -- while the header promised a diff.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify(
+        { mcpServers: { github: { command: "npx", env: { GITHUB_TOKEN: "ghp_sibling_secret" } } } },
+        null,
+        2,
+      ),
+    );
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(
+      join(settingsDir, "settings.json"),
+      JSON.stringify({ env: { ANTHROPIC_API_KEY: "sk-ant-settings-secret" }, permissions: { allow: ["Bash(git *)"] } }),
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    expect(r.wouldWrite).toHaveLength(2);
+    const out = cap.stdout();
+    expect(out).not.toContain("ghp_sibling_secret");
+    expect(out).not.toContain("sk-ant-settings-secret");
+    // Not even the sibling's key or the pre-existing allow rule: nothing that
+    // is not changing is echoed.
+    expect(out).not.toContain('"github"');
+    expect(out).not.toContain("Bash(git *)");
+    // What WOULD change still previews: the entry at its container path and
+    // the permissions.allow delta.
+    expect(out).toContain('"mcpServers"');
+    expect(out).toContain(`"${ENTRY_NAME}"`);
+    expect(out).toContain('"npx"');
+    expect(out).toContain(`permissions.allow += ${JSON.stringify([CLAUDE_CODE_ALLOW_PATTERN])}`);
+  });
+
+  it("masks the values of the env it carries over from the existing entry, but still names its keys", async () => {
+    // The carry-over ahead of the preview keeps the existing entry's env
+    // verbatim, and README tells users to put YAW_MCP_VAULT_PASSPHRASE in
+    // exactly that block -- so rendering entryToWrite as-is printed the vault
+    // passphrase into the one output that exists to be pasted somewhere,
+    // under a comment claiming the preview no longer leaked.
+    const clientPath = join(synthHome, ".claude.json");
+    const original = JSON.stringify(
+      {
+        mcpServers: {
+          [ENTRY_NAME]: { command: "old", env: { YAW_MCP_VAULT_PASSPHRASE: "hunter2-vault-passphrase" } },
+        },
+      },
+      null,
+      2,
+    );
+    writeFileSync(clientPath, original);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toEqual([]);
+    const out = cap.stdout();
+    expect(out).not.toContain("hunter2-vault-passphrase");
+    expect(cap.stderr()).not.toContain("hunter2-vault-passphrase");
+    // The key survives in both places it is named: the carry-over line, and
+    // the previewed entry, where the placeholder stands in for the value.
+    expect(out).toContain(`Kept existing env on the ${ENTRY_NAME} entry: YAW_MCP_VAULT_PASSPHRASE`);
+    expect(out).toContain(`"YAW_MCP_VAULT_PASSPHRASE": ${JSON.stringify(DRY_RUN_ENV_PLACEHOLDER)}`);
+    // Preview only: the file still holds the real value, untouched.
+    expect(readFileSync(clientPath, "utf8")).toBe(original);
+  });
+
+  it("previews a local-scope entry under its projects[<dir>] nesting, so the user sees where it lands", async () => {
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "local",
+      os: "linux",
+      home: synthHome,
+      cwd: synthCwd,
+      dryRun: true,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    expect(r.exitCode).toBe(0);
+    const out = cap.stdout();
+    expect(out).toContain('"projects"');
+    expect(out).toContain(JSON.stringify(projectsKey(synthCwd)));
+    expect(out).toContain(`"${ENTRY_NAME}"`);
+  });
+});
+
+describe("runInstall — a client config that changes between read and write", () => {
+  // The read of ~/.claude.json and its publishing rename bracket an awaited
+  // `oam --version` probe (up to 3s) plus the collision prompt, and Claude
+  // Code writes that same file during a live session. The probe seam IS that
+  // window, so a write from inside it is what a concurrent save looks like.
+  it("refuses instead of clobbering a save that landed during the oam probe", async () => {
+    const clientPath = join(synthHome, ".claude.json");
+    writeFileSync(clientPath, JSON.stringify({ mcpServers: { other: { command: "x" } } }, null, 2));
+    const concurrent = JSON.stringify(
+      { mcpServers: { other: { command: "x" } }, projects: { "/repo": { allowedTools: ["Read"] } } },
+      null,
+      2,
+    );
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: async () => {
+        writeFileSync(clientPath, concurrent);
+        return OAM_ABSENT();
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    expect(cap.stderr()).toMatch(/changed while install was running/);
+    // The concurrent save survives byte-for-byte: no entry was merged over the
+    // pre-probe snapshot and published on top of it.
+    expect(readFileSync(clientPath, "utf8")).toBe(concurrent);
+    // Nothing downstream ran either -- the settings.json patch was never written.
+    expect(existsSync(join(synthHome, ".claude", "settings.json"))).toBe(false);
+  });
+
+  it("refuses when the file was absent at read time but exists by write time", async () => {
+    // The fresh-install shape of the same race: Claude Code creates
+    // ~/.claude.json while install is still deciding what to write into a file
+    // it believes does not exist.
+    const clientPath = join(synthHome, ".claude.json");
+    const concurrent = JSON.stringify({ mcpServers: { other: { command: "x" } } }, null, 2);
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: async () => {
+        writeFileSync(clientPath, concurrent);
+        return OAM_ABSENT();
+      },
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.stderr()).toMatch(/changed while install was running/);
+    expect(readFileSync(clientPath, "utf8")).toBe(concurrent);
+  });
+});
+
+describe("runInstall — settings.json that changes between its read and its patch", () => {
+  // The client-config guard above covered only the client config. settings.json
+  // is read AFTER the oam probe and the collision prompt but BEFORE the client
+  // config is published, and Claude Code rewrites settings.json on every
+  // permission approval -- so an approval landing during that publish was
+  // replaced by a patch computed on the pre-publish bytes, with no diagnostic.
+  // The publish is the one awaited step inside that window, which is what the
+  // atomicWriteSeam hook at the top of this file reaches.
+  it("skips the permissions patch with a warning, keeps the concurrent bytes, and still exits 0", async () => {
+    const settingsDir = join(synthHome, ".claude");
+    mkdirSync(settingsDir, { recursive: true });
+    const settingsPath = join(settingsDir, "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: ["Bash(git *)"] } }, null, 2));
+    // What an approval leaves behind: the same file, one more rule. A different
+    // byte length, so the fingerprint moves even on a coarse-mtime filesystem.
+    const concurrent = JSON.stringify({ permissions: { allow: ["Bash(git *)", "Bash(npm test)"] } }, null, 2);
+    atomicWriteSeam.beforeWrite = (path) => {
+      if (basename(path) === ".claude.json") writeFileSync(settingsPath, concurrent);
+    };
+    const cap = captureIo();
+    const r = await runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: cap.io,
+      oamProbe: OAM_ABSENT,
+    });
+    // The install itself succeeds: the launch entry landed, and only the
+    // settings patch was withheld.
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toHaveLength(1);
+    expect(r.written).not.toContain(settingsPath);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME].command).toBe("npx");
+    const stderr = cap.stderr();
+    expect(stderr).toMatch(/settings\.json changed while install was running/);
+    expect(stderr).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    // Not the client-config refusal, which names "nothing was written".
+    expect(stderr).not.toContain("nothing was written");
+    // The approval survives byte-for-byte: our pattern was not merged over the
+    // pre-publish snapshot and published on top of it.
+    expect(readFileSync(settingsPath, "utf8")).toBe(concurrent);
   });
 });
 
@@ -2566,7 +2854,7 @@ describe("runInstall — preserves the user's bytes and perms", () => {
   );
 });
 
-describe("runInstall — legacy allow-pattern stripping", () => {
+describe("runInstall — legacy allow-patterns are never stripped", () => {
   function seedSettings(allow: string[]): string {
     const settingsDir = join(synthHome, ".claude");
     mkdirSync(settingsDir, { recursive: true });
@@ -2605,9 +2893,16 @@ describe("runInstall — legacy allow-pattern stripping", () => {
     expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
   });
 
-  it("strips mcp__yaw_mcp__* once the legacy entry is gone", async () => {
-    // Nothing can match the wildcard any more, so it is genuinely dead and
-    // should not accumulate forever.
+  it("leaves mcp__yaw_mcp__* in place at user scope even when the file being written has no legacy entry", async () => {
+    // ~/.claude/settings.json is GLOBAL: its allow-list also covers a legacy
+    // `yaw-mcp` entry wired in some repo's .mcp.json (project scope) or under
+    // another project's local scope -- containers a user-scope install never
+    // reads. The old rule stripped the pattern whenever the ONE container this
+    // run writes lacked the entry, which revoked that still-running server's
+    // grant and made Claude Code re-prompt on every one of its tool calls: the
+    // same regression the previous test guards, one scope over. So install
+    // never strips. The stale ENTRY still gets its "remove it" note; the
+    // pattern goes when the user deletes the entry it serves.
     writeFileSync(join(synthHome, ".claude.json"), JSON.stringify({ mcpServers: {} }), "utf8");
     const settingsPath = seedSettings(["Bash(git *)", "mcp__yaw_mcp__*"]);
 
@@ -2623,8 +2918,7 @@ describe("runInstall — legacy allow-pattern stripping", () => {
     expect(r.exitCode).toBe(0);
     const allow = (JSON.parse(readFileSync(settingsPath, "utf8")) as { permissions: { allow: string[] } }).permissions
       .allow;
-    expect(allow).not.toContain("mcp__yaw_mcp__*");
-    expect(allow).toContain(CLAUDE_CODE_ALLOW_PATTERN);
+    expect(allow).toEqual(["Bash(git *)", "mcp__yaw_mcp__*", CLAUDE_CODE_ALLOW_PATTERN]);
   });
 });
 
@@ -2767,12 +3061,16 @@ describe("mergePermissionsAllow — non-string entries", () => {
     ]);
   });
 
-  it("still drops a dead legacy pattern sitting beside a non-string element", () => {
-    // Retention must not cost the legacy-wildcard cleanup: only the STRING
-    // elements are eligible for the drop, and they still get dropped.
+  it("keeps a legacy pattern sitting beside a non-string element, in place and in order", () => {
+    // Neither the legacy string (never stripped -- see the unit test above)
+    // nor the non-string neighbour is touched; our pattern is appended.
     const existing = { permissions: { allow: ["mcp__yaw_mcp__*", { rule: "custom" }] } };
     const merged = mergePermissionsAllow(existing, [CLAUDE_CODE_ALLOW_PATTERN]);
-    expect((merged.permissions as { allow: unknown[] }).allow).toEqual([{ rule: "custom" }, CLAUDE_CODE_ALLOW_PATTERN]);
+    expect((merged.permissions as { allow: unknown[] }).allow).toEqual([
+      "mcp__yaw_mcp__*",
+      { rule: "custom" },
+      CLAUDE_CODE_ALLOW_PATTERN,
+    ]);
   });
 
   it("a mixed-type allow array survives a real install", async () => {

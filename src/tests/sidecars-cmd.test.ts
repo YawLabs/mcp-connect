@@ -5,12 +5,22 @@
 // exercised against the filesystem is the manifest that gets written, since
 // that is the contract npm consumes.
 
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isRegistrySpec, type OamProbe } from "../oam-spawn.js";
 import {
+  acquireSidecarsLock,
   collectNonRegistrySpecs,
   collectRangeSpecs,
   collectSidecarSpecs,
@@ -18,6 +28,8 @@ import {
   installedVersion,
   parseSidecarsArgs,
   runSidecarsInstall,
+  SIDECAR_LOCK_HEARTBEAT_MS,
+  SIDECARS_LOCK_NAME,
   sidecarsManifest,
   sidecarsNodeModules,
   sidecarsPlatformPath,
@@ -294,6 +306,56 @@ describe("installedPlatform", () => {
   });
 });
 
+describe("acquireSidecarsLock", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "sidecars-lock-"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("is ONE lock for both writers: a second take fails while the first is held", () => {
+    // The manual CLI and sidecar-refresh's background install both go through
+    // this function on the sidecars root, so two npm reify passes cannot land
+    // on one node_modules at once. Reddens if either caller grows a lock of
+    // its own under a different name -- they would then serialize only against
+    // themselves.
+    const first = acquireSidecarsLock(dir);
+    expect(first).not.toBeNull();
+    expect(existsSync(join(dir, SIDECARS_LOCK_NAME))).toBe(true);
+    expect(acquireSidecarsLock(dir), "a live holder must read as contention").toBeNull();
+
+    first?.();
+    expect(existsSync(join(dir, SIDECARS_LOCK_NAME)), "release removes the file").toBe(false);
+    const second = acquireSidecarsLock(dir);
+    expect(second).not.toBeNull();
+    second?.();
+  });
+
+  it("keeps a held lock's mtime fresh, so a long install is not stolen as stale", () => {
+    // auto-upgrade's stale-steal window is ten minutes, sized for its own
+    // seconds-long hold; a whole-tree install on a cold cache can outlast it,
+    // after which a second writer reads the lock as abandoned and runs npm
+    // beside a live one. The heartbeat is what keeps the mtime inside the
+    // window for as long as the holder lives. Fake timers drive the interval
+    // AND the Date the touch writes, so the mtime has to move by the advance.
+    vi.useFakeTimers();
+    const release = acquireSidecarsLock(dir);
+    expect(release).not.toBeNull();
+    const lock = join(dir, SIDECARS_LOCK_NAME);
+    const taken = statSync(lock).mtimeMs;
+
+    vi.advanceTimersByTime(3 * SIDECAR_LOCK_HEARTBEAT_MS);
+
+    // A second of slack for filesystem timestamp granularity; the advance is
+    // three minutes, so a heartbeat that stopped firing is unmistakable.
+    expect(statSync(lock).mtimeMs - taken).toBeGreaterThanOrEqual(3 * SIDECAR_LOCK_HEARTBEAT_MS - 1000);
+    release?.();
+  });
+});
+
 describe("parseSidecarsArgs", () => {
   it("requires the install verb rather than defaulting to it", () => {
     // A bare `yaw-mcp sidecars` must not start installing packages; the verb
@@ -327,6 +389,18 @@ const JSON_KEYS = [
   "conflicts",
   "skipped",
 ].sort();
+
+/** The ordinary installable server, for the tests below that are about the
+ *  install's surroundings (the lock) rather than about the config. */
+const FETCH_SERVER = {
+  id: "1",
+  name: "F",
+  namespace: "fetch",
+  type: "local",
+  transport: "stdio",
+  command: "npx",
+  args: ["-y", "@yawlabs/fetch-mcp@latest"],
+};
 
 describe("runSidecarsInstall", () => {
   let home: string;
@@ -1229,5 +1303,137 @@ describe("runSidecarsInstall", () => {
     const text = res.lines.join("\n");
     expect(text).toContain("@yawlabs/postgres-mcp@latest");
     expect(text).toContain("installing @yawlabs/postgres-mcp@1.0.0");
+  });
+
+  // ---------------------------------------------------------------------
+  // The lock. sidecar-refresh's background refresh runs this same command
+  // from inside `serve`, so a human running it by hand can land on a tree
+  // another process is mid-reify on. Two npm passes rewriting one
+  // node_modules at once tear package dirs, and each reports its own exit
+  // code with no idea the other ran. The CLI used to take no lock at all.
+  // ---------------------------------------------------------------------
+
+  it("refuses to run npm while another process holds the sidecars lock", async () => {
+    writeBundles([FETCH_SERVER]);
+    let out = "";
+    let npmCalled = false;
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      json: true,
+      out: (s) => {
+        out += s;
+      },
+      acquireLock: () => null,
+      runNpm: async () => {
+        npmCalled = true;
+        return 0;
+      },
+    });
+
+    expect(npmCalled, "a second npm on a tree another process is reifying").toBe(false);
+    // Exit 1 WITH `error`: nothing was installed and the caller has to come
+    // back, which a script cannot learn from a clean document -- and exit 1
+    // with `error: null` is the shape the JSON tests above forbid.
+    expect(res.exitCode).toBe(1);
+    // The message NAMES the lock file: the holder may be a live refresh or a
+    // serve that was killed mid-install (the lock is honoured until its mtime
+    // goes stale for exactly that reason), and looking at the file is the one
+    // thing an operator can do with either.
+    expect(res.lines.join("\n")).toContain("try again");
+    expect(res.lines.join("\n")).toContain(join(sidecarsRoot(home), SIDECARS_LOCK_NAME));
+    const doc = JSON.parse(out);
+    expect(Object.keys(doc).sort()).toEqual(JSON_KEYS);
+    expect(doc.reason).toBe("locked");
+    expect(doc.error).not.toBeNull();
+    expect(doc.installed).toEqual([]);
+    // And the manifest was NOT rewritten under the other writer's feet: that
+    // write is already a change to what its npm is reifying against.
+    expect(existsSync(join(sidecarsRoot(home), "package.json"))).toBe(false);
+  });
+
+  it("takes the lock on the sidecars root before the manifest write and releases it after the last npm step", async () => {
+    writeBundles([FETCH_SERVER]);
+    const events: string[] = [];
+    let manifestExistedAtLock: boolean | null = null;
+
+    await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      oamProbe: noOam,
+      acquireLock: (dir) => {
+        events.push(`lock ${dir}`);
+        manifestExistedAtLock = existsSync(join(dir, "package.json"));
+        return () => events.push("release");
+      },
+      runNpm: async (args) => {
+        events.push(`npm ${args[0]}`);
+        return 0;
+      },
+    });
+
+    // The ROOT, not the home dir or node_modules: sidecar-refresh locks the
+    // same directory, and a lock on any other path would not contend with it.
+    expect(events).toEqual([`lock ${sidecarsRoot(home)}`, "npm install", "npm update", "release"]);
+    expect(manifestExistedAtLock, "the lock must precede the first byte written into the tree").toBe(false);
+  });
+
+  it("releases the lock when npm fails, so the next writer is not held off for the stale window", async () => {
+    // A lock left behind would keep the background refresh off this tree for
+    // auto-upgrade's whole stale window over a failure already reported.
+    writeBundles([FETCH_SERVER]);
+    const events: string[] = [];
+
+    const res = await runSidecarsInstall({
+      home,
+      cwd: home,
+      out: () => {},
+      acquireLock: () => () => events.push("release"),
+      runNpm: async (args) => {
+        events.push(`npm ${args[0]}`);
+        return 1;
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(events).toEqual(["npm install", "release"]);
+  });
+
+  it("excludes a second writer with the REAL lock, not only an injected one", async () => {
+    // The default path, end to end: hold the real lock -- the very
+    // acquireSidecarsLock the refresh's default takes, on the same root -- and
+    // the CLI must yield to it; release it and the same call must proceed and
+    // hand the lock back on its way out.
+    writeBundles([FETCH_SERVER]);
+    const root = sidecarsRoot(home);
+    mkdirSync(root, { recursive: true });
+    const held = acquireSidecarsLock(root);
+    expect(held).not.toBeNull();
+    let npmRuns = 0;
+    const run = () =>
+      runSidecarsInstall({
+        home,
+        cwd: home,
+        out: () => {},
+        oamProbe: noOam,
+        runNpm: async () => {
+          npmRuns += 1;
+          return 0;
+        },
+      });
+
+    try {
+      const blocked = await run();
+      expect(blocked.exitCode).toBe(1);
+      expect(npmRuns, "npm ran into a tree another process holds").toBe(0);
+    } finally {
+      held?.();
+    }
+
+    await run();
+    expect(npmRuns, "install and update, once the holder is gone").toBe(2);
+    expect(existsSync(join(root, SIDECARS_LOCK_NAME)), "the CLI released its own take").toBe(false);
   });
 });

@@ -1,6 +1,8 @@
 // Cross-session persistence for session-scoped signal (learning +
 // detected packs + learned tool lists). Stored at `~/.yaw-mcp/state.json`.
-// Pure functions — ConnectServer owns the load/save lifecycle.
+// Functions with no state of their own except `saveChain` (see saveState),
+// which serializes every save in this process -- ConnectServer owns the
+// load/save lifecycle.
 //
 // Design principles:
 //   - Silent failure. A corrupt or unreadable state file must never
@@ -281,7 +283,9 @@ function countRawEntries(input: unknown): number {
 // .tmp- files (the pid-timestamp suffix makes the temp names unique),
 // and both would rename onto the same target. Atomic-rename means we
 // never see torn JSON, but the loser's increments are silently dropped.
-// Chaining via this promise serializes the writes; the .catch reset
+// Chaining via this promise serializes the writes -- ONE chain for every
+// path, not one per path: the only file anything saves is ~/.yaw-mcp/
+// state.json, so per-path granularity would buy nothing. The .catch reset
 // keeps a failed save from poisoning the chain for subsequent callers.
 //
 // The cross-process race (two yaw-mcp instances writing the same file) is

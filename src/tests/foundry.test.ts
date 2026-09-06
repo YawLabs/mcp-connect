@@ -8,11 +8,22 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
+import { appendFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendFoundryTrace, FOUNDRY_FILENAME, isFoundryEnabled, MAX_FOUNDRY_BYTES, redactIntent } from "../foundry.js";
 import { userConfigDir } from "../paths.js";
+
+// Passthrough spies over the two fs calls appendFoundryTrace makes, so a test
+// can read the MODE it asked for. Asserting the bits on disk instead pins
+// nothing on Windows (stat reports a synthetic 0o666) -- the only place this
+// suite runs -- and on POSIX would only measure the runner's umask. The real
+// fs still runs underneath, so every other case here behaves as before.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, mkdir: vi.fn(actual.mkdir), appendFile: vi.fn(actual.appendFile) };
+});
 
 describe("isFoundryEnabled", () => {
   const orig = process.env.YAW_MCP_FOUNDRY;
@@ -243,10 +254,6 @@ describe("appendFoundryTrace", () => {
 
   const trace = {
     tokens: ["create", "issue"],
-    candidates: [
-      { ns: "gh", score: 0.9 },
-      { ns: "gitlab", score: 0.4 },
-    ],
     chosen: "gh",
     redactedCount: 1,
   };
@@ -274,7 +281,7 @@ describe("appendFoundryTrace", () => {
   it("writes one JSON line when enabled, with no raw intent", async () => {
     process.env.YAW_MCP_FOUNDRY = "1";
     await appendFoundryTrace(trace, home);
-    const file = join(home, ".yaw-mcp", "foundry.jsonl");
+    const file = join(userConfigDir(home), FOUNDRY_FILENAME);
     const contents = readFileSync(file, "utf8");
     const lines = contents.trim().split("\n");
     expect(lines).toHaveLength(1);
@@ -294,9 +301,28 @@ describe("appendFoundryTrace", () => {
     process.env.YAW_MCP_FOUNDRY = "1";
     await appendFoundryTrace(trace, home);
     await appendFoundryTrace(trace, home);
-    const file = join(home, ".yaw-mcp", "foundry.jsonl");
+    const file = join(userConfigDir(home), FOUNDRY_FILENAME);
     const lines = readFileSync(file, "utf8").trim().split("\n");
     expect(lines).toHaveLength(2);
+  });
+
+  it("creates the harvest owner-only: 0o700 on the dir it makes, 0o600 on the file", async () => {
+    // Names, company names and ticket text survive redaction (see the file
+    // header), so on a multi-user host a harvest born at the umask default
+    // handed every token bag to any local user. The MODE handed to fs is the
+    // decision under test; whether the OS honours it is the OS's business.
+    process.env.YAW_MCP_FOUNDRY = "1";
+    await appendFoundryTrace(trace, home);
+    const dir = userConfigDir(home);
+    const file = join(dir, FOUNDRY_FILENAME);
+    const mk = vi.mocked(mkdir).mock.calls.find((c) => c[0] === dir);
+    expect(mk, "mkdir was never asked for the harvest dir").toBeDefined();
+    expect(mk?.[1]).toEqual({ recursive: true, mode: 0o700 });
+    const ap = vi.mocked(appendFile).mock.calls.find((c) => c[0] === file);
+    expect(ap, "appendFile was never asked for the harvest file").toBeDefined();
+    expect(ap?.[2]).toEqual({ encoding: "utf8", mode: 0o600 });
+    // And the line still landed through the passthrough.
+    expect(readFileSync(file, "utf8").trim().split("\n")).toHaveLength(1);
   });
 
   it("never throws even when the home path is invalid", async () => {
@@ -307,9 +333,9 @@ describe("appendFoundryTrace", () => {
 
   it("does not append when foundry.jsonl is already at the 5 MiB cap", async () => {
     process.env.YAW_MCP_FOUNDRY = "1";
-    const dir = join(home, ".yaw-mcp");
+    const dir = userConfigDir(home);
     mkdirSync(dir, { recursive: true });
-    const file = join(dir, "foundry.jsonl");
+    const file = join(dir, FOUNDRY_FILENAME);
     // Grow the file to exactly MAX_FOUNDRY_BYTES with truncate (sparse on most
     // filesystems) instead of allocating and writing 5 MiB of real bytes, and
     // measure with stat so the cap's worth of content is never pulled into the

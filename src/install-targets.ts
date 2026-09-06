@@ -109,7 +109,10 @@ export const INSTALL_TARGETS: InstallTarget[] = [
     label: "Claude Desktop",
     jsonShape: "mcpServers",
     availableOn: ["macos", "windows"],
-    notes: "Claude Desktop reads one file per OS — no project scope. Restart the app after editing.",
+    // ASCII `--`, not an em-dash: install prints this verbatim (`Note: ...`),
+    // and Claude Desktop is a Windows client -- on a console whose codepage is
+    // not UTF-8 the em-dash rendered as mojibake in the line the user reads.
+    notes: "Claude Desktop reads one file per OS -- no project scope. Restart the app after editing.",
     scopes: [
       {
         scope: "user",
@@ -478,15 +481,18 @@ const KNOWN_CMD_SHIM_LAUNCHERS = new Set(["npx", "npm", "pnpm", "yarn", "bunx"])
  *  re-parse. Listed so the common direct launchers get single-level
  *  (full-fidelity) escaping instead of the fail-safe shim depth.
  *
- *  `uvx` and `pipx` sit here, NOT in the shim set above, even though they are
- *  Python-ecosystem launchers: uv ships `uvx.exe` beside `uv.exe` (and yaw-mcp's
- *  own bootstrap installs exactly that native binary -- see uv-bootstrap.ts),
- *  and pipx installs `pipx.exe`. Calling them shims cost an arg a caret level it
- *  never spends: a no-space metachar arg was triple-caret escaped and reached
- *  uvx.exe as the corrupted `^&` instead of `&`, after ONE cmd parse. The
- *  residual risk is a user who hand-rolls their own `uvx.cmd` on PATH -- that
- *  arg is under-escaped -- but an explicit `uvx.cmd` spelling in the config is
- *  still caught by the extension test in isCmdShimLauncher. */
+ *  `uv`, `uvx` and `pipx` sit here, NOT in the shim set above, even though they
+ *  are Python-ecosystem launchers: uv ships `uv.exe` and `uvx.exe` as native
+ *  binaries (yaw-mcp's own bootstrap installs exactly that `uv.exe` -- see
+ *  uv-bootstrap.ts), and pipx installs `pipx.exe`. Calling them shims cost an
+ *  arg a caret level it never spends: a no-space metachar arg was triple-caret
+ *  escaped and reached uvx.exe as the corrupted `^&` instead of `&`, after ONE
+ *  cmd parse. Bare `uv` (a `uv run <srv>` upstream) was missing from this set
+ *  after uvx had been cured of that, so it fell through to the fail-safe shim
+ *  depth and uv.exe got the same corrupted arg. The residual risk is a user
+ *  who hand-rolls their own `uvx.cmd` on PATH -- that arg is under-escaped --
+ *  but an explicit `uvx.cmd` spelling in the config is still caught by the
+ *  extension test in isCmdShimLauncher. */
 const KNOWN_DIRECT_BINARIES = new Set([
   "node",
   "deno",
@@ -494,6 +500,7 @@ const KNOWN_DIRECT_BINARIES = new Set([
   "python",
   "python3",
   "py",
+  "uv",
   "uvx",
   "pipx",
   "ruby",
@@ -733,14 +740,14 @@ export const CLAUDE_CODE_ALLOW_PATTERN = "mcp__mcp__*";
  *  segment is absorbed by the env redirect). Project/local scopes are
  *  project-relative and unaffected.
  *
- *  `os` is DEAD and now optional: unlike pathFor (which spells a `display`
- *  string for the TARGET os), every path here is built with `node:path.join`
- *  against the runner's own platform -- the only thing a caller writing the
- *  file could use. It stays declared solely so the existing call sites keep
- *  compiling; new callers should omit it and old ones can drop it. */
+ *  No `os` parameter, unlike pathFor (which spells a `display` string for the
+ *  TARGET os): every path here is built with `node:path.join` against the
+ *  runner's own platform -- the only thing a caller writing the file could
+ *  use. A dead `os` option used to ride along for the sake of old call sites;
+ *  it was dropped once the last one stopped passing it. */
 export function resolveClaudeCodeSettingsPath(
   scope: InstallScope,
-  opts: { home: string; projectDir?: string; os?: InstallOS; claudeConfigDir?: string },
+  opts: { home: string; projectDir?: string; claudeConfigDir?: string },
 ): string | null {
   const { home, projectDir, claudeConfigDir } = opts;
   const cfgDir = claudeConfigDir && claudeConfigDir.length > 0 ? claudeConfigDir : null;

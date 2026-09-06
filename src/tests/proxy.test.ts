@@ -83,6 +83,23 @@ function withCapturedStderr<T>(fn: () => T): { writes: string[]; value: T } {
   }
 }
 
+/** withCapturedStderr for an async `fn`: the sync form restores the writer as
+ *  soon as `fn` RETURNS, which for a promise is before any of the awaited
+ *  work has logged anything. */
+async function withCapturedStderrAsync<T>(fn: () => Promise<T>): Promise<{ writes: string[]; value: T }> {
+  const writes: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  (process.stderr as { write: unknown }).write = (chunk: string | Uint8Array) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  };
+  try {
+    return { writes, value: await fn() };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
 /** Pin LOG_LEVEL for a describe whose assertions read captured stderr. */
 function pinLogLevel(): void {
   beforeEach(() => {
@@ -885,6 +902,64 @@ describe("routeToolCall — upstream failures", () => {
     const connections = new Map([["gh", callableWith(() => Promise.reject("transport closed"))]]);
     const result = await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections);
     expect(result.content[0].text).toBe("Error calling gh_create_issue: transport closed");
+  });
+});
+
+describe("upstream error text is scrubbed before it is logged", () => {
+  // error-category.ts's header says it: third-party servers routinely echo
+  // args and secrets in error text (URLs with api_key=, request bodies,
+  // tracebacks with locals). The three catch arms under test logged that text
+  // verbatim at error level, and for a stdio server stderr IS the client's
+  // on-disk log. The RESULT still carries the raw text -- the client needs it
+  // to debug -- so each case checks both sides of that line.
+  pinLogLevel();
+  const SECRET = "eyJhbGciOiJIUzI1NiJ9dEADbEEF";
+  const MESSAGE = `401 rejected Authorization: Bearer ${SECRET}`;
+
+  function loggedLine(writes: string[], msg: string): string {
+    const line = writes.find((w) => w.includes(msg));
+    expect(line, `expected a "${msg}" log line; got ${JSON.stringify(writes)}`).toBeDefined();
+    return line ?? "";
+  }
+
+  it("routeToolCall", async () => {
+    const conn = makeConnection("gh", ["create_issue"]);
+    (conn as any).client = { callTool: () => Promise.reject(new Error(MESSAGE)) };
+    const connections = new Map([["gh", conn]]);
+    const { writes, value } = await withCapturedStderrAsync(() =>
+      routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections),
+    );
+    const line = loggedLine(writes, "Tool call failed");
+    expect(line).not.toContain(SECRET);
+    expect(line).toContain("<redacted>");
+    // The model still sees the whole thing.
+    expect(value.content[0].text).toContain(SECRET);
+  });
+
+  it("routeResourceRead", async () => {
+    const conn = makeConnection("db", [], ["db://tables"]);
+    (conn as any).client = { readResource: () => Promise.reject(new Error(MESSAGE)) };
+    const connections = new Map([["db", conn]]);
+    const { writes, value } = await withCapturedStderrAsync(() =>
+      routeResourceRead("connect://db/db://tables", buildResourceRoutes(connections), connections),
+    );
+    const line = loggedLine(writes, "Resource read failed");
+    expect(line).not.toContain(SECRET);
+    expect(line).toContain("<redacted>");
+    expect(value.contents[0].text).toContain(SECRET);
+  });
+
+  it("routePromptGet", async () => {
+    const conn = makeConnection("gh", [], [], ["review_pr"]);
+    (conn as any).client = { getPrompt: () => Promise.reject(new Error(MESSAGE)) };
+    const connections = new Map([["gh", conn]]);
+    const { writes, value } = await withCapturedStderrAsync(() =>
+      routePromptGet("gh_review_pr", undefined, buildPromptRoutes(connections), connections),
+    );
+    const line = loggedLine(writes, "Prompt get failed");
+    expect(line).not.toContain(SECRET);
+    expect(line).toContain("<redacted>");
+    expect(value.messages[0].content.text).toContain(SECRET);
   });
 });
 

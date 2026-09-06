@@ -10,6 +10,7 @@ import {
   maybeRefreshSidecars,
   mergeSidecarRefreshState,
   parseSidecarRefreshState,
+  SIDECAR_REFRESH_START_DELAY_MS,
   SIDECAR_REFRESH_THROTTLE_MS,
   type SidecarRefreshDeps,
   type SidecarRefreshState,
@@ -305,6 +306,9 @@ function harness(over: Partial<SidecarRefreshDeps> = {}) {
   const hasManagedSidecarsImpl = vi.fn(over.hasManagedSidecarsImpl ?? ((_home?: string): boolean => true));
   const specsImpl = vi.fn(over.specsImpl ?? (async (): Promise<SidecarSpec[]> => [spec("a-mcp")]));
   const nowImpl = vi.fn(over.nowImpl ?? ((): number => NOW));
+  // Resolves at once by default: the delay's PLACEMENT is what the tests
+  // below pin, and a real minute would make every other assertion here wait.
+  const delayImpl = vi.fn(over.delayImpl ?? (async (_ms: number): Promise<void> => {}));
   // Both typed from the module's own exported shapes rather than a hand-copied
   // literal: the state is read-modify-written precisely so a key a newer build
   // adds survives, and a local `{ lastSidecarRefreshCheck?: number }` here
@@ -319,6 +323,7 @@ function harness(over: Partial<SidecarRefreshDeps> = {}) {
     hasManagedSidecarsImpl,
     specsImpl,
     nowImpl,
+    delayImpl,
     readStateImpl,
     writeStateImpl,
     home: over.home ?? HOME,
@@ -333,6 +338,7 @@ function harness(over: Partial<SidecarRefreshDeps> = {}) {
     hasManagedSidecarsImpl,
     specsImpl,
     nowImpl,
+    delayImpl,
     readStateImpl,
     writeStateImpl,
   };
@@ -407,6 +413,22 @@ describe("maybeRefreshSidecars", () => {
     expect(h.writeStateImpl).not.toHaveBeenCalled();
   });
 
+  it("re-reads the throttle after the start delay, so a pane that woke second does not probe", async () => {
+    // Two panes start inside the same minute: both pass the pre-delay gate
+    // (no stamp yet), both sleep. The first to wake stamps; the second used to
+    // load the config and probe the registry anyway, because the gate was
+    // decided once, before the sleep. The second read is what stops it.
+    const reads = vi.fn<() => SidecarRefreshState | null>();
+    reads.mockReturnValueOnce(null).mockReturnValueOnce({ lastSidecarRefreshCheck: NOW - 2_000 });
+    const h = harness({ readStateImpl: reads });
+    await maybeRefreshSidecars(h.deps);
+    expect(reads).toHaveBeenCalledTimes(2);
+    expect(h.delayImpl).toHaveBeenCalledTimes(1);
+    expect(h.specsImpl).not.toHaveBeenCalled();
+    expect(h.fetchLatestImpl).not.toHaveBeenCalled();
+    expect(h.writeStateImpl).not.toHaveBeenCalled();
+  });
+
   it("is throttled by a check made an hour ago", async () => {
     const h = harness({
       readStateImpl: vi.fn(() => ({ lastSidecarRefreshCheck: NOW - 60 * 60 * 1000 })),
@@ -464,6 +486,72 @@ describe("maybeRefreshSidecars", () => {
     await maybeRefreshSidecars(h.deps);
     expect(h.spawnRefreshImpl).toHaveBeenCalledTimes(1);
     expect(h.writeStateImpl).toHaveBeenCalledWith({ lastSidecarRefreshCheck: NOW });
+  });
+
+  it("waits out the start delay before it reads the config or the registry", async () => {
+    // server.ts fires this the instant the transport connects, which is when
+    // the client's first tools/list spawns servers from the very tree a
+    // refresh rewrites. The delay is what moves the rewrite off that burst,
+    // so it has to sit ahead of everything that reads the config or the
+    // registry. Reddens if the await is dropped or moved below the config
+    // read.
+    let go: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      go = resolve;
+    });
+    const h = harness({ delayImpl: vi.fn(() => gate) });
+
+    const run = maybeRefreshSidecars(h.deps);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(h.delayImpl).toHaveBeenCalledWith(SIDECAR_REFRESH_START_DELAY_MS);
+    expect(h.specsImpl).not.toHaveBeenCalled();
+    expect(h.fetchLatestImpl).not.toHaveBeenCalled();
+    // And nothing is recorded while the delay is pending: a `serve` that
+    // exits inside it has checked nothing, so it must check again on its next
+    // start rather than sit out a day on a check that never happened.
+    expect(h.writeStateImpl).not.toHaveBeenCalled();
+
+    go();
+    await run;
+    expect(h.fetchLatestImpl).toHaveBeenCalledWith("a-mcp");
+    expect(h.spawnRefreshImpl).toHaveBeenCalledTimes(1);
+    expect(h.writeStateImpl).toHaveBeenCalledWith({ lastSidecarRefreshCheck: NOW });
+  });
+
+  it("holds no delay at all on a start the cheap gates stop", async () => {
+    // The common no-op start -- no managed tree, a check within the last day,
+    // the opt-out -- must not park a timer: the delay sits AFTER those gates
+    // so it costs nothing on the machines (most of them) that never refresh.
+    const noTree = harness({ hasManagedSidecarsImpl: vi.fn(() => false) });
+    await maybeRefreshSidecars(noTree.deps);
+    expect(noTree.delayImpl).not.toHaveBeenCalled();
+
+    const throttled = harness({
+      readStateImpl: vi.fn(() => ({ lastSidecarRefreshCheck: NOW - 60 * 60 * 1000 })),
+    });
+    await maybeRefreshSidecars(throttled.deps);
+    expect(throttled.delayImpl).not.toHaveBeenCalled();
+
+    process.env.YAW_MCP_SIDECAR_REFRESH = "0";
+    const off = harness();
+    await maybeRefreshSidecars(off.deps);
+    expect(off.delayImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not resolve until an async state write has landed", async () => {
+    // The default write is atomic and therefore async. "Resolves once the
+    // check completes" has to include it, or a caller that awaits this and
+    // then reads the stamp back races the write. Reddens if recordCheck goes
+    // back to a fire-and-forget call of the writer.
+    let landed = false;
+    const h = harness({
+      writeStateImpl: vi.fn(async (_patch: SidecarRefreshStatePatch): Promise<void> => {
+        await new Promise((r) => setTimeout(r, 5));
+        landed = true;
+      }),
+    });
+    await maybeRefreshSidecars(h.deps);
+    expect(landed).toBe(true);
   });
 
   it("does NOT spawn and does NOT record the timestamp when the lock is held", async () => {
@@ -769,6 +857,14 @@ describe("user-global scope", () => {
     expect(opts.out).toBeTypeOf("function");
     expect(opts.err).toBeTypeOf("function");
     expect(opts.runNpm).toBeTypeOf("function");
+    // And a no-op lock, not the command's default: maybeRefreshSidecars already
+    // HOLDS the real sidecars lock when this install runs, and the default
+    // would take that same file again and read its own holder as "someone
+    // else" -- the refresh would refuse the install it took the lock for.
+    // Reddens if `acquireLock` is dropped from the options.
+    const release = opts.acquireLock?.(sidecarsRoot(HOME));
+    expect(release).toBeTypeOf("function");
+    expect(() => release?.()).not.toThrow();
   });
 });
 

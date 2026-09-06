@@ -63,7 +63,9 @@ export function userConfigDir(home: string = homedir()): string {
   return path.join(home, CONFIG_DIRNAME);
 }
 
-function normalizeForCompare(p: string): string {
+// Exported for doctor's shell-history dedupe, which keys on the same
+// case-folded spelling so a case-variant HISTFILE cannot double count.
+export function normalizeForCompare(p: string): string {
   // Case-fold on win32 AND darwin: both default to case-insensitive
   // filesystems (NTFS; APFS/HFS+ unless formatted case-sensitive), so a
   // case-variant spelling of $HOME must compare equal to the cwd's
@@ -141,17 +143,19 @@ export const ALLOW_UNOWNED_ENV = "YAW_MCP_ALLOW_UNOWNED_PROJECT_DIRS";
 // the trees the session actually visits.
 const warnedUntrustedDirs = new Set<string>();
 
-async function ownedByCurrentUser(candidate: string): Promise<boolean> {
+// `st` is the walk's OWN stat of the candidate -- the one that just proved it
+// is a directory. Re-statting here was a second syscall and a second TOCTOU
+// window on a path we had already examined, for no new information.
+//
+// `env` is the CALLER's environment, not process.env. doctor and guide thread
+// an injected env into this walk so a synthetic run can be probed; reading
+// process.env here made that injection a silent no-op for the one key the
+// walk cares about, and the tests only stayed green because they stubbed the
+// real environment as well.
+function ownedByCurrentUser(st: Awaited<ReturnType<typeof stat>>, env: NodeJS.ProcessEnv): boolean {
   const geteuid = (process as { geteuid?: () => number }).geteuid;
-  if (typeof geteuid !== "function") return process.env[ALLOW_UNOWNED_ENV] === "1";
-  try {
-    const st = await stat(candidate);
-    return typeof st.uid === "number" && st.uid === geteuid.call(process);
-  } catch {
-    // Can't verify ownership of a dir we just saw exist -- treat as
-    // hostile / racy and don't trust it.
-    return false;
-  }
+  if (typeof geteuid !== "function") return env[ALLOW_UNOWNED_ENV] === "1";
+  return typeof st.uid === "number" && st.uid === geteuid.call(process);
 }
 
 // Walks up from `start` looking for a `.yaw-mcp/` directory, stopping
@@ -161,7 +165,14 @@ async function ownedByCurrentUser(candidate: string): Promise<boolean> {
 // Why exclusive of $HOME: a `.yaw-mcp/` sitting at $HOME is the
 // user-global scope (handled separately by userConfigDir). Returning
 // it here would double-load it as both project and user-global.
-export async function findProjectConfigDir(start: string, home: string = homedir()): Promise<string | null> {
+// `env` feeds the ownership gate's ALLOW_UNOWNED_ENV opt-in (see
+// ownedByCurrentUser); callers that probe with a synthetic environment pass
+// theirs, everything else gets process.env.
+export async function findProjectConfigDir(
+  start: string,
+  home: string = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
   // os.homedir() is already the USERPROFILE reader on win32, and it is this
   // parameter's own default -- an empty explicit `home` just means "use the
   // default after all".
@@ -217,7 +228,7 @@ export async function findProjectConfigDir(start: string, home: string = homedir
         // or alias. Returning it here would double-load it as both project
         // and user-global scope; skip it and keep walking.
         log("debug", "Skipping a .yaw-mcp/ that resolves to the user-global config dir", { candidate });
-      } else if (boundedByHome || (await ownedByCurrentUser(candidate))) {
+      } else if (boundedByHome || ownedByCurrentUser(st, env)) {
         return candidate;
       } else {
         // Found but not trusted: skip it and keep walking, mirroring the

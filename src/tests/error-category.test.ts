@@ -3,8 +3,9 @@ import { classifyError, ERROR_CATEGORIES } from "../error-category.js";
 
 describe("classifyError", () => {
   // Test cases sourced from real failures observed in session
-  // transcripts on 2026-05-19 .. 2026-05-21 (mcp-hosting Recent
-  // failures dashboard investigation).
+  // transcripts on 2026-05-19 .. 2026-05-21 (an investigation of the
+  // since-retired hosted backend's "Recent failures" dashboard; the
+  // failure shapes outlived the dashboard).
   const cases: Array<[string, string, (typeof ERROR_CATEGORIES)[number]]> = [
     ["ssh_exec timeout", "Error calling ssh_ssh_exec [code=-32001]: MCP error -32001: Request timed out", "timeout"],
     ["bare 'timed out' phrasing", "upstream: connection timed out after 30s", "timeout"],
@@ -318,15 +319,18 @@ describe("classifyError", () => {
     }
   });
 
-  // Cross-repo drift tripwire. The mcp-hosting backend ships its own
-  // copy of this list in src/lib/connect-error-categories.ts; the
-  // ingest endpoint normalizes against it and drops unknown values to
-  // null. If someone widens this enum without bumping the backend's
-  // copy, every value of the new category gets silently dropped on
-  // ingest. Pin the literal contents here so adding/removing a member
-  // is a deliberate two-repo change (this test fails -> backend test
-  // also fails -> both have to be updated together).
-  it("ERROR_CATEGORIES is the exact pinned list (cross-repo drift tripwire)", () => {
+  // Drift tripwire for the one surviving consumer of these strings.
+  // reward.ts's ERROR_SHAPED_CATEGORIES names seven of the eight by literal
+  // (everything but upstream_error) to decide which soft failures score
+  // REWARD_ERROR_SHAPED. That set is typed ReadonlySet<ErrorCategory>, so a
+  // RENAMED or REMOVED member fails tsc over there -- but an ADDED member
+  // does not: it silently lands in the "not error-shaped" bucket, and a 200
+  // reply carrying the new category grades as a clean full-credit success.
+  // Pin the literal contents here so widening the enum is a deliberate
+  // two-file change (this test fails -> reward.ts's set has to decide
+  // whether the newcomer is error-shaped). The hosted backend that once kept
+  // its own copy of this list is retired; there is no second repo to update.
+  it("ERROR_CATEGORIES is the exact pinned list (reward.ts coupling tripwire)", () => {
     expect([...ERROR_CATEGORIES]).toEqual([
       "validation_error",
       "timeout",

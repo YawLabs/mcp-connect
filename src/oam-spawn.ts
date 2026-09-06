@@ -69,6 +69,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CURRENT_OS, type InstallOS } from "./install-targets.js";
+import { stripInternalSecretsFromEnv } from "./internal-secret-env.js";
 import { log } from "./logger.js";
 import { sidecarsNodeModules } from "./paths.js";
 
@@ -154,12 +155,23 @@ export function specConstraint(spec: string): SpecConstraint {
  *
  * sidecars-cmd.ts consumes this export too (a git/path spec cannot be a
  * dependency KEY in a generated manifest).
+ *
+ * Character-level, the rule is validate-npm-package-name's: each part of the
+ * name must survive encodeURIComponent unchanged. The looser "anything but a
+ * separator" shape this used to accept let through names npm itself refuses,
+ * and each of them broke a different consumer: a backslash in `foo\bar` is a
+ * path separator to the Windows lookup below (the very traversal the leading-
+ * character guard exists to stop), and `#`, `%` and `?` land raw in the
+ * registry URL sidecar-refresh builds from the name.
  */
 export function isRegistrySpec(spec: string): boolean {
   // A protocol (github:, file:, git+ssh:, http:) or a filesystem path.
   if (spec.includes(":") || /^[./~\\]/.test(spec)) return false;
   // @scope/name, or a bare name. npm forbids a leading "." or "_".
-  return /^(@[^/@\s]+\/)?[^./_@\s][^/@\s]*$/.test(packageName(spec));
+  const m = /^(?:@([^/]+)\/)?([^./_][^/]*)$/.exec(packageName(spec));
+  if (!m) return false;
+  const [, scope, name] = m;
+  return (scope === undefined || encodeURIComponent(scope) === scope) && encodeURIComponent(name) === name;
 }
 
 /**
@@ -794,6 +806,10 @@ function spawnVersionProbe(bin: string): Promise<string> {
       child = spawn(bin, ["--version"], {
         stdio: ["ignore", "pipe", "ignore"],
         windowsHide: process.platform === "win32",
+        // oam is a binary yaw-mcp did not write; README promises the vault
+        // passphrase is stripped from every child yaw-mcp starts, and this
+        // probe was one of two spawns that still inherited process.env whole.
+        env: stripInternalSecretsFromEnv(process.env),
       });
     } catch (err) {
       reject(err);
@@ -1146,9 +1162,15 @@ export function rewriteForOam(
     const spec = specIdx === -1 ? undefined : args[specIdx];
     if (!spec) return { command, args };
     if (spec.startsWith("-")) {
+      // The flag and the argv LENGTH, never the argv itself: everything after
+      // the flag belongs to the server, and a server's args are where a token
+      // rides (`--token <secret>`). The logger does no redaction, and
+      // LOG_LEVEL=debug is exactly what support asks a user to turn on before
+      // sending the client's log files over -- this was the one line in the
+      // broker that copied a server's whole command line into them.
       log("debug", "npx launch carries flags yaw-mcp does not parse; staying on npx instead of oam", {
         flag: spec,
-        args,
+        argc: args.length,
       });
       return { command, args };
     }
@@ -1207,6 +1229,22 @@ export function rewriteForOam(
  *  fragment is exactly how those three decisions drift apart. */
 const NPX_CACHE_MARKER = `${sep}_npx${sep}`;
 
+/** Every `_npx/<hash>/node_modules` under one `_npx` root, or `[]` when the
+ *  root cannot be read -- `npm cache clean` during a long-lived broker's life,
+ *  a pruned or unreadable directory. The catch is what keeps that a quiet node
+ *  fallback instead of an unhandled throw on the connect path. ONE body for the
+ *  two locators below, which differ only in how they find the root: a
+ *  byte-identical copy in each is how the two came to be maintained apart. */
+function npxHashNodeModules(npxRoot: string): string[] {
+  try {
+    return readdirSync(npxRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => join(npxRoot, e.name, "node_modules"));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * The `node_modules` directories of every npx install cache, derived from a
  * module path that lives under `_npx/<hash>/...`. When the broker is itself
@@ -1227,13 +1265,7 @@ export function npxCacheNodeModules(fromUrl: string = import.meta.url): string[]
   const idx = here.indexOf(NPX_CACHE_MARKER);
   if (idx === -1) return [];
   const npxRoot = here.slice(0, idx + NPX_CACHE_MARKER.length - sep.length); // ".../_npx"
-  try {
-    return readdirSync(npxRoot, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => join(npxRoot, e.name, "node_modules"));
-  } catch {
-    return [];
-  }
+  return npxHashNodeModules(npxRoot);
 }
 
 /**
@@ -1302,6 +1334,16 @@ function npmrcValue(raw: string): string {
  *  `_npx` readdir under it found nothing, and every npx sidecar quietly stayed
  *  on npx -- indistinguishable from "no sidecars installed".
  *
+ *  `${VAR}` references are expanded from the environment, because npm's config
+ *  layer does that to every value it loads from a file (@npmcli/config's
+ *  envReplace) and `cache=${XDG_CACHE_HOME}/npm` is how a dotfiles repo writes
+ *  a relocated cache. Left literal, the result was a directory that exists on
+ *  no machine, readdirSync threw, and every npx sidecar quietly stayed on npx.
+ *  Mirrored exactly, escapes included: `\${VAR}` is a literal `${VAR}` (an odd
+ *  run of backslashes escapes), and a name the environment does not carry is
+ *  left as written rather than replaced with "" -- which is what npm does too.
+ *  Expanded BEFORE the `~/` step below, in npm's order.
+ *
  *  `~/` is expanded, because npm expands it for path-typed config fields
  *  (@npmcli/config's parse-field) and `cache=~/.npm-cache` is a natural thing
  *  to write. Only the `~/` form, which is the only one npm itself expands -- a
@@ -1321,7 +1363,7 @@ function npmrcCache(file: string): string | null {
     // match `^\s*cache`.
     const m = /^\s*cache\s*=(.*)$/.exec(line);
     if (!m) continue;
-    const value = npmrcValue(m[1]);
+    const value = expandNpmrcEnv(npmrcValue(m[1]));
     // An empty value is skipped rather than latched as "the last one": it
     // cannot name a directory, and treating it as the winner would let a
     // stray `cache=` line erase a real setting above it.
@@ -1329,6 +1371,18 @@ function npmrcCache(file: string): string | null {
     last = value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
   }
   return last;
+}
+
+/** npm's envReplace, verbatim in behaviour: `${NAME}` becomes the environment's
+ *  value for NAME; an odd number of backslashes ahead of it escapes (half of
+ *  them survive, the reference stays literal); an even number is halved and
+ *  the reference expands; an unset NAME is left as the literal `${NAME}`. */
+function expandNpmrcEnv(value: string, env: NodeJS.ProcessEnv = process.env): string {
+  return value.replace(/(\\*)\$\{([^${}]+)\}/g, (orig, esc: string, name: string) => {
+    if (esc.length % 2 === 1) return orig.slice((esc.length + 1) / 2);
+    const val = env[name];
+    return esc.slice(esc.length / 2) + (val === undefined ? `\${${name}}` : val);
+  });
 }
 
 // Memoized PER fromUrl: the answer cannot change within a process, and this
@@ -1453,14 +1507,7 @@ function resolveNpmCacheDir(fromUrl: string): string | null {
  */
 export function npmCacheNpxNodeModules(cacheDir: string | null): string[] {
   if (!cacheDir) return [];
-  const npxRoot = join(cacheDir, "_npx");
-  try {
-    return readdirSync(npxRoot, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => join(npxRoot, e.name, "node_modules"));
-  } catch {
-    return [];
-  }
+  return npxHashNodeModules(join(cacheDir, "_npx"));
 }
 
 /**
@@ -1508,23 +1555,43 @@ interface PackageHit {
 function packageEntry(pkgDir: string, pkg: string): PackageHit | null {
   const pjPath = join(pkgDir, "package.json");
   if (!existsSync(pjPath)) return null;
-  let j: { bin?: string | Record<string, string>; main?: string; name?: string; version?: unknown };
+  // Parsed as `unknown` and narrowed by hand, because the SHAPE is as
+  // untrusted as the syntax: this reads every `_npx/<hash>` cache dir on the
+  // machine plus the managed tree, and a manifest that is valid JSON but not a
+  // package.json object (`null`, an array) or that declares a non-string bin
+  // (`"bin": {"x": 1}`) used to throw a TypeError out of the connect path.
+  // That throw is fatal where a null would have been free: upstream.ts wraps
+  // it as an ActivationError, and its one-shot node respawn only fires once the
+  // rewrite has been APPLIED -- which it never was, so the server fails to
+  // activate at all instead of staying on npx. The header's "never a
+  // correctness dependency" holds only if every malformed shape here is a null.
+  let parsed: unknown;
   try {
-    j = JSON.parse(readFileSync(pjPath, "utf8"));
+    parsed = JSON.parse(readFileSync(pjPath, "utf8"));
   } catch {
     return null;
   }
-  let rel: string | undefined;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const j = parsed as { bin?: unknown; main?: unknown; name?: unknown; version?: unknown };
+  let rel: unknown;
   if (typeof j.bin === "string") {
     rel = j.bin;
   } else if (j.bin && typeof j.bin === "object") {
     // Prefer the bin keyed by the unscoped name, then the full name, then the
     // first declared bin (servers often name the bin differently from the pkg).
+    // OWN keys only: a package whose unscoped name is "constructor" (or any
+    // other Object.prototype key) would otherwise read the prototype's function
+    // through a plain index, and that is not a path either.
+    const bins = j.bin as Record<string, unknown>;
+    const own = (key: unknown): unknown =>
+      typeof key === "string" && Object.hasOwn(bins, key) ? bins[key] : undefined;
     const unscoped = pkg.slice(pkg.lastIndexOf("/") + 1);
-    rel = j.bin[unscoped] ?? (j.name ? j.bin[j.name] : undefined) ?? Object.values(j.bin)[0];
+    rel = own(unscoped) ?? own(j.name) ?? Object.values(bins)[0];
   }
   if (!rel && typeof j.main === "string") rel = j.main;
-  if (!rel) return null;
+  // Anything but a non-empty string is not an entry -- and isAbsolute throws
+  // ERR_INVALID_ARG_TYPE on a non-string rather than returning false.
+  if (typeof rel !== "string" || rel.length === 0) return null;
   const entry = isAbsolute(rel) ? rel : join(pkgDir, rel);
   // A DECLARED entry is not an entry on disk. package.json is the manifest, not
   // the file listing: a `files` field that omits the bin, a partially pruned

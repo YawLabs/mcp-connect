@@ -17,9 +17,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../logger.js", () => ({ log: vi.fn() }));
 
-// Point cacheDir() at a throwaway temp dir so the exists(finalBin)
-// short-circuit in resolveUv never finds a real cached binary from a
-// previous developer bootstrap and skips the download path.
+// Point cacheDir() at a throwaway temp dir so the cached-binary short-circuit
+// in resolveUv (a non-empty finalBin stat) never finds a real cached binary
+// from a previous developer bootstrap and skips the download path.
 vi.mock("../paths.js", () => {
   const nodeOs = require("node:os");
   const nodePath = require("node:path");
@@ -123,15 +123,42 @@ describe("resolveUv checksum mismatch", () => {
     const wrongHash = createHash("sha256").update(Buffer.from("different-content")).digest("hex");
     const shaBody = Buffer.from(`${wrongHash}  uv-x86_64-pc-windows-msvc.zip\n`);
 
-    // resolveUv calls fetchWithRedirects twice: once for the archive, once
-    // for the .sha256 file. Both succeed (200) but the hashes won't match.
-    mockRequest
-      .mockResolvedValueOnce(fakeResponse(200, archiveBody) as never)
-      .mockResolvedValueOnce(fakeResponse(200, shaBody) as never);
+    // resolveUv calls fetchWithRedirects twice: the .sha256 sidecar, then the
+    // archive. Keyed on the URL rather than queued positionally, so the test
+    // asserts the checksum gate and not the fetch order: a positional queue
+    // handed the archive bytes to the sidecar fetch once the order changed,
+    // and the "mismatch" it produced was between two wrong operands.
+    mockRequest.mockImplementation((url: unknown) =>
+      Promise.resolve(fakeResponse(200, String(url).endsWith(".sha256") ? shaBody : archiveBody) as never),
+    );
 
     const err = await ensureUv().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toContain("checksum mismatch");
+  });
+});
+
+// ── fetch order: the sidecar first, so a missing sidecar costs no archive ──
+
+describe("resolveUv fetch order", () => {
+  it("fetches the .sha256 sidecar before the archive, so a missing sidecar never starts the download", async () => {
+    // A Promise.all over both let the tiny sidecar 404 (the shape of a
+    // UV_VERSION bump that outruns Astral's upload) while the 18-23 MB archive
+    // download carried on into memory with nothing to abort it -- each fetch
+    // arms its own AbortSignal.timeout and nothing cancelled the survivor.
+    // Sequential sidecar-first turns that into one small failed request.
+    const seen: string[] = [];
+    mockRequest.mockImplementation((url: unknown) => {
+      seen.push(String(url));
+      return Promise.resolve(fakeResponse(String(url).endsWith(".sha256") ? 404 : 200, Buffer.alloc(0)) as never);
+    });
+
+    const err = await ensureUv().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("failed: HTTP 404");
+    // Exactly one request, and it was the sidecar: the archive never started.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/\.sha256$/);
   });
 });
 
@@ -145,10 +172,11 @@ describe("fetchWithRedirects redirect following", () => {
     const correctHash = createHash("sha256").update(finalBody).digest("hex");
     const shaBody = Buffer.from(`${correctHash}  archive.zip\n`);
 
-    // URL-keyed, NOT a positional mockResolvedValueOnce chain: resolveUv runs
-    // Promise.all([fetchWithRedirects(archiveUrl), fetchWithRedirects(shaUrl)]),
-    // so the concurrent sha fetch consumed the queued archive 200 and the
-    // checksum never passed -- the very thing this test is named for went
+    // URL-keyed, NOT a positional mockResolvedValueOnce chain: resolveUv
+    // fetches the .sha256 sidecar and then the archive, and a positional queue
+    // bakes that order into the mock -- when the two ran concurrently under
+    // Promise.all, the sha fetch consumed the queued archive 200 and the
+    // checksum never passed, so the very thing this test is named for went
     // unasserted. Keying on the URL makes each fetch get its own response, and
     // only the FIRST archive-URL hit redirects (the CDN target does not end in
     // .sha256 either, so it correctly falls through to the archive branch).
@@ -173,12 +201,13 @@ describe("fetchWithRedirects redirect following", () => {
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).not.toContain("checksum mismatch");
 
-    // Both fetches start concurrently, so the calls are:
+    // The sidecar is fetched first, then the archive, so the calls are:
+    //   shaUrl -> 200
     //   archiveUrl -> 302
-    //   shaUrl -> 200 (sha fetch, runs concurrently, resolves immediately)
     //   redirect Location -> 200 (archive follow-through)
     expect(mockRequest).toHaveBeenCalledTimes(3);
     const urls = mockRequest.mock.calls.map((c) => (c as [string, ...unknown[]])[0]);
+    expect(urls[0]).toMatch(/\.sha256$/);
     expect(urls).toContain("https://cdn.example.com/uv.zip");
   });
 });

@@ -374,7 +374,7 @@ describe("runAdd", () => {
     expect(io.errText()).toMatch(/no server with slug/i);
   });
 
-  // SLUG_RE is the gate the case-handling suite at the bottom of this file
+  // CATALOG_SLUG_RE is the gate the case-handling suite at the bottom of this file
   // leans on as established fact ("`add GA` is rejected at the gate") -- and it
   // is exit 2 (usage error), not the exit 1 an unknown-but-well-formed slug
   // gets, so the two failures stay distinguishable by a script. Nothing is
@@ -546,8 +546,50 @@ describe("runAdd", () => {
     expect(r.exitCode).toBe(0);
     const note = io.errText();
     expect(note).toContain("would CHANGE the entry's launch command");
-    expect(note).toContain("from: docker run old/fetch");
-    expect(note).toContain("to: npx -y @yawlabs/fetch-mcp");
+    // Rendered like the removal preview (`$ ` prefix, `HTTP ` for a url), so
+    // the two halves of the swap read the same way every other launch line
+    // in this command does.
+    expect(note).toContain("from: $ docker run old/fetch");
+    expect(note).toContain("to: $ npx -y @yawlabs/fetch-mcp");
+  });
+
+  // The preview's stated purpose is to describe the run it previews, and the
+  // real run ends on two stderr notes -- the ambient var the server will
+  // depend on, and the project file that shadows the write -- that the dry
+  // run used to return before. A user checking with --dry-run first saw
+  // neither.
+  it("--dry-run says the ambient shell value would NOT be persisted", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "github",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_shell" },
+      fetchCatalog,
+      out: () => {},
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).toMatch(/GITHUB_PERSONAL_ACCESS_TOKEN would be read from your shell env and NOT persisted/);
+    expect(io.errText()).not.toContain("ghp_shell");
+  });
+
+  it("--dry-run warns about the project file that would shadow the write", async () => {
+    writeUnapprovedProjectBundles();
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "fetch",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: { YAW_MCP_TRUST_PROJECT: "1" },
+      fetchCatalog,
+      out: () => {},
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.errText()).toMatch(/overrides your user-global bundles\.json, so this entry would not load/);
   });
 
   // A SET-BUT-EMPTY YAW_MCP_CATALOG_URL (a CI variable declared with no value,
@@ -970,9 +1012,16 @@ describe("runRemove", () => {
       err: () => {},
     });
     const io = captureIO();
+    // cwd + env are not optional hygiene: without them findProjectConfigDir
+    // walks up from the REAL process.cwd() and probes the developer's real
+    // ~/.yaw-mcp as project config (the run logged "Skipping an untrusted
+    // .yaw-mcp/ dir outside $HOME"), and on POSIX it is owned by the user, so
+    // the real user-global file was read and hashed by a unit test.
     const r = await runRemove({
       target: "fetch",
       home: synthHome,
+      cwd: synthCwd,
+      env: {},
       force: true,
       out: (s) => io.out.push(s),
       err: (s) => io.err.push(s),
@@ -1013,6 +1062,8 @@ describe("runRemove", () => {
     const r = await runRemove({
       target: "fetch",
       home: synthHome,
+      cwd: synthCwd,
+      env: {},
       out: (s) => io.out.push(s),
       err: (s) => io.err.push(s),
     });
@@ -1243,6 +1294,70 @@ describe("runRemove confirmation gate", () => {
     expect(bytes().equals(before)).toBe(true);
   });
 
+  // EOF at the prompt -- Ctrl+D, or a piped stdin that runs dry -- used to
+  // leave rl.question() pending forever: no "Aborted", the finally's
+  // rl.close() never ran, and the process ended by event-loop drain at status
+  // 0, so a wrapper checking $? read the decline as success. It has to settle
+  // as a NO. (A hang here fails on the test timeout.)
+  it("Ctrl+C at the prompt is a cancel: 'Cancelled', exit 130, bytes untouched", async () => {
+    // Distinct from EOF: readline closes the interface on the keypress with
+    // no process signal, and treating that as "" made the decline path
+    // answer for the user -- exit 1 and "Aborted" for what was a cancel.
+    // Every other prompt in the product exits 130 on Ctrl+C. terminal:true
+    // is what makes readline own the keypress, as it does on a TTY; ETX is
+    // built from its code so no control byte sits in this source file.
+    await addFetch();
+    const before = bytes();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    const io = captureIO();
+    const pending = runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: { stdin, stdout, terminal: true },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // Let the interface attach before the keypress lands.
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write(String.fromCharCode(3));
+    const r = await pending;
+    expect(r.exitCode).toBe(130);
+    expect(io.errText()).toMatch(/Cancelled/);
+    expect(io.errText()).not.toMatch(/Aborted/);
+    expect(r.written).toEqual([]);
+    expect(bytes().equals(before)).toBe(true);
+  });
+
+  it("EOF at the prompt settles as a decline: 'Aborted', exit 1, bytes untouched", async () => {
+    await addFetch();
+    const before = bytes();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const prompt: string[] = [];
+    stdout.on("data", (c: Buffer) => prompt.push(c.toString("utf8")));
+    // Ended with nothing written: the interface attaches and sees EOF at once.
+    stdin.end();
+    const io = captureIO();
+    const r = await runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: { stdin, stdout },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(prompt.join("")).toContain('Remove "fetch"? [y/N]');
+    expect(io.errText()).toMatch(/Aborted/);
+    expect(r.written).toEqual([]);
+    expect(bytes().equals(before)).toBe(true);
+  });
+
   it("a declined prompt (and a bare Enter) leaves bundles.json BYTE-identical", async () => {
     await addFetch();
     // "" is the bare Enter -- the default must be NO, not yes.
@@ -1406,6 +1521,21 @@ describe("runRemove confirmation gate", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(bytes().equals(before)).toBe(true);
+    // The second half of the name: the same raw entry IS deleted once the
+    // gate is satisfied. Without this the case only proved the refusal, and
+    // "would still delete" was an unasserted premise.
+    const forced = await runRemove({
+      target: "broken",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: false,
+      force: true,
+      out: () => {},
+      err: () => {},
+    });
+    expect(forced.exitCode).toBe(0);
+    const rawServers = (JSON.parse(readFileSync(bundlesPath(), "utf8")) as { servers: unknown[] }).servers;
+    expect(rawServers).toEqual([]);
   });
 
   // The gate parses with parseJsonc -- the SAME parser the write path uses.
@@ -1639,11 +1769,13 @@ describe("runList", () => {
     expect(lines.slice(1, 4).map((l) => l.split(/\s+/)[0])).toEqual(["alpha", "mid", "zebra"]);
   });
 
-  // rawEnvKeysByNamespace is first-entry-wins on a duplicated namespace,
-  // matching the write path's findIndex -- so a second entry sharing a
-  // namespace is reported with the FIRST one's keys rather than its own, and
-  // its stored value still never reaches stdout.
-  it("--json reports the first entry's env keys when two entries share a namespace", async () => {
+  // rawEnvKeysByNamespace keeps one queue of key lists per namespace, in file
+  // order, so each of two entries sharing a namespace is reported with its
+  // OWN keys. First-entry-wins used to copy the first duplicate's keys onto
+  // the second (and this test pinned that as intended) -- the second entry's
+  // required keys were simply misreported. Stored values still never reach
+  // stdout.
+  it("--json reports each entry's own env keys when two entries share a namespace", async () => {
     writeUserBundles({
       version: 1,
       servers: [
@@ -1663,7 +1795,7 @@ describe("runList", () => {
     const parsed = JSON.parse(io.text());
     expect(parsed.servers).toHaveLength(2);
     expect(parsed.servers[0].envKeys).toEqual(["FIRST_KEY"]);
-    expect(parsed.servers[1].envKeys).toEqual(["FIRST_KEY"]);
+    expect(parsed.servers[1].envKeys).toEqual(["SECOND_KEY"]);
     expect(io.text()).not.toContain("s3cret");
   });
 
@@ -2024,8 +2156,104 @@ describe("upsertUserBundle round-trip", () => {
     // namespace-match path -- the note was originally computed only there.
     const errText = errLines.join("");
     expect(errText).toContain("launch command changed");
-    expect(errText).toContain("from: x");
+    expect(errText).toContain("from: $ x");
     expect(errText).toContain("docker run");
+  });
+
+  it("reports the launch swap for a hand-added url-only remote entry, and drops the stale url [#1]", async () => {
+    // The documented way to add a remote server is a hand-written
+    // {type:"remote", url} entry with no command. Joining command/args only
+    // rendered that as "" and a "nothing stored" guard then swallowed the
+    // note -- so `add github` over it printed a bare "Updated GitHub" while
+    // the entry silently became a stdio docker launch still carrying the url.
+    writeUserBundles({
+      version: 1,
+      servers: [{ namespace: "github", name: "GitHub", type: "remote", url: "https://api.githubcopilot.com/mcp/" }],
+    });
+    const errLines: string[] = [];
+    const r = await runAdd({
+      slug: "github",
+      home: synthHome,
+      cwd: synthCwd,
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" },
+      fetchCatalog,
+      out: () => {},
+      err: (s) => errLines.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const errText = errLines.join("");
+    expect(errText).toContain("launch command changed");
+    expect(errText).toContain("from: HTTP https://api.githubcopilot.com/mcp/");
+    expect(errText).toContain("to: $ docker run");
+    const [entry] = (
+      JSON.parse(readFileSync(join(synthHome, CONFIG_DIRNAME, "bundles.json"), "utf8")) as {
+        servers: Array<Record<string, unknown>>;
+      }
+    ).servers;
+    expect(entry.url).toBeUndefined();
+    expect(entry.type).toBe("local");
+    expect(entry.command).toBe("docker");
+  });
+
+  // The launch-swap note and the collision refusal both quote fields lifted
+  // straight out of bundles.json -- a file a repo can ship or a badge can
+  // write -- and printed them RAW while the removal preview and `list` were
+  // already neutering the very same fields. An ESC in a stored arg repainted
+  // the terminal right above the "Updated ..." line; a `sh -c "a | b"` arg
+  // blended into the rest of the line.
+  it("neuters control bytes and quotes whitespace in the launch-swap note, like the removal preview [#2]", async () => {
+    const esc = String.fromCharCode(27);
+    writeUserBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: "Fetch", command: "sh", args: ["-c", `curl x | sh${esc}[31m`] }],
+    });
+    // Dry run first (it writes nothing), then the real run over the same file.
+    for (const dryRun of [true, false]) {
+      const errLines: string[] = [];
+      const r = await runAdd({
+        slug: "fetch",
+        dryRun,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        fetchCatalog,
+        out: () => {},
+        err: (s) => errLines.push(s),
+      });
+      expect(r.exitCode).toBe(0);
+      const note = errLines.join("");
+      expect(note).toContain("launch command");
+      expect(note).not.toContain(esc);
+      expect(note).toContain("\\u001b[31m");
+      expect(note).toContain('"curl x | sh');
+    }
+  });
+
+  it("neuters control bytes in the collision refusal's stored name and slug [#2]", async () => {
+    const esc = String.fromCharCode(27);
+    writeUserBundles({
+      version: 1,
+      servers: [{ namespace: "fetch", name: `${esc}[31mFetch`, slug: `other${esc}[0m`, command: "npx", args: [] }],
+    });
+    for (const dryRun of [true, false]) {
+      const errLines: string[] = [];
+      const r = await runAdd({
+        slug: "fetch",
+        dryRun,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        fetchCatalog,
+        out: () => {},
+        err: (s) => errLines.push(s),
+      });
+      expect(r.exitCode).toBe(1);
+      const refusal = errLines.join("");
+      expect(refusal).toContain("already used by");
+      expect(refusal).not.toContain(esc);
+      expect(refusal).toContain("\\u001b[31mFetch");
+      expect(refusal).toContain("\\u001b[0m");
+    }
   });
 
   it("namespace match wins over an earlier name match (two-pass lookup) [#1]", async () => {
@@ -2257,6 +2485,82 @@ describe("upsertUserBundle round-trip", () => {
   });
 });
 
+// readRawUserBundles drops an invalid top-level defaultRuntime on the way
+// through -- the rewrite then deletes the key from the file -- and the only
+// notice used to be a raw JSON log envelope on stderr, the one shape the
+// loader's own warnings deliberately avoid. add, remove and the dry run now
+// print it as `warning: ...`, exactly the way `list` prints load warnings.
+describe("write-path warnings reach the user as prose", () => {
+  const seed = (servers: unknown[]): void => writeUserBundles({ version: 1, defaultRuntime: "omm", servers });
+
+  it("add prints the dropped-defaultRuntime warning, on the real run and the dry run", async () => {
+    for (const dryRun of [true, false]) {
+      seed([{ namespace: "fetch", name: "Fetch", command: "npx" }]);
+      const io = captureIO();
+      const r = await runAdd({
+        slug: "fetch",
+        dryRun,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        fetchCatalog,
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode).toBe(0);
+      expect(io.errText()).toMatch(/^warning: .*defaultRuntime.*"omm"/m);
+    }
+  });
+
+  it("add prints them on the COLLISION path too, where the user is about to edit the file", async () => {
+    // The refusal sends the user into bundles.json to resolve the namespace
+    // clash, so a diagnostic about that same file -- here a defaultRuntime
+    // the loader dropped -- is exactly what they need before they open it.
+    // The dry run printed it and the real run threw the warnings away with
+    // the BundleCollisionError, which inverted the parity the preview is
+    // supposed to have with the run it previews.
+    seed([{ namespace: "github", name: "GitHub", slug: "github-enterprise", command: "other", args: [] }]);
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "github",
+      home: synthHome,
+      cwd: synthCwd,
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" },
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toMatch(/^warning: .*defaultRuntime.*"omm"/m);
+    expect(io.errText()).toContain('added as "github-enterprise"');
+    expect(r.written).toEqual([]);
+  });
+
+  it("remove prints it once, not once per candidate namespace it tried", async () => {
+    // Target "brave-search" tries the literal first (a miss that still reads
+    // the file) and only then the derived "bravesearch" -- two reads, one
+    // warning each, deduped to one line.
+    seed([{ namespace: "bravesearch", name: "Brave Search", command: "npx" }]);
+    const io = captureIO();
+    const r = await runRemove({
+      target: "brave-search",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      force: true,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(io.text()).toMatch(/Removed "bravesearch"/);
+    const hits = io
+      .errText()
+      .split("\n")
+      .filter((l) => l.startsWith("warning: ") && l.includes("defaultRuntime"));
+    expect(hits).toHaveLength(1);
+  });
+});
+
 describe("runAdd env-at-rest [#3]", () => {
   it("does NOT persist an ambient shell secret; seeds the key empty + warns", async () => {
     // GITHUB_PERSONAL_ACCESS_TOKEN comes from the SHELL (env), not --env.
@@ -2411,7 +2715,7 @@ describe("runRemove shadowing [#5] + removeUserBundle", () => {
   });
 });
 
-// `add GA` is rejected at the gate (SLUG_RE is lowercase-only) while `remove
+// `add GA` is rejected at the gate (CATALOG_SLUG_RE is lowercase-only) while `remove
 // GA` used to pass a case-INSENSITIVE shape check and then match nothing --
 // every lookup downstream is case-sensitive and every stored form is
 // lowercase. Same input, opposite verdicts, and the exit-0 "nothing to do"

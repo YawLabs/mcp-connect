@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MAX_EXEC_STEPS } from "../exec-engine.js";
 import { PENALTY_RATE_THRESHOLD } from "../learning.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "../meta-tools.js";
-import { SECRET_REF_RE } from "../secrets-vault.js";
+import { MALFORMED_REF_MARKER, MALFORMED_REF_MAX_CHARS, SECRET_REF_RE } from "../secrets-vault.js";
 
 describe("mcp_connect_secrets meta-tool definition", () => {
   it("is registered with values-free annotations", () => {
@@ -55,6 +55,15 @@ describe("meta-tool descriptions quote the constants that enforce them", () => {
     // that renders it -- this description is one of those surfaces.
     expect(META_TOOLS.health.description).toContain(`<${Math.round(PENALTY_RATE_THRESHOLD * 100)}%`);
   });
+
+  it("does not retype the idle-unload threshold in deactivate's description", () => {
+    // The real threshold is adaptive (ADAPTIVE_MIN..ADAPTIVE_MAX around a
+    // YAW_MCP_IDLE_THRESHOLD baseline, idle-ttl.ts), so any literal here is
+    // wrong for most servers most of the time. Name the knob, never a number.
+    const d = META_TOOLS.deactivate.description;
+    expect(d).not.toMatch(/\d+\+? tool calls/);
+    expect(d).toContain("YAW_MCP_IDLE_THRESHOLD");
+  });
 });
 
 describe("mcp_connect_exec description matches what handleExec does", () => {
@@ -86,7 +95,50 @@ describe("computeSecretsReport (names only, never values)", () => {
       },
     ];
     const rows = computeSecretsReport(servers, new Set(["gh"]));
-    expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: ["missing_one"] }]);
+    expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: ["missing_one"], malformed: [] }]);
+  });
+
+  it("names a reference the strict regex cannot parse in its own `malformed` column", () => {
+    // resolveServerEnv refuses the spawn over a malformed ref exactly as over
+    // a missing name, but the report scans with the strict regex, so until
+    // this column it said "gh: injected, nothing missing" about a server that
+    // will not start -- and a server whose ONLY ref is the typo got no row at
+    // all, reading as "needs no secrets".
+    const servers: Array<{ namespace: string; env?: Record<string, string> }> = [
+      { namespace: "typo-only", env: { T: "${secret:gh token}" } },
+      { namespace: "mixed", env: { A: "${secret:gh}", B: "${secret:absent}", C: "${secret:gh" } },
+    ];
+    const rows = computeSecretsReport(servers, new Set(["gh"]));
+    expect(rows).toEqual([
+      {
+        server: "typo-only",
+        injectedSecrets: [],
+        missing: [],
+        malformed: [`${MALFORMED_REF_MARKER} \${secret:gh ...`],
+      },
+      {
+        server: "mixed",
+        injectedSecrets: ["gh"],
+        missing: ["absent"],
+        malformed: [`${MALFORMED_REF_MARKER} \${secret:gh`],
+      },
+    ]);
+  });
+
+  it("quotes a malformed reference in secrets-vault's bounded display form, never the raw env value", () => {
+    // An unterminated ref runs to the end of the env value, which can carry
+    // anything the user put after the typo. This report goes to the model,
+    // so it gets the same control-stripped, capped form the refusal uses.
+    const servers = [
+      { namespace: "db", env: { URL: `\${secret:DB_PASS@db.internal:5432/prod?x=y&pw=${"z".repeat(200)}` } },
+    ];
+    const rows = computeSecretsReport(servers, new Set());
+    expect(rows).toHaveLength(1);
+    expect(rows[0].malformed).toHaveLength(1);
+    const [quoted] = rows[0].malformed;
+    expect(quoted.startsWith(`${MALFORMED_REF_MARKER} \${secret:DB_PASS`)).toBe(true);
+    expect(quoted.length).toBeLessThanOrEqual(MALFORMED_REF_MARKER.length + 1 + MALFORMED_REF_MAX_CHARS + 3);
+    expect(JSON.stringify(rows)).not.toContain("pw=");
   });
 
   it("reports only the vault keys this server references, never the whole key list", () => {
@@ -95,7 +147,7 @@ describe("computeSecretsReport (names only, never values)", () => {
     // an inventory of every credential the user holds.
     const servers = [{ namespace: "gh", env: { T: "${secret:gh}" } }];
     const rows = computeSecretsReport(servers, new Set(["gh", "aws", "slack"]));
-    expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: [] }]);
+    expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: [], malformed: [] }]);
     expect(JSON.stringify(rows)).not.toContain("aws");
     expect(JSON.stringify(rows)).not.toContain("slack");
   });
@@ -134,7 +186,7 @@ describe("computeSecretsReport (names only, never values)", () => {
     SECRET_REF_RE.lastIndex = 5;
     try {
       const rows = computeSecretsReport([{ namespace: "gh", env: { T: "${secret:gh}" } }], new Set(["gh"]));
-      expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: [] }]);
+      expect(rows).toEqual([{ server: "gh", injectedSecrets: ["gh"], missing: [], malformed: [] }]);
     } finally {
       SECRET_REF_RE.lastIndex = saved;
     }
@@ -146,7 +198,10 @@ describe("computeSecretsReport (names only, never values)", () => {
     const serialized = JSON.stringify(rows);
     // The only string that should appear is the NAME "gh", never a value.
     expect(serialized).toContain("gh");
-    // No env value content (the literal placeholder) leaks into the report.
+    // No env value content (the literal placeholder) leaks into the report
+    // for a WELL-FORMED ref. (The `malformed` column is the deliberate
+    // exception: it quotes the unparseable span, bounded, because the typo
+    // IS the diagnostic -- see the malformed cases above.)
     expect(serialized).not.toContain("${secret:");
   });
 });

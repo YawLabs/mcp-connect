@@ -15,6 +15,7 @@ import {
   runTry,
   runTryCleanup,
   scanTrials,
+  TRY_USAGE,
   type TrialMarker,
   trialGcFailureWarning,
   trialMarkerPath,
@@ -155,19 +156,31 @@ describe("parseTryArgs", () => {
     expect(r.ok).toBe(false);
   });
 
-  it("parses --dry-run + --base", () => {
-    const r = parseTryArgs(["demo", "--dry-run", "--base", "http://localhost:3000"]);
+  it("parses --dry-run + --yes (and -y)", () => {
+    const r = parseTryArgs(["demo", "--dry-run", "--yes"]);
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.options.dryRun).toBe(true);
-      expect(r.options.baseUrl).toBe("http://localhost:3000");
+      expect(r.options.yes).toBe(true);
     }
+    const short = parseTryArgs(["demo", "-y"]);
+    expect(short.ok).toBe(true);
+    if (short.ok) expect(short.options.yes).toBe(true);
+    const bare = parseTryArgs(["demo"]);
+    expect(bare.ok).toBe(true);
+    if (bare.ok) expect(bare.options.yes).toBeUndefined();
   });
 
-  it("rejects --base followed by a flag instead of swallowing --dry-run as the URL", () => {
-    const r = parseTryArgs(["demo", "--base", "--dry-run"]);
+  it("rejects --base now that the no-op is gone, instead of silently accepting it", () => {
+    // Parsed, threaded into the catalog seam and ignored there for one
+    // release (v0.79.x). A script still passing it now gets the same exit 2
+    // as any other unknown flag rather than a flag that pretends to work --
+    // and the usage no longer names it, or the env var nothing ever read.
+    const r = parseTryArgs(["demo", "--base", "http://localhost:3000"]);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/--base requires a URL/);
+    if (!r.ok) expect(r.error).toMatch(/Unknown flag: --base/);
+    expect(TRY_USAGE).not.toContain("--base");
+    expect(TRY_USAGE).not.toContain("YAW_MCP_BASE_URL");
   });
 
   it("rejects unknown flags", () => {
@@ -192,16 +205,10 @@ describe("parseTryCleanupArgs", () => {
     expect(parseTryCleanupArgs(["demo", "--bogus"]).ok).toBe(false);
   });
 
-  it("rejects --base followed by a flag instead of swallowing it as the URL", () => {
-    const r = parseTryCleanupArgs(["demo", "--base", "--help"]);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/--base requires a URL/);
-  });
-
-  it("still accepts --base with a real URL", () => {
+  it("rejects --base like any other unknown flag now that nothing reads it", () => {
     const r = parseTryCleanupArgs(["demo", "--base", "http://localhost:3000"]);
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.options.baseUrl).toBe("http://localhost:3000");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/Unknown flag: --base/);
   });
 
   it("rejects a bare '-' positional with a clear arg-parse error", () => {
@@ -1493,7 +1500,7 @@ describe("runTry — catalog URL threading", () => {
       env: catalogEnv,
       out: cap.pushOut,
       err: cap.pushErr,
-      fetchExplore: async (_base, _slug, catalogUrl) => {
+      fetchExplore: async (_slug, catalogUrl) => {
         seen.push(catalogUrl);
         return SAMPLE;
       },
@@ -1732,6 +1739,38 @@ describe("runTry — auto-detected client (no --client)", () => {
     expect(r.marker?.clientPath).toBe(clientPath);
     expect(JSON.parse(readFileSync(clientPath, "utf8")).mcpServers["yaw-mcp-try-demo"]).toBeDefined();
   });
+
+  it("skips a client whose config exists but cannot be READ, like one that does not parse", async () => {
+    // A directory at ~/.claude.json is the portable EISDIR; the real-world
+    // shape is a root-owned or other-user-0600 file (EACCES). The probe
+    // reports that as `unreadable`, not `malformed`, and auto-detect filtered
+    // on malformed alone -- so it picked claude-code as "the client in use"
+    // and runTry then aborted on the very read the probe had just watched
+    // fail, while a readable ~/.cursor/mcp.json sat one slot further along.
+    mkdirSync(join(synthHome, ".claude.json"), { recursive: true });
+    mkdirSync(join(synthHome, ".cursor"), { recursive: true });
+    const cursorPath = join(synthHome, ".cursor", "mcp.json");
+    writeFileSync(cursorPath, JSON.stringify({ mcpServers: { existing: { command: "x" } } }));
+
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => SAMPLE,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).not.toMatch(/could not be read/);
+    expect(r.marker?.clientName).toBe("cursor");
+    expect(r.marker?.clientPath).toBe(cursorPath);
+    const cursor = JSON.parse(readFileSync(cursorPath, "utf8"));
+    expect(cursor.mcpServers["yaw-mcp-try-demo"].command).toBe("npx");
+    expect(cursor.mcpServers.existing).toBeDefined();
+  });
 });
 
 describe("runTry — vscode has no user scope", () => {
@@ -1749,8 +1788,10 @@ describe("runTry — vscode has no user scope", () => {
       fetchExplore: async () => SAMPLE,
     });
     expect(r.exitCode).toBe(0);
-    // vscode flips the scope to "project", so the trial -- and any inline
-    // secret with it -- lands in a WORKSPACE file that is routinely committed.
+    // vscode flips the scope to "project", so the trial lands in a WORKSPACE
+    // file that is routinely committed. With no inline secret there is
+    // nothing to publish, so no --yes is needed and nothing is said about it.
+    expect(cap.errText()).toBe("");
     const workspacePath = join(synthCwd, ".vscode", "mcp.json");
     expect(existsSync(workspacePath)).toBe(true);
     const config = JSON.parse(readFileSync(workspacePath, "utf8"));
@@ -1761,6 +1802,123 @@ describe("runTry — vscode has no user scope", () => {
     expect(marker.clientName).toBe("vscode");
     expect(marker.clientPath).toBe(workspacePath);
     expect(marker.containerPath).toEqual(["servers"]);
+  });
+});
+
+describe("runTry -- inline secret bound for a project-scope (commit-to-share) file", () => {
+  // The auto-detect scenario: a repo ships .vscode/mcp.json, the developer
+  // has the token exported and no personal client config, and `yaw-mcp try`
+  // picks vscode -- whose only scope is the workspace file -- and copies the
+  // token inline into a file `git add -A` sweeps up. Nothing used to say so:
+  // the only secret-location note was the ambient-only one, and the 0600
+  // chmod protects local perms, not version control.
+  const workspacePath = (): string => join(synthCwd, ".vscode", "mcp.json");
+
+  function seedWorkspaceConfig(): void {
+    mkdirSync(join(synthCwd, ".vscode"), { recursive: true });
+    writeFileSync(workspacePath(), JSON.stringify({ servers: { existing: { command: "x" } } }));
+  }
+
+  it("refuses without --yes, names the file, the key and the hazard, and writes nothing", async () => {
+    seedWorkspaceConfig();
+    const before = readFileSync(workspacePath(), "utf8");
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      // No --client: auto-detect lands on vscode because its workspace file
+      // is the only client config that exists.
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: { FOO_TOKEN: "ambient-secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.written).toEqual([]);
+    // The workspace file is byte-identical and no marker was dropped.
+    expect(readFileSync(workspacePath(), "utf8")).toBe(before);
+    expect(existsSync(trialMarkerPath("demo", synthHome))).toBe(false);
+    const err = cap.errText();
+    expect(err).toContain(workspacePath());
+    expect(err).toMatch(/commit/i);
+    expect(err).toContain("FOO_TOKEN");
+    expect(err).not.toContain("ambient-secret");
+    expect(err).toContain("--yes");
+    // The way out that keeps the secret off the shared file.
+    expect(err).toMatch(/--client claude-code/);
+    expect(cap.text()).not.toMatch(/Trial wired/);
+  });
+
+  it("refuses under --dry-run too, so the preview never promises a write the real run declines", async () => {
+    seedWorkspaceConfig();
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "vscode",
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      envOverrides: { FOO_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(cap.text()).not.toMatch(/would write/);
+    expect(cap.errText()).toContain("--yes");
+  });
+
+  it("writes it with --yes, still warning on stderr", async () => {
+    seedWorkspaceConfig();
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "vscode",
+      yes: true,
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      envOverrides: { FOO_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.written).toContain(workspacePath());
+    const config = JSON.parse(readFileSync(workspacePath(), "utf8"));
+    expect(config.servers["yaw-mcp-try-demo"].env).toEqual({ FOO_TOKEN: "secret" });
+    expect(config.servers.existing).toBeDefined();
+    // --yes lifts the refusal, not the warning: the user is still told where
+    // the plaintext value now lives.
+    const err = cap.errText();
+    expect(err).toContain(workspacePath());
+    expect(err).toContain("FOO_TOKEN");
+    expect(err).not.toContain("refusing");
+    expect(cap.text()).toMatch(/Trial wired/);
+  });
+
+  it("never asks a user-scope target for --yes", async () => {
+    const cap = captureIO();
+    const r = await runTry({
+      slug: "demo",
+      clientId: "claude-code",
+      home: synthHome,
+      cwd: synthCwd,
+      os: "linux",
+      env: {},
+      envOverrides: { FOO_TOKEN: "secret" },
+      out: cap.pushOut,
+      err: cap.pushErr,
+      fetchExplore: async () => ({ ...SAMPLE, requiredEnvVars: ["FOO_TOKEN"] }),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(cap.errText()).not.toContain("--yes");
+    expect(cap.errText()).not.toMatch(/commit/i);
   });
 });
 

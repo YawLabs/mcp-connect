@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, constants, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -39,6 +39,79 @@ import {
   specConstraint,
   winNormalize,
 } from "../oam-spawn.js";
+
+// isExecutableFile (oam-spawn.ts) asks the REAL filesystem two questions --
+// statSync for "is this a regular file", accessSync(X_OK) for "would the loader
+// run it" -- and the two POSIX-side branches of resolveBinAbsolute need
+// fixtures a Windows runner cannot stage for either one. A ':'-joined PATH
+// cannot carry a drive-lettered temp path (it splits at the drive letter), and
+// X_OK is a no-op on Windows -- Node degrades it to F_OK -- so a chmod 0644
+// file still reads as executable there. Both tests were skipIf(win32) for that
+// reason, which in this repo meant they ran NOWHERE: there are no CI legs, and
+// release.sh runs the suite on the Windows machine that cuts the release.
+//
+// So the DISK is injected, not the decision. Only statSync/accessSync answers
+// for paths under SYNTH_ROOT come from the map below; every other path passes
+// straight through to node:fs, which is load-bearing -- almost every other
+// fixture in this file is a real temp dir. resolveBinAbsolute and
+// isExecutableFile run unmodified, including isExecutableFile's own
+// `platform !== "win32"` gate and its everything-is-"not the binary" catch, so
+// the assertions still measure the search rather than a stub of it. accessLog
+// records the X_OK calls the staged paths receive, which lets the tests pin the
+// DECISION -- X_OK demanded off Windows, never asked for on it -- and not just
+// its outcome.
+const { SYNTH_ROOT, fsKey, fsEntries, accessLog } = vi.hoisted(() => ({
+  SYNTH_ROOT: "/yaw-mcp-synthetic-posix",
+  // node:path is platform-NATIVE: a POSIX-shaped path run through join() comes
+  // back backslashed on a Windows runner. Both the map keys and the lookups
+  // are folded to forward slashes so the two spellings of one staged path
+  // cannot disagree.
+  fsKey: (p: string) => p.replace(/\\/g, "/"),
+  fsEntries: new Map<string, "exec" | "noexec">(),
+  accessLog: [] as { path: string; mode: number | undefined }[],
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  /** "exec"/"noexec" for a staged path, "absent" for an unstaged one under the
+   *  synthetic root (the map is authoritative there, so a real directory of
+   *  that name on the runner could not answer instead), and null for every
+   *  real path -- which passes through untouched. */
+  const staged = (target: unknown): "exec" | "noexec" | "absent" | null => {
+    if (typeof target !== "string") return null;
+    const key = fsKey(target);
+    if (!key.startsWith(`${SYNTH_ROOT}/`)) return null;
+    return fsEntries.get(key) ?? "absent";
+  };
+  const errno = (code: string, syscall: string, target: string): NodeJS.ErrnoException => {
+    const err: NodeJS.ErrnoException = new Error(`${code}: injected fs failure, ${syscall} '${target}'`);
+    err.code = code;
+    return err;
+  };
+  const statSync = ((target: unknown, ...rest: unknown[]) => {
+    const kind = staged(target);
+    if (kind === null) return (actual.statSync as (...a: unknown[]) => unknown)(target, ...rest);
+    if (kind === "absent") throw errno("ENOENT", "stat", String(target));
+    // A staged path is always a regular FILE: the directory-shaped candidate is
+    // covered by a real mkdir fixture (the "skips a DIRECTORY" test) and needs
+    // no injection, so isFile() is the only thing the search asks of this.
+    return { isFile: () => true, isDirectory: () => false };
+  }) as unknown as typeof actual.statSync;
+  const accessSync = ((target: unknown, mode?: number) => {
+    const kind = staged(target);
+    if (kind === null) return (actual.accessSync as (...a: unknown[]) => unknown)(target, mode);
+    accessLog.push({ path: String(target), mode });
+    if (kind === "absent") throw errno("ENOENT", "access", String(target));
+    // EACCES on an X_OK request is exactly what a real chmod 0644 file answers
+    // off Windows; anything weaker than X_OK (an F_OK existence check) still
+    // succeeds, so the staged file is "there but not runnable", not "missing".
+    if (kind === "noexec" && ((mode ?? actual.constants.F_OK) & actual.constants.X_OK) !== 0) {
+      throw errno("EACCES", "access", String(target));
+    }
+    return undefined;
+  }) as unknown as typeof actual.accessSync;
+  return { ...actual, statSync, accessSync };
+});
 
 describe("winNormalize", () => {
   it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
@@ -117,6 +190,22 @@ describe("isRegistrySpec", () => {
   it("rejects protocol and path specs, which npx accepts but a name lookup cannot", () => {
     for (const bad of ["github:owner/repo", "file:../x", "git+ssh://git@host/x.git", "./local-server", "~/x", "../x"]) {
       expect(isRegistrySpec(bad), bad).toBe(false);
+    }
+  });
+
+  it("rejects a name npm itself refuses, since each one broke a different consumer", () => {
+    // validate-npm-package-name's rule: every part must survive
+    // encodeURIComponent unchanged. A backslash is a path separator to the
+    // Windows lookup (the traversal the leading-character guard exists to
+    // stop); `#`, `%`, `?` and a space land raw in the registry URL
+    // sidecar-refresh builds from the name. Every one of these passed the old
+    // "anything but a separator" shape.
+    for (const bad of ["foo\\bar", "foo#bar", "foo%bar", "foo?bar", "foo bar", "@sc#ope/x", "@scope/_x"]) {
+      expect(isRegistrySpec(bad), bad).toBe(false);
+    }
+    // ...without losing the punctuation npm does allow.
+    for (const ok of ["some.pkg", "under_score-mcp", "@yaw-labs/x.y~z", "a-b@1.0.0"]) {
+      expect(isRegistrySpec(ok), ok).toBe(true);
     }
   });
 });
@@ -363,6 +452,31 @@ describe("resolveBinAbsolute", () => {
     return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
   }
 
+  /** A POSIX-shaped bin directory that exists only in the injected fs at the
+   *  top of this file, for the two branches a real temp dir cannot express on a
+   *  Windows runner (see that block for why). The path carries no drive letter,
+   *  so it survives a ':'-delimited PATH; `noexec` gives a file that stats as a
+   *  regular file but denies X_OK, which is what chmod 0644 produces for real.
+   *
+   *  The staged keys go through the same join() the search uses, so a Windows
+   *  runner's backslashed spelling of this POSIX path still matches. */
+  function posixBinDir(leaf: string, files: Record<string, "exec" | "noexec">): { dir: string; cleanup: () => void } {
+    const dir = `${SYNTH_ROOT}/${leaf}`;
+    const keys = Object.entries(files).map(([name, kind]) => {
+      const key = fsKey(join(dir, name));
+      fsEntries.set(key, kind);
+      return key;
+    });
+    accessLog.length = 0;
+    return {
+      dir,
+      cleanup: () => {
+        for (const key of keys) fsEntries.delete(key);
+        accessLog.length = 0;
+      },
+    };
+  }
+
   it("finds a bare name through PATHEXT on Windows, where `oam` is a file called oam.exe", () => {
     // The case the install path lives on: `oam` spawns because the loader
     // appends an extension, so a PATH-only search finds nothing on disk.
@@ -486,24 +600,31 @@ describe("resolveBinAbsolute", () => {
     }
   });
 
-  // POSIX-only for the reason above: a colon-joined PATH cannot carry a
-  // drive-lettered fixture path, so this can only be exercised where absolute
-  // paths are POSIX-shaped.
-  //
-  // NOTHING RUNS THIS TODAY. There are no CI legs -- this repo ships no
-  // workflows, and release.sh runs `npm test` on the releasing machine, which
-  // is Windows. So this and the X_OK test below are gates for a POSIX
-  // developer's local run, not covered branches: treat the ':' split and the
-  // X_OK enforcement as unverified by the suite until either a POSIX leg
-  // exists or the executable check becomes injectable the way `platform` is.
-  it.skipIf(process.platform === "win32")("splits PATH on ':' off Windows, and needs no PATHEXT", () => {
-    const { dir, cleanup } = binDir("oam");
-    const other = mkdtempSync(join(tmpdir(), "resolvebin-empty-"));
+  // The fixture is injected rather than staged on disk (see the node:fs block
+  // at the top of this file): a real temp dir is drive-lettered on the runner
+  // that cuts every release, and a ':'-delimited PATH would split it at that
+  // drive letter, so the test would be measuring the fixture rather than the
+  // search. Only "what is on disk at this path" is answered from the map --
+  // the split, the PATHEXT decision and isExecutableFile all run for real, so
+  // what this proves is unchanged: a ';' split would leave the whole
+  // "<other>:<dir>" string as ONE entry and find nothing, and applying the
+  // default PATHEXT off Windows would search oam.COM/.EXE/... and never the
+  // extensionless `oam` that is the only file staged.
+  it("splits PATH on ':' off Windows, and needs no PATHEXT", () => {
+    const { dir, cleanup } = posixBinDir("split", { oam: "exec" });
+    const other = `${SYNTH_ROOT}/split-empty`;
     try {
+      // Expectation built with the SAME join the search uses. node:path is
+      // platform-native, so this POSIX path builds with backslashes on a
+      // Windows runner and a hardcoded "/.../oam" would fail there for a
+      // reason that has nothing to do with the ':' split.
       expect(resolveBinAbsolute("oam", { PATH: `${other}:${dir}` }, "linux")).toBe(join(dir, "oam"));
+      // ...and the POSIX branch paid the X_OK it owes, on the file it answered
+      // with and on nothing else: the miss in `other` never got that far,
+      // because statSync said ENOENT first.
+      expect(accessLog).toEqual([{ path: join(dir, "oam"), mode: constants.X_OK }]);
     } finally {
       cleanup();
-      rmSync(other, { recursive: true, force: true });
     }
   });
 
@@ -597,21 +718,41 @@ describe("resolveBinAbsolute", () => {
     }
   });
 
-  // Real fs permissions, so this is gated on the RUNNER, not on the injected
-  // platform: X_OK is a no-op on Windows (Node treats it as F_OK), where
-  // executability is the extension and PATHEXT has already decided it.
-  it.skipIf(process.platform === "win32")("skips a non-executable file off Windows", () => {
-    const dir = mkdtempSync(join(tmpdir(), "resolvebin-noexec-"));
-    writeFileSync(join(dir, "oam"), "");
-    chmodSync(join(dir, "oam"), 0o644);
+  // The permission is injected, not real (see the node:fs block at the top). A
+  // real `chmodSync(..., 0o644)` fixture WOULD force a runner-gated test,
+  // because X_OK is a no-op on Windows -- Node degrades it to F_OK -- so the
+  // real fs there cannot produce a file that stats as a regular file and still
+  // refuses X_OK; injecting the errno instead is what lets this one run
+  // everywhere, including the Windows machine that cuts the release. The staged
+  // file answers EACCES to exactly that X_OK request, which is what the real
+  // 0644 file answers off Windows, and isExecutableFile's own platform gate,
+  // its accessSync call and its catch are all the shipped code.
+  it("skips a non-executable file off Windows, and asks no X_OK on Windows", () => {
+    const { dir, cleanup } = posixBinDir("noexec", { oam: "noexec" });
     try {
       // The loader skips it in favour of the real binary further down PATH, and
       // this is the shape that makes probeOam report a `spawn` failure -- so
       // returning it as the answer to "where is oam" is doubly wrong.
       expect(resolveBinAbsolute("oam", { PATH: dir }, "linux")).toBeNull();
       expect(resolveBinAbsolute(join(dir, "oam"), {}, "linux")).toBeNull();
+      // Both refusals came from X_OK and nothing else. The file stats as a
+      // regular file, so this is the assertion that separates "skipped because
+      // it is not executable" from "skipped because the stat missed" -- an
+      // isExecutableFile that stopped asking would have returned it twice.
+      expect(accessLog).toEqual([
+        { path: join(dir, "oam"), mode: constants.X_OK },
+        { path: join(dir, "oam"), mode: constants.X_OK },
+      ]);
+      // The win32 half of the same gate, which the runner skip also hid: the
+      // IDENTICAL file is the answer there, because executability is the
+      // extension and PATHEXT has already decided it. Asserted through the
+      // absolute branch on purpose -- a bare `oam` on win32 is searched as
+      // oam.COM/.EXE/... and would never reach an extensionless file at all.
+      accessLog.length = 0;
+      expect(resolveBinAbsolute(join(dir, "oam"), {}, "win32")).toBe(winNormalize(join(dir, "oam"), "win32"));
+      expect(accessLog).toEqual([]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      cleanup();
     }
   });
 });
@@ -1046,6 +1187,46 @@ describe("npmCacheDir", () => {
     }
   });
 
+  it("expands a ${VAR} reference from the environment, as npm's config layer does", () => {
+    // `cache=${XDG_CACHE_HOME}/npm` is how a dotfiles repo writes a relocated
+    // cache, and @npmcli/config's envReplace expands it for every value it
+    // loads from a file. Left literal it named a directory that exists on no
+    // machine, readdirSync threw, and every npx sidecar quietly stayed on npx.
+    // Plain double-quoted strings below, so JS does not interpolate what the
+    // npmrc has to carry verbatim.
+    const dir = join(tmpdir(), "cache-ENVREF");
+    process.env.YAW_MCP_TEST_NPMRC_CACHE = dir;
+    const bare = brokerWithNpmrc("${YAW_MCP_TEST_NPMRC_CACHE}");
+    const inPath = brokerWithNpmrc("${YAW_MCP_TEST_NPMRC_CACHE}/npm");
+    try {
+      expect(npmCacheDir(bare.url)).toBe(dir);
+      expect(npmCacheDir(inPath.url)).toBe(`${dir}/npm`);
+    } finally {
+      delete process.env.YAW_MCP_TEST_NPMRC_CACHE;
+      bare.cleanup();
+      inPath.cleanup();
+    }
+  });
+
+  it("keeps an escaped or unset ${VAR} reference literal, as npm does", () => {
+    // npm's two edge rules, mirrored so a value npm would leave alone is left
+    // alone here too: an odd run of backslashes escapes the reference (one
+    // backslash is consumed, the reference stays), and a name the environment
+    // does not carry stays as written rather than collapsing to "".
+    delete process.env.YAW_MCP_TEST_NPMRC_UNSET;
+    process.env.YAW_MCP_TEST_NPMRC_CACHE = join(tmpdir(), "cache-ENVREF");
+    const unset = brokerWithNpmrc("${YAW_MCP_TEST_NPMRC_UNSET}/npm");
+    const escaped = brokerWithNpmrc("\\${YAW_MCP_TEST_NPMRC_CACHE}");
+    try {
+      expect(npmCacheDir(unset.url)).toBe("${YAW_MCP_TEST_NPMRC_UNSET}/npm");
+      expect(npmCacheDir(escaped.url)).toBe("${YAW_MCP_TEST_NPMRC_CACHE}");
+    } finally {
+      delete process.env.YAW_MCP_TEST_NPMRC_CACHE;
+      unset.cleanup();
+      escaped.cleanup();
+    }
+  });
+
   // Every case below yields a cache dir that does not exist if it is decoded
   // wrong, after which readdirSync throws, npmCacheNpxNodeModules returns [],
   // and every npx sidecar quietly stays on npx -- indistinguishable from "no
@@ -1335,6 +1516,56 @@ describe("resolveNpmEntry", () => {
     const dir = writePkg(npx, "libonly", { name: "libonly", main: "lib/main.js" });
     try {
       expect(resolveNpmEntry("libonly", brokerUrl, null, null)).toBe(join(dir, "lib", "main.js"));
+    } finally {
+      cleanup();
+    }
+  });
+
+  // The SHAPE of a package.json is as untrusted as its syntax: this reads
+  // every `_npx/<hash>` cache dir on the machine plus the managed tree. A
+  // malformed manifest used to throw a TypeError out of the connect path,
+  // where upstream wraps it as an ActivationError and its one-shot node
+  // respawn never fires (the rewrite was never applied) -- so the server
+  // failed to activate at all where a null would have kept it on npx for
+  // free. Written by hand rather than through writeManifest, which derives
+  // the files to create from a WELL-FORMED bin.
+
+  it("returns null, rather than throwing, for a bin that is not a string", async () => {
+    // `bin: {"x": 1}` reached isAbsolute, which throws ERR_INVALID_ARG_TYPE
+    // on a non-string instead of answering false.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = join(npx, "bbb", "node_modules", "badbin");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "badbin", bin: { x: 1 } }));
+    try {
+      expect(() => resolveNpmEntry("badbin", brokerUrl, null, null)).not.toThrow();
+      expect(resolveNpmEntry("badbin", brokerUrl, null, null)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns null for a manifest that is valid JSON but not a package object", async () => {
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = join(npx, "bbb", "node_modules", "nullpkg");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), "null");
+    try {
+      expect(() => resolveNpmEntry("nullpkg", brokerUrl, null, null)).not.toThrow();
+      expect(resolveNpmEntry("nullpkg", brokerUrl, null, null)).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reads only the package's OWN bin keys, never Object.prototype's", async () => {
+    // `bin[unscoped]` on a package named "constructor" used to return Object's
+    // constructor function -- truthy, so it won the tier lookup and then threw
+    // out of isAbsolute. The first declared bin is the right answer.
+    const { npx, brokerUrl, cleanup } = fixture();
+    const dir = writePkg(npx, "constructor", { name: "constructor", bin: { "ctor-cli": "dist/index.js" } });
+    try {
+      expect(resolveNpmEntry("constructor", brokerUrl, null, null)).toBe(join(dir, "dist", "index.js"));
     } finally {
       cleanup();
     }
@@ -1760,11 +1991,13 @@ describe("resolveNpmEntry", () => {
   });
 });
 
-// probeOam runs execFileSync, which blocks the event loop, on the upstream
-// connect path of a single-threaded broker. Without a timeout an oam binary
-// that never returns wedges the whole hub. These pin both halves of the
-// contract: the bound exists, and exceeding it degrades to the same
-// node fallback that an absent oam already produces.
+// probeOam spawns `oam --version` asynchronously and settles on a deadline: the
+// timer resolves the probe whether or not the child ever exits, so a wedged
+// binary on the upstream connect path of a single-threaded broker cannot hold
+// the hub. (It was execFileSync until #91, and a synchronous probe with a
+// `timeout` still hung on an unkillable child -- see spawnVersionProbe.) These
+// pin both halves of the contract: the bound exists, and exceeding it degrades
+// to the same node fallback that an absent oam already produces.
 describe("probeOam timeout", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => resetOamBinCache());
@@ -1778,8 +2011,9 @@ describe("probeOam timeout", () => {
   });
 
   it("falls back to node when the probe times out", async () => {
-    // execFileSync throws ETIMEDOUT when the child exceeds `timeout`; the
-    // catch must produce the same result as "oam is not installed".
+    // The spawn's deadline rejects with `code: "ETIMEDOUT"` -- the shape
+    // execFileSync used to throw, kept so probeOam's catch is unchanged -- and
+    // that catch must produce the same result as "oam is not installed".
     const probe = await probeOam(async () => {
       const err = new Error("spawnSync oam ETIMEDOUT") as Error & { code?: string };
       err.code = "ETIMEDOUT";
@@ -2042,23 +2276,30 @@ describe("probeOam hardening", () => {
 });
 
 describe("MIN_OAM_VERSION freshness floor", () => {
-  it("is at least 0.13.0 (bump this literal when you bump the floor)", () => {
+  /** The ratchet. ONE literal, and the title is built from it, so the two
+   *  cannot say different numbers -- the title used to name 0.13.0 while the
+   *  body asserted 0.13.1. */
+  const FLOOR = "0.13.1";
+
+  it(`is at least ${FLOOR} (bump this literal when you bump the floor)`, () => {
     // POLICY (see the constant's doc): the floor tracks the LATEST oam
     // release, bumped with every release. This literal-floor pin mirrors
     // the UV_VERSION freshness test in uv-bootstrap.test.ts: every other
     // MIN_OAM_VERSION assertion derives its fixture FROM the constant, so
-    // without this a stale floor was invisible to the suite. The contract
-    // is ONE-directional: the constant can never drop below this literal
-    // (a revert fails here); raising the constant without the literal
-    // passes and merely leaves this pin weak, so bump BOTH together.
+    // without this a stale floor was invisible to the suite. That makes this
+    // the ONE deliberate exception to the derive-from-constant rule: a floor
+    // derived from the constant would assert the constant against itself.
+    // The contract is ONE-directional: the constant can never drop below
+    // this literal (a revert fails here); raising the constant without the
+    // literal passes and merely leaves this pin weak, so bump BOTH together.
     // Catching a NEW upstream release still takes the release checklist --
     // a network-dependent freshness gate is deliberately out (see the
     // doctor-cmd stance on network in tests).
-    expect(compareVersions(MIN_OAM_VERSION, "0.13.1")).toBeGreaterThanOrEqual(0);
+    expect(compareVersions(MIN_OAM_VERSION, FLOOR)).toBeGreaterThanOrEqual(0);
   });
 });
 
-describe("resolveOamSpawn — unavailable-oam warning", () => {
+describe("resolveOamSpawn -- unavailable-oam warning", () => {
   beforeEach(() => resetOamBinCache());
   afterEach(() => {
     resetOamBinCache();

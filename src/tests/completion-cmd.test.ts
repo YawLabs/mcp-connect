@@ -14,7 +14,6 @@ import { parseInstallArgs } from "../install-cmd.js";
 import { parseAddArgs, parseListArgs, parseRemoveArgs } from "../local-add-cmd.js";
 import { parseResetLearningArgs } from "../reset-learning-cmd.js";
 import { parseSecretsArgs } from "../secrets-cmd.js";
-import { parseServersArgs } from "../servers-cmd.js";
 import { parseSidecarsArgs } from "../sidecars-cmd.js";
 import { FLAG_ALIASES, KNOWN_SUBCOMMANDS } from "../subcommands.js";
 import { parseTrustArgs } from "../trust-cmd.js";
@@ -30,8 +29,13 @@ const SUBCOMMAND_NAMES = SUBCOMMAND_SPEC.map((s) => s.name);
 // table -- not a hand-maintained mirror -- makes the drift guard REAL: a
 // new dispatched subcommand that forgets a SUBCOMMAND_SPEC entry fails
 // this test.
+// `servers` is the one DELIBERATE exemption: still dispatched (Yaw Terminal
+// shells out to `yaw-mcp servers --json` and reads signedIn:false from its
+// always-non-zero exit), but a deprecation stub, and completing a deprecated
+// thing teaches it -- the rule that already hides `--token`. The dedicated
+// test below pins that it stays dispatched AND stays uncompleted.
 const DISPATCHED_SUBCOMMANDS = KNOWN_SUBCOMMANDS.filter(
-  (s) => !(FLAG_ALIASES as readonly string[]).includes(s) && s !== "help",
+  (s) => !(FLAG_ALIASES as readonly string[]).includes(s) && s !== "help" && s !== "servers",
 );
 
 function capture(): { out: string[]; err: string[]; push: (s: string) => void; pushErr: (s: string) => void } {
@@ -281,6 +285,23 @@ describe("renderScript — fish", () => {
     expect(s).toContain('-a "claude-code claude-desktop cursor vscode"');
     expect(s).toContain('-a "list match"');
   });
+
+  it("scopes positional candidates to the ACTIVE subcommand too", () => {
+    // Same defect as the flag lines, one release later: the positional lines
+    // kept `__fish_seen_subcommand_from`, so once a positional VALUE is also
+    // a subcommand name (`sidecars install`) the token count alone decided
+    // whose candidates fish offered. Nothing in the generated script may use
+    // the anywhere-on-the-line guard any more.
+    const s = renderScript("fish");
+    const positionalLines = s.split("\n").filter((l) => l.includes(" -a ") && l.includes("count (commandline -opc)"));
+    expect(positionalLines.length).toBeGreaterThan(0);
+    for (const line of positionalLines) {
+      expect(line, `positional line is not scoped to the active subcommand: ${line}`).toMatch(
+        /-n "__yaw_mcp_using_subcommand [a-z-]+; and test \(count \(commandline -opc\)\) -eq [0-9]+"/,
+      );
+    }
+    expect(s).not.toContain("__fish_seen_subcommand_from");
+  });
 });
 
 describe("renderScript — powershell", () => {
@@ -418,7 +439,6 @@ const FLAG_PARSERS: Record<string, (argv: string[]) => ProbeResult> = {
   try: parseTryArgs,
   "try-cleanup": parseTryCleanupArgs,
   doctor: parseDoctorArgs,
-  servers: parseServersArgs,
   bundles: parseBundlesArgs,
   upgrade: parseUpgradeArgs,
   completion: parseCompletionArgs,
@@ -453,6 +473,14 @@ describe("SUBCOMMAND_SPEC coverage", () => {
     const known = new Set<string>(KNOWN_SUBCOMMANDS);
     const stale = SUBCOMMAND_NAMES.filter((s) => s !== "help" && !known.has(s));
     expect(stale).toEqual([]);
+  });
+
+  it("does not complete the deprecated `servers` stub, which stays dispatched for Yaw Terminal", () => {
+    // Completing a deprecated thing teaches it (the rule that hides --token).
+    // The subcommand itself must NOT go: Yaw Terminal shells out to
+    // `yaw-mcp servers --json` and derives signedIn:false from its exit code.
+    expect(SUBCOMMAND_NAMES).not.toContain("servers");
+    expect([...KNOWN_SUBCOMMANDS]).toContain("servers");
   });
 
   it("specs foundry (previously dispatched but absent from the completion spec)", () => {

@@ -4,12 +4,14 @@ import os from "node:os";
 import nodePath from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseSecretsArgs, runSecrets, SECRETS_USAGE } from "../secrets-cmd.js";
-import type { EncryptedEntry } from "../secrets-crypto.js";
+import { deriveKey, type EncryptedEntry, encryptEntry, generateSalt, LEGACY_KDF } from "../secrets-crypto.js";
 import {
   isUnlocked,
   loadVault,
   lock,
+  MALFORMED_REF_MARKER,
   rotateVault,
+  SECRETS_SCHEMA_VERSION,
   saveVault,
   unlock,
   type VaultFile,
@@ -196,6 +198,31 @@ describe("parseSecretsArgs", () => {
   it("rejects --secret without arg", () => {
     const r = parseSecretsArgs(["audit", "--secret"]);
     expect(r.ok).toBe(false);
+  });
+
+  it("rejects --secret / --server followed by a flag instead of storing the flag as the filter", () => {
+    // `audit --secret --json` used to store "--json" as the secret filter and
+    // print an empty trail -- the same trap --value already refused. A
+    // namespace or a secret name can never start with a dash, so a
+    // dash-leading value is always a missing one.
+    const r = parseSecretsArgs(["audit", "--secret", "--json"]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/--secret requires a value/);
+    const s = parseSecretsArgs(["audit", "--server", "--json"]);
+    expect(s.ok).toBe(false);
+    if (!s.ok) expect(s.error).toMatch(/--server requires a value/);
+  });
+
+  it('rejects `set NAME --value ""` at parse time, before any passphrase prompt', () => {
+    // runSecrets refuses an empty value too, but only AFTER the passphrase
+    // prompt and the ~100ms scrypt derivation -- the same ordering the name
+    // check was pulled forward for. The parser owns the cheap refusal.
+    const r = parseSecretsArgs(["set", "github", "--value", ""]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toMatch(/Secret value cannot be empty/);
+      expect((r as { help?: boolean }).help).toBeUndefined();
+    }
   });
 
   // The name character-class check used to live ONLY in setSecret, which
@@ -401,7 +428,6 @@ class FakeTTYStdin {
 describe("readLineFromTTY -- Ctrl-D cancel", () => {
   let home: string;
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   const io = { out: vi.fn(), err: vi.fn() };
 
   beforeEach(async () => {
@@ -431,7 +457,7 @@ describe("readLineFromTTY -- Ctrl-D cancel", () => {
         name: "github",
         value: "ghp_abc",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -456,7 +482,7 @@ describe("readLineFromTTY -- Ctrl-D cancel", () => {
         name: "github",
         value: "ghp_abc",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -476,7 +502,6 @@ describe("readLineFromTTY -- Ctrl-D cancel", () => {
 describe("readLineFromTTY -- multi-line paste feeds successive prompts", () => {
   const io = { out: vi.fn(), err: vi.fn() };
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   beforeEach(async () => {
@@ -504,7 +529,7 @@ describe("readLineFromTTY -- multi-line paste feeds successive prompts", () => {
         action: "set",
         name: "github",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -537,7 +562,6 @@ describe("passphrase-required message under Git Bash / MSYS", () => {
   // case the MSYS wording may claim.
   const stdin = { isTTY: false } as unknown as NodeJS.ReadableStream;
   const stdout = { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
   let savedMsystem: string | undefined;
 
@@ -562,10 +586,7 @@ describe("passphrase-required message under Git Bash / MSYS", () => {
 
   it("names the MSYS pipe emulation and the real remedies when MSYSTEM is set", async () => {
     process.env.MSYSTEM = "MINGW64";
-    const r = await runSecrets(
-      { action: "set", name: "github", value: "ghp_abc", home, io: { stdin, stdout, stderr } },
-      io,
-    );
+    const r = await runSecrets({ action: "set", name: "github", value: "ghp_abc", home, io: { stdin, stdout } }, io);
     expect(r.exitCode).toBe(1);
     expect(errText()).toContain("Passphrase required.");
     expect(errText()).toContain("Git Bash/MSYS");
@@ -577,10 +598,7 @@ describe("passphrase-required message under Git Bash / MSYS", () => {
 
   it("keeps the plain TTY wording when MSYSTEM is not set", async () => {
     delete process.env.MSYSTEM;
-    const r = await runSecrets(
-      { action: "set", name: "github", value: "ghp_abc", home, io: { stdin, stdout, stderr } },
-      io,
-    );
+    const r = await runSecrets({ action: "set", name: "github", value: "ghp_abc", home, io: { stdin, stdout } }, io);
     expect(r.exitCode).toBe(1);
     expect(errText()).toContain(
       "Passphrase required. Set YAW_MCP_VAULT_PASSPHRASE or run from a TTY so we can prompt.",
@@ -600,7 +618,6 @@ describe("passphrase-required message under Git Bash / MSYS", () => {
 describe("runSecrets set -- confirm-twice on vault creation", () => {
   const io = { out: vi.fn(), err: vi.fn() };
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   const promptText = (): string =>
@@ -633,7 +650,7 @@ describe("runSecrets set -- confirm-twice on vault creation", () => {
         name: "github",
         value: "ghp_abc",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -667,7 +684,7 @@ describe("runSecrets set -- confirm-twice on vault creation", () => {
         name: "github",
         value: "ghp_abc",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -691,7 +708,7 @@ describe("runSecrets set -- confirm-twice on vault creation", () => {
         name: "github",
         value: "ghp_abc",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -715,7 +732,7 @@ describe("runSecrets set -- confirm-twice on vault creation", () => {
         name: "github",
         value: "ghp_abc",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -745,7 +762,7 @@ describe("runSecrets set -- confirm-twice on vault creation", () => {
         name: "github",
         value: "ghp_abc",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -769,24 +786,20 @@ describe("runSecrets set -- confirm-twice on vault creation", () => {
 describe("runSecrets -- short-passphrase warning covers the TTY paths", () => {
   const io = { out: vi.fn(), err: vi.fn() };
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
-  const warned = (): string =>
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
-  const ttyIo = (
-    stdin: FakeTTYStdin,
-  ): { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream; stderr: NodeJS.WritableStream } => ({
+  // The warnings ride the same `err` callback as every error envelope --
+  // there is no separate stderr stream for an embedder to forget to wire.
+  const warned = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  const ttyIo = (stdin: FakeTTYStdin): { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream } => ({
     stdin: stdin as unknown as NodeJS.ReadableStream,
     stdout,
-    stderr,
   });
 
   beforeEach(async () => {
     io.out.mockReset();
     io.err.mockReset();
     (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
     lock();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
     home = makeHome();
@@ -822,7 +835,7 @@ describe("runSecrets -- short-passphrase warning covers the TTY paths", () => {
       (await runSecrets({ action: "set", name: "github", value: "ghp_abc", passphrase: "abc", home }, io)).exitCode,
     ).toBe(0);
     lock();
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    io.err.mockReset();
 
     const stdin = new FakeTTYStdin(["abc\r"]);
     const r = await runSecrets({ action: "get", name: "github", home, io: ttyIo(stdin) }, io);
@@ -846,7 +859,7 @@ describe("runSecrets -- short-passphrase warning covers the TTY paths", () => {
       ).exitCode,
     ).toBe(0);
     lock();
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    io.err.mockReset();
 
     // Short AND wrong: the vault's real passphrase is the long one above.
     const stdin = new FakeTTYStdin(["oops\r"]);
@@ -870,7 +883,6 @@ describe("runSecrets -- short-passphrase warning covers the TTY paths", () => {
 describe("secrets set -- invalid name fails before any prompt", () => {
   const io = { out: vi.fn(), err: vi.fn() };
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   /** Mirror the CLI dispatcher (src/index.ts:160): parse first, and reach
@@ -888,7 +900,7 @@ describe("secrets set -- invalid name fails before any prompt", () => {
       {
         ...parsed.options,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1046,6 +1058,32 @@ describe("runSecrets audit", () => {
     expect(out.toLowerCase()).toContain("no secret-resolution audit");
   });
 
+  it("renders a MALFORMED-ref row and lets --secret filter on the marker string the help documents", async () => {
+    // resolveServerEnv refuses a spawn over a `${secret:` the strict regex
+    // cannot parse and records it as a `missing` event whose secret NAME is
+    // the bounded marker form (upstream.ts). The audit help now tells the
+    // operator that such a row means a typo in bundles.json and that
+    // --secret matches the full marker string -- so the renderer must show
+    // the row, and the filter must accept that name. Without this an
+    // operator filtering for "gh" sees nothing and concludes the spawn never
+    // reached the vault at all.
+    const { appendAuditEvent } = await import("../secrets-audit.js");
+    const marker = `${MALFORMED_REF_MARKER} gh`;
+    await appendAuditEvent({ server: "gh", secret: marker, event: "missing" }, home);
+    await appendAuditEvent({ server: "gh", secret: "other", event: "injected" }, home);
+
+    const rendered = await runSecrets({ action: "audit", home }, io);
+    expect(rendered.exitCode).toBe(0);
+    expect(io.out.mock.calls.map((c) => c[0] as string).join("")).toContain(marker);
+
+    io.out.mockReset();
+    const filtered = await runSecrets({ action: "audit", secretFilter: marker, home, json: true }, io);
+    expect(filtered.exitCode).toBe(0);
+    const parsed = JSON.parse(io.out.mock.calls.map((c) => c[0] as string).join(""));
+    expect(parsed.count).toBe(1);
+    expect(parsed.events[0]).toMatchObject({ server: "gh", secret: marker, event: "missing" });
+  });
+
   it("renders recorded events and filters by server", async () => {
     const { appendAuditEvent } = await import("../secrets-audit.js");
     await appendAuditEvent({ server: "gh", secret: "token", event: "injected" }, home);
@@ -1080,22 +1118,19 @@ const CONFIRM_PASS = "confirm-passphrase-xyz";
 
 /** Non-TTY stdin/stdout pair, so these tests never depend on whether the
  *  vitest worker's process.stdin happens to be a TTY. */
-function nonTTYIo(stderr: NodeJS.WritableStream): {
+function nonTTYIo(): {
   stdin: NodeJS.ReadableStream;
   stdout: NodeJS.WritableStream;
-  stderr: NodeJS.WritableStream;
 } {
   return {
     stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
     stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
-    stderr,
   };
 }
 
 describe("runSecrets remove -- confirmation gate", () => {
   const io = { out: vi.fn(), err: vi.fn() };
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   /** Seed a one-entry vault and return its exact on-disk bytes, so a test
@@ -1139,7 +1174,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         name: "TOKEN",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1164,7 +1199,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         name: "TOKEN",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1184,7 +1219,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         name: "TOKEN",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1213,7 +1248,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         action: "remove",
         name: "TOKEN",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1233,7 +1268,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         name: "TOKEN",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1257,7 +1292,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         name: "TOKEN",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1280,7 +1315,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         name: "TOKEN",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1302,7 +1337,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         name: "TOKEN",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1312,10 +1347,7 @@ describe("runSecrets remove -- confirmation gate", () => {
 
   it("non-TTY without --force refuses (exit 2), names the flag, and leaves the vault byte-identical", async () => {
     const before = await seed();
-    const r = await runSecrets(
-      { action: "remove", name: "TOKEN", passphrase: CONFIRM_PASS, home, io: nonTTYIo(stderr) },
-      io,
-    );
+    const r = await runSecrets({ action: "remove", name: "TOKEN", passphrase: CONFIRM_PASS, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(2);
     expect(errText()).toContain("--force");
     expect(errText()).toContain("neither stdin nor stdout is a TTY");
@@ -1337,7 +1369,6 @@ describe("runSecrets remove -- confirmation gate", () => {
         io: {
           stdin: { isTTY: true } as unknown as NodeJS.ReadableStream,
           stdout: { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream,
-          stderr,
         },
       },
       io,
@@ -1360,7 +1391,6 @@ describe("runSecrets remove -- confirmation gate", () => {
         io: {
           stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
           stdout: { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream,
-          stderr,
         },
       },
       io,
@@ -1375,7 +1405,7 @@ describe("runSecrets remove -- confirmation gate", () => {
   it("non-TTY with --force deletes", async () => {
     await seed();
     const r = await runSecrets(
-      { action: "remove", name: "TOKEN", passphrase: CONFIRM_PASS, force: true, home, io: nonTTYIo(stderr) },
+      { action: "remove", name: "TOKEN", passphrase: CONFIRM_PASS, force: true, home, io: nonTTYIo() },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -1405,7 +1435,7 @@ describe("runSecrets remove -- confirmation gate", () => {
         passphrase: CONFIRM_PASS,
         force: true,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1424,7 +1454,7 @@ describe("runSecrets remove -- confirmation gate", () => {
     const before = await seed();
     // No passphrase hook, no env var, no TTY to prompt on: --force must not
     // turn into a free pass at the vault.
-    const r = await runSecrets({ action: "remove", name: "TOKEN", force: true, home, io: nonTTYIo(stderr) }, io);
+    const r = await runSecrets({ action: "remove", name: "TOKEN", force: true, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(1);
     expect(errText().toLowerCase()).toMatch(/passphrase required/);
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
@@ -1432,10 +1462,7 @@ describe("runSecrets remove -- confirmation gate", () => {
 
   it("a missing name still reports not-found, never the --force refusal", async () => {
     await seed();
-    const r = await runSecrets(
-      { action: "remove", name: "NOPE", passphrase: CONFIRM_PASS, home, io: nonTTYIo(stderr) },
-      io,
-    );
+    const r = await runSecrets({ action: "remove", name: "NOPE", passphrase: CONFIRM_PASS, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(1);
     expect(errText()).toContain('No secret named "NOPE"');
     expect(errText()).not.toContain("--force");
@@ -1445,7 +1472,6 @@ describe("runSecrets remove -- confirmation gate", () => {
 describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", () => {
   const io = { out: vi.fn(), err: vi.fn() };
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
@@ -1500,7 +1526,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
         value: "new-value",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1525,7 +1551,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
         value: "new-value",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1546,7 +1572,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
         value: "new-value",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1559,7 +1585,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
   it("non-TTY overwrite PROCEEDS without --force (credential rotation must stay scriptable)", async () => {
     await seed();
     const r = await runSecrets(
-      { action: "set", name: "TOKEN", value: "rotated", passphrase: CONFIRM_PASS, home, io: nonTTYIo(stderr) },
+      { action: "set", name: "TOKEN", value: "rotated", passphrase: CONFIRM_PASS, home, io: nonTTYIo() },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -1571,7 +1597,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
 
   it("a fresh name still says Stored, and --json carries replaced:false", async () => {
     const r = await runSecrets(
-      { action: "set", name: "FRESH", value: "v", passphrase: CONFIRM_PASS, home, json: true, io: nonTTYIo(stderr) },
+      { action: "set", name: "FRESH", value: "v", passphrase: CONFIRM_PASS, home, json: true, io: nonTTYIo() },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -1580,7 +1606,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
     io.out.mockReset();
     lock();
     const again = await runSecrets(
-      { action: "set", name: "FRESH", value: "v2", passphrase: CONFIRM_PASS, home, json: true, io: nonTTYIo(stderr) },
+      { action: "set", name: "FRESH", value: "v2", passphrase: CONFIRM_PASS, home, json: true, io: nonTTYIo() },
       io,
     );
     expect(again.exitCode).toBe(0);
@@ -1600,7 +1626,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
         passphrase: CONFIRM_PASS,
         force: true,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1619,7 +1645,7 @@ describe("runSecrets set -- overwrite confirmation and Replaced/Stored split", (
         name: "FRESH",
         passphrase: CONFIRM_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1651,7 +1677,6 @@ const ROT_NEW = "rotate-brand-new-xyz";
 describe("runSecrets rotate -- abort paths leave the vault byte-identical", () => {
   const io = { out: vi.fn(), err: vi.fn() };
   const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
@@ -1690,7 +1715,6 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
     io.out.mockReset();
     io.err.mockReset();
     (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
     lock();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
     delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
@@ -1831,7 +1855,7 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
 
   it("refuses when no CURRENT passphrase can be obtained (non-TTY, no env) -- vault untouched", async () => {
     const before = await seedMulti();
-    const r = await runSecrets({ action: "rotate", newPassphrase: ROT_NEW, home, io: nonTTYIo(stderr) }, io);
+    const r = await runSecrets({ action: "rotate", newPassphrase: ROT_NEW, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(1);
     expect(errText()).toContain("Current passphrase required");
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
@@ -1841,7 +1865,7 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
     // The current passphrase is correct and the vault is fully decryptable;
     // the only thing missing is the new passphrase. Nothing may be written.
     const before = await seedMulti();
-    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, home, io: nonTTYIo(stderr) }, io);
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(1);
     expect(errText()).toContain("New passphrase required");
     expect(errText()).toContain("YAW_MCP_VAULT_PASSPHRASE_NEW");
@@ -1850,10 +1874,7 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
 
   it('an EMPTY new passphrase ("") is treated as "none supplied", never as a key of length zero', async () => {
     const before = await seedMulti();
-    const r = await runSecrets(
-      { action: "rotate", passphrase: ROT_PASS, newPassphrase: "", home, io: nonTTYIo(stderr) },
-      io,
-    );
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, newPassphrase: "", home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(1);
     expect(errText()).toContain("New passphrase required");
     expect(readFileSync(vaultPath(home), "utf8")).toBe(before);
@@ -1868,7 +1889,7 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
         action: "rotate",
         newPassphrase: ROT_NEW,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1889,7 +1910,7 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
         action: "rotate",
         passphrase: ROT_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1907,7 +1928,7 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
         action: "rotate",
         passphrase: ROT_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1929,7 +1950,7 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
         action: "rotate",
         passphrase: ROT_PASS,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -1941,7 +1962,6 @@ describe("runSecrets rotate -- abort paths leave the vault byte-identical", () =
 
 describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
   const io = { out: vi.fn(), err: vi.fn() };
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
@@ -1958,7 +1978,6 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
   beforeEach(async () => {
     io.out.mockReset();
     io.err.mockReset();
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
     lock();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
     delete process.env.YAW_MCP_VAULT_PASSPHRASE_NEW;
@@ -2051,10 +2070,10 @@ describe("runSecrets rotate -- the success path re-keys EVERY entry", () => {
     lock();
     process.env.YAW_MCP_VAULT_PASSPHRASE_NEW = "tiny";
 
-    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, home, io: nonTTYIo(stderr) }, io);
+    const r = await runSecrets({ action: "rotate", passphrase: ROT_PASS, home, io: nonTTYIo() }, io);
     expect(r.exitCode).toBe(0);
 
-    const warned = (stderr.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+    const warned = io.err.mock.calls.map((c) => c[0] as string).join("");
     expect(warned).toContain("the new passphrase is shorter than 12 characters");
     // The rotation still happened -- the warning is advisory, not a block.
     expect(await readBack("ONLY", "tiny")).toBe("v");
@@ -2147,47 +2166,31 @@ describe("runSecrets audit -- human render, filters, and read failure", () => {
     expect(outText()).not.toContain("No secret-resolution audit");
   });
 
-  it("surfaces a readAuditLog failure as exit 1 rather than an unhandled rejection", async () => {
-    // NOTE: today's readAuditLog swallows every I/O error internally and
-    // returns [], so this catch arm is unreachable through the real module
-    // -- it is a guard against a future readAuditLog that throws. The mock
-    // is what makes the guard testable; nothing in the arm is faked.
-    vi.resetModules();
-    vi.doMock("../secrets-audit.js", async () => {
-      const actual = await vi.importActual<typeof import("../secrets-audit.js")>("../secrets-audit.js");
-      return {
-        ...actual,
-        readAuditLog: async () => {
-          throw new Error("EACCES: permission denied, open 'secrets-audit.log'");
-        },
-      };
-    });
-    try {
-      const { runSecrets: freshRunSecrets } = await import("../secrets-cmd.js");
+  it("surfaces an unreadable audit log as exit 1, naming the path and errno -- not as an empty trail", async () => {
+    // A DIRECTORY at the log path makes the read fail with EISDIR, the
+    // "exists but unreadable" shape (EACCES and EIO are the same class).
+    // readAuditLog used to swallow that and return [], so `secrets audit`
+    // told the operator "no events recorded yet" about a trail sitting right
+    // there, and this catch arm was reachable only by mocking readAuditLog
+    // to throw. Through the real module now.
+    const { auditLogPath } = await import("../secrets-audit.js");
+    mkdirSync(auditLogPath(home), { recursive: true });
 
-      const plain = { out: vi.fn(), err: vi.fn() };
-      const r1 = await freshRunSecrets({ action: "audit", home }, plain);
-      expect(r1.exitCode).toBe(1);
-      expect(plain.err.mock.calls.map((c) => c[0] as string).join("")).toContain("yaw-mcp secrets audit: EACCES");
+    const r1 = await runSecrets({ action: "audit", home }, io);
+    expect(r1.exitCode).toBe(1);
+    expect(errText()).toContain("yaw-mcp secrets audit: could not read the audit log");
+    expect(errText()).toContain(auditLogPath(home));
+    expect(errText()).toContain("EISDIR");
+    // The empty-trail line is exactly the lie this exists to stop.
+    expect(outText()).not.toContain("No secret-resolution audit events");
 
-      const asJson = { out: vi.fn(), err: vi.fn() };
-      const r2 = await freshRunSecrets({ action: "audit", home, json: true }, asJson);
-      expect(r2.exitCode).toBe(1);
-      const line = asJson.err.mock.calls.map((c) => c[0] as string).join("");
-      expect(JSON.parse(line)).toMatchObject({ ok: false });
-      expect(JSON.parse(line).error).toContain("EACCES");
-    } finally {
-      vi.doUnmock("../secrets-audit.js");
-      vi.resetModules();
-    }
-    // Sanity: the statically-imported (never-mocked) runSecrets the rest of
-    // the suite holds still reads the real audit log. Asserting only that
-    // `errText()` is empty proved nothing -- this test wrote to `plain` and
-    // `asJson`, never to `io`, so it was true before the mock existed.
-    const r3 = await runSecrets({ action: "audit", home }, io);
-    expect(r3.exitCode).toBe(0);
-    expect(outText()).toContain("No secret-resolution audit events recorded yet.");
-    expect(errText()).toBe("");
+    io.err.mockReset();
+    const r2 = await runSecrets({ action: "audit", home, json: true }, io);
+    expect(r2.exitCode).toBe(1);
+    const parsed = JSON.parse(errText());
+    expect(parsed).toMatchObject({ ok: false });
+    expect(parsed.error).toContain("could not read the audit log");
+    expect(parsed.error).toContain("EISDIR");
   });
 });
 
@@ -2258,7 +2261,6 @@ describe("runSecrets -- concurrent-writer guard", () => {
         io: {
           stdin: rewritingStdin as unknown as NodeJS.ReadableStream,
           stdout: { write: vi.fn() } as unknown as NodeJS.WritableStream,
-          stderr: { write: vi.fn() } as unknown as NodeJS.WritableStream,
         },
       },
       io,
@@ -2296,7 +2298,6 @@ describe("runSecrets -- concurrent-writer guard", () => {
         io: {
           stdin: quietStdin as unknown as NodeJS.ReadableStream,
           stdout: { write: vi.fn() } as unknown as NodeJS.WritableStream,
-          stderr: { write: vi.fn() } as unknown as NodeJS.WritableStream,
         },
       },
       io,
@@ -2332,7 +2333,6 @@ describe("runSecrets -- concurrent-writer guard", () => {
       return deliver();
     };
     const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-    const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
 
     const r = await runSecrets(
       {
@@ -2340,7 +2340,7 @@ describe("runSecrets -- concurrent-writer guard", () => {
         name: "TOKEN",
         passphrase: "a-long-passphrase",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -2380,10 +2380,10 @@ describe("runSecrets -- concurrent-writer guard", () => {
         concurrent.started = true; // latch before the await so a re-entrant resume() cannot re-run it
         // The concurrent rotate is done with the vault PRIMITIVES rather than
         // a nested runSecrets: a second CLI run in the SAME process would
-        // call lock(), which zero-fills the module-cached key Buffer the
-        // outer command still holds by reference -- a shape that cannot
-        // occur in production (every CLI run is its own process) and would
-        // make the outer rotate fail for the wrong reason.
+        // lock() the module-level key cache out from under the outer command
+        // -- a shape that cannot occur in production (every CLI run is its
+        // own process). unlock() hands out COPIES now, so the outer key would
+        // in fact survive, but the fixture should not lean on that.
         void (async () => {
           const onDisk = await loadVault(file);
           if (!onDisk) throw new Error("fixture: vault vanished");
@@ -2397,14 +2397,13 @@ describe("runSecrets -- concurrent-writer guard", () => {
       return deliver();
     };
     const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
-    const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
 
     const r = await runSecrets(
       {
         action: "rotate",
         passphrase: OLD,
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -2477,7 +2476,6 @@ describe("runSecrets -- concurrent-writer guard", () => {
 
 describe("runSecrets set -- the value prompt refuses a redirected stdout", () => {
   const io = { out: vi.fn(), err: vi.fn() };
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   beforeEach(async () => {
@@ -2506,7 +2504,7 @@ describe("runSecrets set -- the value prompt refuses a redirected stdout", () =>
         name: "GH",
         passphrase: "a-long-passphrase",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -2532,7 +2530,7 @@ describe("runSecrets set -- the value prompt refuses a redirected stdout", () =>
         name: "GH",
         passphrase: "a-long-passphrase",
         home,
-        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout, stderr },
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
       },
       io,
     );
@@ -2547,10 +2545,124 @@ describe("runSecrets set -- the value prompt refuses a redirected stdout", () =>
     (stdin as { isTTY?: boolean }).isTTY = false;
     const stdout = { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream;
     const r = await runSecrets(
-      { action: "set", name: "GH", passphrase: "a-long-passphrase", home, io: { stdin, stdout, stderr } },
+      { action: "set", name: "GH", passphrase: "a-long-passphrase", home, io: { stdin, stdout } },
       io,
     );
     expect(r.exitCode).toBe(0);
+  });
+});
+
+// -----------------------------------------------------------------------
+// Key sequences at the NO-ECHO prompts. The raw-mode reader used to drop the
+// ESC byte alone and buffer the rest of an arrow key ("[D") as typed text.
+// At the echoed [y/N] prompt that was harmless noise; at "Secret value:" and
+// the passphrase prompts nothing is echoed, so the corruption was invisible:
+// a Left arrow to fix a typo in a pasted token stored `ghp_abc[D` behind a
+// green "Stored secret", and the server later failed auth with nothing
+// pointing at the vault.
+// -----------------------------------------------------------------------
+
+describe("readLineFromTTY -- key sequences never reach a no-echo prompt's value", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const stdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
+  const ESC = String.fromCharCode(27);
+  const KEYS_PASS = "a-long-passphrase";
+  let home: string;
+
+  /** Store GH through the interactive "Secret value:" prompt fed by `stdin`
+   *  (the passphrase is injected, so that is the only prompt), then read it
+   *  back with a fresh derivation. undefined when either step failed. */
+  async function storeViaPrompt(stdin: FakeTTYStdin): Promise<string | undefined> {
+    const r = await runSecrets(
+      {
+        action: "set",
+        name: "GH",
+        passphrase: KEYS_PASS,
+        home,
+        io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout },
+      },
+      io,
+    );
+    if (r.exitCode !== 0) return undefined;
+    lock();
+    const probe = { out: vi.fn(), err: vi.fn() };
+    const got = await runSecrets({ action: "get", name: "GH", passphrase: KEYS_PASS, home, json: true }, probe);
+    if (got.exitCode !== 0) return undefined;
+    const line = probe.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    return line ? (JSON.parse(line).value as string) : undefined;
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    (stdout.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("a CSI arrow key inside the value is dropped whole, never stored as [D", async () => {
+    // Left arrow is ESC "[" "D". The reader is not a line editor (there is
+    // no cursor to move), so the honest behavior is to drop the key -- and
+    // above all never to store its printable tail as part of the secret.
+    expect(await storeViaPrompt(new FakeTTYStdin([`ghp_a${ESC}[Dbc\r`]))).toBe("ghp_abc");
+  });
+
+  it("an SS3 arrow (ESC O A) is dropped too", async () => {
+    // Application-cursor mode sends ESC "O" <final> for the same keys.
+    expect(await storeViaPrompt(new FakeTTYStdin([`ghp${ESC}OA_abc\r`]))).toBe("ghp_abc");
+  });
+
+  it("a lone Escape key followed by Enter still submits what was typed", async () => {
+    // ESC followed by a control byte is not a sequence: Enter has to keep
+    // meaning Enter, or the user's submit silently vanishes.
+    expect(await storeViaPrompt(new FakeTTYStdin([`ghp_abc${ESC}\r`]))).toBe("ghp_abc");
+  });
+
+  it("a lone Escape key followed by an ordinary character keeps the character", async () => {
+    // Only the sequence bytes are the terminal's; the keystroke after a bare
+    // ESC (a reflexive Escape, or the meta prefix of an Alt chord) is the
+    // user's and must not be eaten -- the echoed [y/N] prompt pins the same
+    // rule for "ESC y".
+    expect(await storeViaPrompt(new FakeTTYStdin([`ghp_${ESC}abc\r`]))).toBe("ghp_abc");
+  });
+
+  it("a sequence split across two stdin chunks is still dropped whole", async () => {
+    // A terminal can deliver the ESC in one read and "[D" in the next. The
+    // parser state has to survive the chunk boundary, or the tail lands in
+    // the value. FakeTTYStdin hands out one chunk per prompt; this override
+    // delivers BOTH queued chunks to the single value prompt, in order.
+    const stdin = new FakeTTYStdin([`ghp_abc${ESC}`, `[D\r`]);
+    const deliver = stdin.resume.bind(stdin);
+    stdin.resume = () => {
+      deliver();
+      return deliver();
+    };
+    expect(await storeViaPrompt(stdin)).toBe("ghp_abc");
+  });
+
+  it("the passphrase prompt gets the same treatment", async () => {
+    // Seed off-TTY, then unlock through the TTY prompt with a Left arrow in
+    // the middle of the typed passphrase. Buffered as "[D" it would be a
+    // WRONG passphrase -- and the user, seeing no echo, would never know why.
+    const seeded = await runSecrets({ action: "set", name: "GH", value: "ghp_abc", passphrase: KEYS_PASS, home }, io);
+    expect(seeded.exitCode).toBe(0);
+    lock();
+    io.out.mockReset();
+    const stdin = new FakeTTYStdin([`a-long-pass${ESC}[Dphrase\r`]);
+    const r = await runSecrets(
+      { action: "get", name: "GH", home, json: true, io: { stdin: stdin as unknown as NodeJS.ReadableStream, stdout } },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    const line = io.out.mock.calls.map((c) => c[0] as string).find((s) => s.trim().startsWith("{"));
+    expect(line && JSON.parse(line).value).toBe("ghp_abc");
   });
 });
 
@@ -2732,14 +2844,14 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
   const ttyStdout = { isTTY: true, write: vi.fn() } as unknown as NodeJS.WritableStream;
   const pipedStdout = { isTTY: false, write: vi.fn() } as unknown as NodeJS.WritableStream;
   const idleStdin = { isTTY: false } as unknown as NodeJS.ReadableStream;
-  const stderr = { write: vi.fn() } as unknown as NodeJS.WritableStream;
   let home: string;
 
   const PROSE_PASS = "a-long-enough-passphrase";
   const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
   const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
-  const warned = (): string =>
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string).join("");
+  // The warnings ride the same `err` callback as every error envelope --
+  // there is no separate stderr stream for an embedder to forget to wire.
+  const warned = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
 
   /** Seed two entries, then corrupt BAD's ciphertext so it is still
    *  STRUCTURALLY valid (loadVault only checks the three fields are strings)
@@ -2766,7 +2878,6 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
   beforeEach(async () => {
     io.out.mockReset();
     io.err.mockReset();
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
     lock();
     delete process.env.YAW_MCP_VAULT_PASSPHRASE;
     home = makeHome();
@@ -2778,7 +2889,12 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
     lock();
   });
 
-  it("lock prints the cache-cleared line and really drops the key", async () => {
+  // `lock` can only clear the cache of the process it runs in, which from
+  // the CLI is about to exit anyway. Its output used to read as a revocation
+  // ("Vault locked.") and its --json envelope was a bare {locked:true}; both
+  // now say what was NOT touched, so neither a human nor a script can take
+  // the no-op for a cut-off of a running server.
+  it("lock says it cleared THIS process's cache only, and really drops the key", async () => {
     // Seed first so there IS a cached key to clear -- against an already
     // locked process the assertion would pass for a `lock` that does nothing.
     const seeded = await runSecrets({ action: "set", name: "GH", value: "ghp_abc", passphrase: PROSE_PASS, home }, io);
@@ -2788,14 +2904,23 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
 
     const r = await runSecrets({ action: "lock", home }, io);
     expect(r.exitCode).toBe(0);
-    expect(outText()).toBe("Vault locked. Passphrase cache cleared.\n");
+    expect(outText()).toBe(
+      "Passphrase cache cleared for this process only. A running yaw-mcp server keeps its own cached key until it exits, and the vault on disk is unchanged.\n",
+    );
+    expect(outText()).not.toContain("Vault locked");
     expect(isUnlocked()).toBe(false);
   });
 
-  it("lock --json emits the machine envelope instead of the prose line", async () => {
+  it("lock --json spells out the scope instead of a bare locked:true", async () => {
     const r = await runSecrets({ action: "lock", home, json: true }, io);
     expect(r.exitCode).toBe(0);
-    expect(JSON.parse(outText())).toEqual({ ok: true, locked: true });
+    expect(JSON.parse(outText())).toEqual({
+      ok: true,
+      locked: true,
+      scope: "this-process",
+      running_servers_affected: false,
+      vault_changed: false,
+    });
     expect(outText()).not.toContain("Passphrase cache cleared");
   });
 
@@ -2857,10 +2982,10 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
     expect(seeded.exitCode).toBe(0);
     lock();
     io.out.mockReset();
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    io.err.mockReset();
 
     const r = await runSecrets(
-      { action: "get", name: "GH", passphrase: PROSE_PASS, home, io: { stdin: idleStdin, stdout: ttyStdout, stderr } },
+      { action: "get", name: "GH", passphrase: PROSE_PASS, home, io: { stdin: idleStdin, stdout: ttyStdout } },
       io,
     );
     expect(r.exitCode).toBe(0);
@@ -2878,7 +3003,7 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
     expect(seeded.exitCode).toBe(0);
     lock();
     io.out.mockReset();
-    (stderr.write as unknown as ReturnType<typeof vi.fn>).mockReset();
+    io.err.mockReset();
 
     const r = await runSecrets(
       {
@@ -2886,7 +3011,7 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
         name: "GH",
         passphrase: PROSE_PASS,
         home,
-        io: { stdin: idleStdin, stdout: pipedStdout, stderr },
+        io: { stdin: idleStdin, stdout: pipedStdout },
       },
       io,
     );
@@ -2906,7 +3031,7 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
         name: "BAD",
         passphrase: PROSE_PASS,
         home,
-        io: { stdin: idleStdin, stdout: pipedStdout, stderr },
+        io: { stdin: idleStdin, stdout: pipedStdout },
       },
       io,
     );
@@ -2928,7 +3053,7 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
         name: "GOOD",
         passphrase: PROSE_PASS,
         home,
-        io: { stdin: idleStdin, stdout: pipedStdout, stderr },
+        io: { stdin: idleStdin, stdout: pipedStdout },
       },
       io,
     );
@@ -2946,7 +3071,7 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
         passphrase: PROSE_PASS,
         home,
         json: true,
-        io: { stdin: idleStdin, stdout: pipedStdout, stderr },
+        io: { stdin: idleStdin, stdout: pipedStdout },
       },
       io,
     );
@@ -2959,5 +3084,135 @@ describe("runSecrets -- the prose arms and the get side channels", () => {
     expect(parsed.hint).toContain('Entry "BAD" failed to decrypt');
     expect(parsed.hint).toContain("Remove it and set it again.");
     expect(outText()).toBe("");
+  });
+});
+
+// -----------------------------------------------------------------------
+// A vault written under schema v1 stays v1 forever: setSecret spreads the
+// vault it was given, and only rotate stamps the current version. The v2
+// name binding therefore never engages for a pre-v2 vault (a blob swapped
+// between two entries still decrypts), and until now no surface said so.
+// -----------------------------------------------------------------------
+
+describe("runSecrets -- a schema-v1 vault is reported once per command, and only rotate upgrades it", () => {
+  const io = { out: vi.fn(), err: vi.fn() };
+  const V1_PASS = "legacy-passphrase-xyz";
+  let home: string;
+
+  const outText = (): string => io.out.mock.calls.map((c) => c[0] as string).join("");
+  const errText = (): string => io.err.mock.calls.map((c) => c[0] as string).join("");
+  const onDiskVersion = (): number => JSON.parse(readFileSync(vaultPath(home), "utf8")).version as number;
+
+  /** A vault exactly as a pre-v2 build wrote it: version 1, no kdf, no
+   *  check marker, and an entry encrypted WITHOUT the name binding. Built by
+   *  hand because no code path produces one any more. */
+  async function writeV1Vault(): Promise<void> {
+    const salt = generateSalt();
+    const key = await deriveKey(V1_PASS, salt, LEGACY_KDF);
+    const legacy = { version: 1, salt: salt.toString("base64"), entries: { GH: encryptEntry("ghp_legacy", key) } };
+    writeFileSync(vaultPath(home), `${JSON.stringify(legacy, null, 2)}\n`, "utf8");
+  }
+
+  beforeEach(async () => {
+    io.out.mockReset();
+    io.err.mockReset();
+    lock();
+    delete process.env.YAW_MCP_VAULT_PASSPHRASE;
+    home = makeHome();
+    await mkdir(nodePath.join(home, ".yaw-mcp"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    lock();
+  });
+
+  it("list, get and set each say the vault is behind and name rotate as the upgrade", async () => {
+    await writeV1Vault();
+    for (const opts of [
+      { action: "list" as const },
+      { action: "get" as const, name: "GH", passphrase: V1_PASS },
+      { action: "set" as const, name: "NEW", value: "v", passphrase: V1_PASS },
+    ]) {
+      io.err.mockReset();
+      lock();
+      const r = await runSecrets({ ...opts, home }, io);
+      expect(r.exitCode, opts.action).toBe(0);
+      expect(errText(), opts.action).toContain("schema v1");
+      expect(errText(), opts.action).toContain("yaw-mcp secrets rotate");
+    }
+    // ...and `set` really did leave the file at v1: the notice is the ONLY
+    // thing that changed, which is exactly why it has to be printed.
+    expect(onDiskVersion()).toBe(1);
+  });
+
+  it("keeps --json stdout a single envelope with the notice on stderr as its own JSON line", async () => {
+    await writeV1Vault();
+    const r = await runSecrets({ action: "list", home, json: true }, io);
+    expect(r.exitCode).toBe(0);
+    // One parseable line on stdout; the notice must never land there.
+    expect(JSON.parse(outText())).toMatchObject({ ok: true, vault: true, keys: ["GH"] });
+    // ...and under --json the notice is JSON too, not prose: the error
+    // envelopes share this stream, so a wrapper parses it line by line.
+    expect(JSON.parse(errText())).toEqual({
+      warning: "schema-behind",
+      schema: 1,
+      current: SECRETS_SCHEMA_VERSION,
+      upgrade: "yaw-mcp secrets rotate",
+      path: vaultPath(home),
+    });
+  });
+
+  it("under --json a FAILING command on a v1 vault leaves stderr parseable line by line", async () => {
+    // The notice fires on every command that loads the vault, and every
+    // error envelope goes to stderr under --json. A prose notice ahead of the
+    // `{"ok":false,...}` envelope broke every wrapper that JSON.parses the
+    // stream -- for every failing list/get/set/remove, on every pre-v2 vault.
+    await writeV1Vault();
+    const r = await runSecrets({ action: "get", name: "NOPE", home, json: true }, io);
+    expect(r.exitCode).toBe(1);
+    expect(outText()).toBe("");
+    const lines = errText()
+      .split("\n")
+      .filter((l) => l.length > 0);
+    expect(lines).toHaveLength(2);
+    const parsed = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    // First the warning about the FILE, then the envelope for the COMMAND.
+    expect(parsed[0]).toMatchObject({ warning: "schema-behind", schema: 1, current: SECRETS_SCHEMA_VERSION });
+    // No `ok` on the warning line: `ok` is the error envelope's discriminator,
+    // and a wrapper keying on the first stderr line's `ok` must not read a
+    // failed command as fine.
+    expect(parsed[0]).not.toHaveProperty("ok");
+    expect(parsed[1]).toMatchObject({ ok: false, error: 'No secret named "NOPE" in the vault.' });
+  });
+
+  it("rotate rewrites the file at the current schema without nagging, and the notice stops", async () => {
+    await writeV1Vault();
+    const r = await runSecrets(
+      { action: "rotate", passphrase: V1_PASS, newPassphrase: "rotated-passphrase-xyz", home },
+      io,
+    );
+    expect(r.exitCode).toBe(0);
+    // rotate IS the upgrade -- telling the user to run it from inside it
+    // would be noise.
+    expect(errText()).not.toContain("schema v1");
+    expect(onDiskVersion()).toBe(SECRETS_SCHEMA_VERSION);
+
+    io.err.mockReset();
+    lock();
+    const listed = await runSecrets({ action: "list", home }, io);
+    expect(listed.exitCode).toBe(0);
+    expect(errText()).toBe("");
+  });
+
+  it("stays silent for a vault already at the current schema", async () => {
+    const seeded = await runSecrets({ action: "set", name: "GH", value: "ghp_abc", passphrase: V1_PASS, home }, io);
+    expect(seeded.exitCode).toBe(0);
+    expect(onDiskVersion()).toBe(SECRETS_SCHEMA_VERSION);
+    io.err.mockReset();
+    lock();
+    const r = await runSecrets({ action: "list", home }, io);
+    expect(r.exitCode).toBe(0);
+    expect(errText()).toBe("");
   });
 });

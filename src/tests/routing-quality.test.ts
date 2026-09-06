@@ -32,9 +32,10 @@ import { type RankableServer, rankServers } from "../relevance.js";
 // Both are deliberately unit tests, not live-backend integration tests.
 // ═══════════════════════════════════════════════════════════════════════
 
-// Realistic seed of 15 MCP servers drawn from the mcp.hosting catalog.
-// Descriptions + tool metadata match what the dashboard surfaces, which
-// is what the ranker actually sees in production.
+// Realistic seed of 15 MCP servers drawn from the public catalog
+// (yaw.sh/mcp/catalog). Descriptions + tool metadata match what a
+// representative install carries, which is what the ranker actually sees
+// in production.
 const CORPUS: RankableServer[] = [
   {
     namespace: "github",

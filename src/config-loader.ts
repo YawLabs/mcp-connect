@@ -76,19 +76,16 @@ export interface LoadConfigOptions {
   cwd?: string;
   /** Home directory override for tests. Defaults to os.homedir(). */
   home?: string;
-  /** Process env override for tests. Currently unread: the only env vars
-   *  this loader ever consulted were YAW_MCP_TOKEN / YAW_MCP_URL, both
-   *  retired with the hosted backend. Kept on the options type so the many
-   *  existing call sites (server boot, doctor, every CLI subcommand) keep
-   *  compiling through the deprecation window.
+  /** Process env the loader consults. Read for exactly ONE key: paths.ts's
+   *  ALLOW_UNOWNED_ENV opt-in, which the project-dir walk needs when
+   *  ownership is unverifiable (win32). Everything else this loader once read
+   *  from the env (YAW_MCP_TOKEN / YAW_MCP_URL) retired with the hosted
+   *  backend. Defaults to process.env; doctor (doctor-cmd.ts, the shared
+   *  collector) and the tests pass a synthetic one so the walk's trust
+   *  decision can be probed without stubbing the real environment.
    *
-   *  REMOVAL TARGET: delete this field, the two doctor-cmd.ts call sites
-   *  that still thread it (runDoctor / runDoctorJson), and the `env: {}`
-   *  arguments in config-loader.test.ts together, in one change. It is kept
-   *  ONLY to avoid a cross-file churn commit; nothing reads it, so no
-   *  behavior depends on the removal date. If a future config key does need
-   *  an env override, wire that key up explicitly rather than reviving this
-   *  as a general escape hatch. */
+   *  Wire any future env-dependent key up explicitly, the way this one is --
+   *  do not turn the field back into a general escape hatch. */
   env?: NodeJS.ProcessEnv;
 }
 
@@ -143,8 +140,10 @@ function deprecatedKeyWarning(path: string, keys: string[]): string {
 
 /** Filter a config array field down to its usable string entries. Warns when
  *  entries are dropped, when the field isn't an array at all, and when a
- *  surviving entry can't be a namespace (mirroring the apiBase field, which
- *  warns rather than silently swallowing an unusable value). Returns undefined
+ *  surviving entry can't be a namespace (warning rather than silently
+ *  swallowing an unusable value -- the rule every field in this loader
+ *  follows; the retired `apiBase` / `token` keys are warned about the same
+ *  way when they are merely present). Returns undefined
  *  when the field isn't an array OR when every entry was invalid: a
  *  non-empty array that filters to [] must fall THROUGH to the parent scope
  *  rather than resolve to [] -- an empty allow-list means allow-all in
@@ -373,7 +372,7 @@ export async function loadYawMcpConfig(opts: LoadConfigOptions = {}): Promise<Re
   // (cwd, home) so repeat loads in one process don't re-walk the tree.
   await migrateLegacyConfigPathsOnce(cwd, home);
 
-  const projectConfigDir = await findProjectConfigDir(cwd, home).catch((err) => {
+  const projectConfigDir = await findProjectConfigDir(cwd, home, opts.env).catch((err) => {
     log("warn", "Failed searching for project .yaw-mcp/ dir", {
       error: err instanceof Error ? err.message : String(err),
     });

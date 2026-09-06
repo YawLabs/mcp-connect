@@ -460,6 +460,33 @@ describe("redactSecretArgs", () => {
     expect(redactSecretArgs(["--token", "abc", "--port", "3000"])).toEqual(["--token", "<redacted>", "--port", "3000"]);
   });
 
+  it("redacts the value after a secret-bearing HEADER NAME arg (`X-Api-Key:` then the key)", () => {
+    // Not a flag (no dash), so SECRET_FLAG_RE never matched it, and once the
+    // preamble scrubs args one at a time the lone value arg has nothing for
+    // health-score's rules to anchor on -- the joined-line scrub used to
+    // catch this shape and per-arg scrubbing lost it. The name has to END in
+    // `:` or `=`, which is what makes the next arg its value.
+    expect(redactSecretArgs(["-H", "X-Api-Key:", "abc123def456ghi789", "/srv/data"])).toEqual([
+      "-H",
+      "X-Api-Key:",
+      "<redacted>",
+      "/srv/data",
+    ]);
+    // A scheme word between the name and the blob stays legible; the blob
+    // after it is the value.
+    expect(redactSecretArgs(["--header", "Authorization:", "Bearer", "hunter2hunter2", "serve"])).toEqual([
+      "--header",
+      "Authorization:",
+      "Bearer",
+      "<redacted>",
+      "serve",
+    ]);
+    // A header name with nothing after it, and a header name that carries
+    // its value inline, are untouched by this rule (the inline shape is
+    // health-score's, in the second pass).
+    expect(redactSecretArgs(["--port", "3000", "X-Api-Key:"])).toEqual(["--port", "3000", "X-Api-Key:"]);
+  });
+
   it("redacts the --flag=value shape", () => {
     expect(redactSecretArgs(["--api-key=sk-live-123"])).toEqual(["--api-key=<redacted>"]);
   });
@@ -538,6 +565,80 @@ describe("runAudit preamble redaction", () => {
     expect(stdout).toContain("--API-KEY=<redacted>");
     // Non-secret args survive untouched so the operator still sees the shape.
     expect(stdout).toContain("--port 3000");
+  });
+
+  it("scrubs each arg on its own, so a header arg's redaction tail cannot swallow the args after it", async () => {
+    // Scrubbing the space-JOINED args let rule 2's whole-clause tail run past
+    // the argument boundary: `-H X-Api-Key: abc /srv/data --port 3000` came
+    // out as `-H X-Api-Key: <redacted> --port 3000` with the path gone, and a
+    // trailing positional after the header vanished entirely. Per-arg
+    // scrubbing bounds the tail at the argument.
+    const rawArgs = ["-H", "X-Api-Key: abc123def456", "/srv/data", "--port", "3000", "serve", "/srv"];
+    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: rawArgs }]);
+    const io = captureIO();
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async () => ({ grade: "A", score: 100 }),
+    });
+    expect(r.exitCode).toBe(0);
+    const stdout = io.out.join("\n");
+    expect(stdout).not.toContain("abc123def456");
+    expect(stdout).toContain("X-Api-Key: <redacted>");
+    expect(stdout).toContain("/srv/data");
+    expect(stdout).toContain("--port 3000");
+    expect(stdout).toContain("serve /srv");
+  });
+
+  it("scrubs a credential that is NOT a --flag value: a query string, a header arg, a JSON body", async () => {
+    // redactSecretArgs knows the `--flag value` / `--flag=value` shapes and
+    // nothing else, so a key inside a URL, an `Authorization:` header arg or
+    // an inline JSON body printed in the clear in the interactive preamble --
+    // scrollback, screen shares, pasted support output. The joined args now
+    // also go through health-score's scrubForWarning, which covers exactly
+    // those shapes. Still display-only: the runner gets the raw argv.
+    const rawArgs = [
+      "x.js",
+      "--url",
+      "https://api.example.test/x?api_key=sk-live-1234567890",
+      "-H",
+      "Authorization: Bearer abc123def456ghi789",
+      '--body={"token":"tok_9f8e7d6c5b4a"}',
+      "--port",
+      "3000",
+    ];
+    home = makeHome([{ namespace: "ctxlint", type: "local", command: "node", args: rawArgs }]);
+    const io = captureIO();
+    let seenArgs: string[] = [];
+    const r = await runAudit({
+      namespace: "ctxlint",
+      home,
+      cwd: home,
+      out: io.push,
+      err: io.pushErr,
+      runner: async (target) => {
+        seenArgs = target.args;
+        return { grade: "A", score: 100 };
+      },
+    });
+    expect(r.exitCode).toBe(0);
+    const stdout = io.out.join("\n");
+    expect(stdout).toContain("Auditing");
+    expect(stdout).not.toContain("sk-live-1234567890");
+    expect(stdout).not.toContain("abc123def456ghi789");
+    expect(stdout).not.toContain("tok_9f8e7d6c5b4a");
+    // The shape survives so the operator can still read WHICH arg carried it.
+    expect(stdout).toContain("--url https://api.example.test/x?api_key=<redacted>");
+    expect(stdout).toContain("-H Authorization: <redacted>");
+    expect(stdout).toContain('--body={"token":"<redacted>"}');
+    expect(stdout).toContain("--port 3000");
+    // The framing around the args is intact: the scrub runs over the ARGS, not
+    // the whole line, so its whole-clause tail cannot eat the closing paren.
+    expect(stdout).toMatch(/--port 3000\)\.\.\./);
+    expect(seenArgs).toEqual(rawArgs);
   });
 
   it("passes the UNREDACTED args to the runner (redaction is display-only)", async () => {

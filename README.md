@@ -62,7 +62,7 @@ This edits the chosen client's config (correct path + JSON shape for your OS) to
 Useful flags:
 
 - `--scope user|project|local` -- which file to write (Claude Code + Cursor support project/local; VS Code is workspace-only; Claude Desktop is user-only).
-- `--dry-run` -- print the diff and exit without writing.
+- `--dry-run` -- print what would be added (never the rest of the file) and exit without writing.
 - `--force` / `--skip` -- overwrite or leave an existing `mcp` entry (otherwise prompts on a TTY, refuses off-TTY).
 
 Or do every detected client at once:
@@ -171,9 +171,12 @@ yaw-mcp remove <slug-or-namespace>                 # drop a server
 yaw-mcp list [--json]                              # list configured servers with their cached compliance grade
 yaw-mcp try <slug> [--client <name>] [--ttl 1h]    # wire a one-off trial straight into your client (expires)
 yaw-mcp try-cleanup <slug>                          # remove a trial early (doctor GCs expired ones)
+yaw-mcp trust [--yes|--list|--revoke [<path>]]     # approve the project-local .yaw-mcp/bundles.json found from cwd so yaw-mcp loads it (pinned to its exact contents)
 ```
 
-`add` is not `install`: `install <client>` connects an AI client to yaw-mcp; `add <slug>` adds an MCP server to yaw-mcp itself. `try` points the client directly at the upstream server, bypassing yaw-mcp, so you can evaluate it in isolation.
+`add` is not `install`: `install <client>` connects an AI client to yaw-mcp; `add <slug>` adds an MCP server to yaw-mcp itself. `try` points the client directly at the upstream server, bypassing yaw-mcp, so you can evaluate it in isolation. A `--env` value lands in your shell history and process argv like any argument. With `add` it is stored in plain text (file mode `0600`) in `bundles.json` -- keep real credentials in the [local secret vault](#local-secret-vault) and pass `--env KEY='${secret:NAME}'` instead (the single quotes are for bash, zsh and PowerShell; in cmd.exe pass it unquoted, since `$` is not special there and cmd.exe would keep the quotes as part of the value). A `missing` row in `yaw-mcp secrets audit` whose name starts with `<malformed ref>` is a reference that did not parse -- fix the typo in `bundles.json`. With `try` the value is written inline, in plain text, into the client's own config for the trial's lifetime, and is not vault-resolved (the client spawns the server, not yaw-mcp).
+
+A project-local `.yaw-mcp/bundles.json` (committed with a repo) is ignored until `yaw-mcp trust` approves it, since every server in it is a command yaw-mcp spawns as you. Approval is pinned to the file's exact contents, so an edited file needs approving again; `--list` shows approvals (stale ones flagged) and `--revoke` withdraws one. Your own `~/.yaw-mcp/bundles.json` is never gated.
 
 **Inspection & maintenance**
 
@@ -240,7 +243,7 @@ At spawn time, if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own env, it dec
 
 **Where the passphrase comes from.** Three ways, in the order you'll meet them:
 
-1. **`YAW_MCP_VAULT_PASSPHRASE` in yaw-mcp's own env** -- the `env` block of the *yaw-mcp* entry in your MCP client config, not the upstream server's (yaw-mcp strips its own secrets from every child env). This is the only option for a spawn, which happens over stdio with no terminal to prompt on.
+1. **`YAW_MCP_VAULT_PASSPHRASE` in yaw-mcp's own env** -- the `env` block of the *yaw-mcp* entry in your MCP client config, not the upstream server's (yaw-mcp strips its own secrets from the env of every child it starts: every server it spawns, the npm runs behind its self-upgrade and the daily sidecar refresh, and the compliance suite). This is the only option for a spawn, which happens over stdio with no terminal to prompt on.
 2. **An in-session prompt.** If your client supports MCP [elicitation](https://modelcontextprotocol.io/specification/server/elicitation), a locked vault asks for the passphrase once per session and retries the server. It's held in memory for that session only -- never written to disk, and never handed to the server being started.
 3. **The CLI prompt**, for `yaw-mcp secrets` runs: no-echo on a real TTY. Note that Git Bash/MSYS can't offer one (Node sees pipes, not a TTY) -- use PowerShell, `winpty`, or the env var there.
 
@@ -251,7 +254,7 @@ yaw-mcp secrets set <name>      # store a value (no-echo prompt, or --value/--st
 yaw-mcp secrets get <name>      # decrypt and print one value
 yaw-mcp secrets list            # show entry NAMES only (values stay encrypted)
 yaw-mcp secrets remove <name>   # delete an entry
-yaw-mcp secrets lock            # clear the in-process passphrase cache
+yaw-mcp secrets lock            # forget this process's cached passphrase -- effectively a no-op from the CLI; cannot reach a running server or change the vault
 yaw-mcp secrets rotate          # re-encrypt the whole vault under a NEW passphrase
 yaw-mcp secrets audit [--secret NAME] [--server NS] [--json]   # who consumed which secret, when
 ```
@@ -273,7 +276,7 @@ MCP servers are third-party code you choose to run. yaw-mcp doesn't sandbox them
 - **Compliance grades (A-F)** -- the `@yawlabs/mcp-compliance` suite (88 tests) grades a server; `yaw-mcp list` shows it in a `GRADE` column and `discover` shows it inline (`github [ready] [A]`). `YAW_MCP_MIN_COMPLIANCE=B` makes `activate` refuse anything below the floor. Ungraded servers pass (don't punish unknown); audit them yourself with `yaw-mcp compliance <target>`.
 - **Source transparency** -- `list` and `discover` show the exact `command`, `args`, and `url` each server launches with. Nothing is wrapped.
 - **Local credentials** -- vault values are encrypted at rest (scrypt + AES-256-GCM), injected at spawn, and never logged. Nothing is transmitted off the machine.
-- **Response pruning** (`YAW_MCP_PRUNE_RESPONSES`, on by default) -- redacts large file-blob content before it reaches the model, cutting the easiest cross-server prompt-injection vector.
+- **Response pruning** (`YAW_MCP_PRUNE_RESPONSES`, on by default) -- trims token cost by dropping no-information keys (null / empty array / empty object) and trimming trailing whitespace and long blank runs in text results. Structured values are never altered or redacted; it is a token-savings feature, not a security control.
 - **Namespace isolation** -- tools are namespace-prefixed (`gh_create_issue`, never bare `create_issue`), so a server can't impersonate another's tools. `mcp_connect_read_tool` inspects a schema before any code runs.
 
 yaw-mcp does **not** block outbound traffic, firewall DNS, analyze source, or pin hashes -- a malicious server you chose to run can reach any URL your machine can. Review the command before adding a server, run untrusted ones under a restricted user or container, and prefer graded servers when alternatives are equivalent. Report a security issue in yaw-mcp itself via [GitHub private advisories](https://github.com/YawLabs/mcp/security/advisories/new) (see [`SECURITY.md`](./SECURITY.md)).
@@ -291,11 +294,17 @@ Common ones (run `yaw-mcp --help` for the full list):
 | `YAW_MCP_SERVER_CAP` | Max concurrently active servers. Default `6`; `0` disables the cap. |
 | `YAW_MCP_MIN_COMPLIANCE` | Minimum grade (`A`-`F`) an installed server must report before `activate` loads it. |
 | `YAW_MCP_VAULT_PASSPHRASE` | Passphrase for the local secret vault. Required for spawn-time `${secret:NAME}` substitution -- set it in yaw-mcp's own env, not the upstream server's. Clients supporting elicitation prompt for it instead. |
+| `YAW_MCP_TRUST_PROJECT` | `1` skips the consent check on a project-local `.yaw-mcp/bundles.json` and loads it unconditionally. CI/automation only -- it lets any repo you run yaw-mcp inside spawn commands as you. Default: the file must be approved with `yaw-mcp trust`. |
 | `YAW_MCP_AUTO_ACTIVATE` | `0` disables discover auto-loading a clearly-winning server. Default on. |
 | `YAW_MCP_AUTO_UPGRADE` | `0` disables the background self-upgrade check at startup. Default on. |
 | `YAW_MCP_SIDECAR_REFRESH` | `0` disables the daily background check that keeps managed sidecars current. Only ever runs if you have run `yaw-mcp sidecars install`; explicit pins and semver ranges are never moved. Default on. |
+| `OAM_BIN` | Path to the `oam` binary to use instead of the one on `PATH`. A path that does not exist is reported by `doctor` as an unusable oam (fix the variable), not as oam being absent. |
+| `OAM_MAX_HEAP_MB` | Raises the V8 heap cap oam applies to a hosted server (4 GiB by default since oam 0.9.2). Set it in that server's `env` when a hosted sidecar dies with a heap out-of-memory error, or give that server `"runtime": "node"`. |
 | `YAW_MCP_AUTO_LOAD` | `1` pre-activates the top recurring pack at startup (needs persistence). Default off. |
 | `YAW_MCP_PRUNE_RESPONSES` | `0` disables response pruning. Default on. |
+| `MCP_CONNECT_TIMEOUT` | Milliseconds to wait for a server's MCP handshake. Default `15000`; a server's own `connectTimeoutMs` in `bundles.json` always wins. Whole milliseconds in `1..2147483647` -- anything else falls back to the default with one warn. |
+| `MCP_LIST_TIMEOUT` | Milliseconds to wait for a server's tool/resource/prompt inventory calls after the handshake. Default `15000`; same `1..2147483647` whole-millisecond parse, invalid values fall back with one warn. |
+| `MCP_CALL_TIMEOUT` | Milliseconds to wait for a single proxied `tools/call`. Default `60000` (the SDK's own bound); raise it for legitimately slow servers. Same `1..2147483647` whole-millisecond parse, invalid values fall back with one warn. |
 | `YAW_MCP_IDLE_THRESHOLD` | Non-matching tool calls a loaded server tolerates before it is unloaded. Default `10`; bursty servers earn more patience automatically. The older name `MCP_CONNECT_IDLE_THRESHOLD` still works as a fallback. |
 | `YAW_MCP_DISABLE_PERSISTENCE` | `1` keeps learning + pack history process-scoped (CI, containers). Default off. |
 | `LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error`. Default `info`. |
