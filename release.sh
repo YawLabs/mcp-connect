@@ -26,12 +26,26 @@
 # Environment:
 #   SKIP_CONFIRM=1                   skip the y/N confirm prompt
 #   NO_COLOR=1                       disable ANSI colors
-#   SKIP_LINT=1                      DISABLES THE LINT GATE. win32-arm64
-#                                    escape hatch only -- biome segfaults
-#                                    there on every input, so the tolerance
-#                                    paths in run_npm_check can never engage.
-#                                    Typecheck + tests still gate the release;
-#                                    formatting goes unverified on that host.
+#   SKIP_LINT=1                      DISABLES THE LINT GATE. Legacy win32-arm64
+#                                    escape hatch: biome 2.5.x segfaulted there
+#                                    on every input with no output, so the
+#                                    tolerance paths in run_npm_check could not
+#                                    engage. Fixed in v0.72.0 by pinning biome
+#                                    to 2.4.16 (66c48f3; the pin lives at
+#                                    package.json:42), and lint runs clean on
+#                                    win32-arm64 with it. Kept as an escape
+#                                    valve for a future regression, NOT a
+#                                    required workaround -- a failing lint on
+#                                    this host is a real finding, or a broken
+#                                    install (check node_modules is populated),
+#                                    until proven otherwise. Typecheck + tests
+#                                    still gate the release; formatting goes
+#                                    unverified whenever it is set.
+#   ALLOW_STALE_REMOTE=1             Downgrade a failed pre-flight `git fetch`
+#                                    from a hard stop to a warning. The
+#                                    origin/main sync guard then runs against a
+#                                    STALE remote-tracking ref. Deliberate
+#                                    degraded runs only.
 #   GITHUB_TOKEN=<pat>               GitHub token for the step-5 MCP-registry
 #                                    login (needs publish rights on
 #                                    io.github.YawLabs/*). Only read when the
@@ -125,7 +139,10 @@ fail() { FAIL_LINE="${BASH_LINENO[0]}"; echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 MCP_PUBLISHER_VERSION="v1.7.9"
 
 # MINGW64 on Windows ARM64 intermittently segfaults in npm's exit cleanup AFTER
-# a tool has finished and printed its report. The tool's OUTPUT is authoritative:
+# a tool has finished and printed its report. This is npm's WRAPPER, not any one
+# tool -- distinct from the biome-2.5.x binary crash that v0.72.0 fixed by
+# pinning 2.4.16 (package.json:42); do not merge the two. Being intermittent, a
+# clean run does not retire it. The tool's OUTPUT is authoritative:
 # a 139/134 from `npm run` is tolerated only if the tool's own success marker is
 # in the captured output (or a direct re-run bypasses the wrapper). Other
 # platforms treat any non-zero as a hard failure.
@@ -139,14 +156,21 @@ esac
 # verify command (no npm-run wrapper) for tools that print no completion marker.
 run_npm_check() {
   local label="$1" script="$2" fail_re="$3" done_re="${4:-}" verify_cmd="${5:-}" out rc=0
-  # SKIP_LINT=1 escape hatch, matching every sibling @yawlabs release.sh. The
-  # win32-arm64 biome binary segfaults (139) on THIS repo for every input --
-  # `npm run lint`, `npx biome check src/`, a single file, and the direct
-  # node_modules binary all die with zero output, so neither the done_re nor the
-  # verify_cmd tolerance path below can ever engage. Types and tests still gate
-  # the release; formatting goes unverified on this host.
+  # SKIP_LINT=1 escape hatch, matching every sibling @yawlabs release.sh.
+  # HISTORY, not present tense: under biome ^2.5.0 the win32-arm64 binary
+  # segfaulted (139) on THIS repo for every input -- `npm run lint`, `npx biome
+  # check src/`, a single file, and the direct node_modules binary all died with
+  # zero output, so neither the done_re nor the verify_cmd path below could
+  # engage (bc2076e, 2026-07-21 17:01). Superseded 79 minutes later by 66c48f3,
+  # which pinned biome to 2.4.16 exactly; CHANGELOG 0.72.0 records it.
+  # Re-checked 2026-09-06 on win32-arm64 (MINGW64, biome 2.4.16): `npm run lint`
+  # AND the direct node_modules binary both exit 0 printing "Checked 162 files"
+  # -- which is exactly what the Lint call site's done_re matches, so that
+  # tolerance path is LIVE, not unreachable. Retained for a future regression
+  # only. Types and tests still gate the release; formatting goes unverified
+  # whenever it is set.
   if [ "${SKIP_LINT:-}" = "1" ] && [[ "$script" == lint* ]]; then
-    warn "SKIP_LINT=1 -- skipping '$label' (biome segfaults on win32-arm64)"
+    warn "SKIP_LINT=1 -- skipping '$label' (lint gate disabled by request; formatting goes unverified)"
     return 0
   fi
   # `|| rc=$?` is load-bearing: under `set -e` a bare `out=$(npm run ...)` whose
@@ -387,7 +411,20 @@ fi
 
 # Pull the latest remote tags + commits so we can detect a stale local view of
 # HEAD (e.g. a previous interrupted run that already pushed the bump).
-git fetch --tags --prune origin >/dev/null 2>&1 || warn "git fetch failed (offline?) -- proceeding with local state"
+# A failed fetch was previously downgraded to a warning, which was worse than
+# useless: the guard below reads refs/remotes/origin/main, a LOCAL ref the
+# failed fetch never touched, so it compared HEAD against a stale snapshot and
+# passed cleanly. The "offline?" rationale did not hold either -- this script
+# cannot finish offline; it pushes in step 3, publishes to npm in step 4, and
+# downloads mcp-publisher from github.com in step 5. Tolerating the failure
+# bought nothing and cost the guard.
+if ! git fetch --tags --prune origin >/dev/null 2>&1; then
+  if [ "${ALLOW_STALE_REMOTE:-}" = "1" ]; then
+    warn "git fetch failed and ALLOW_STALE_REMOTE=1 -- the origin/main sync guard below is running against a STALE remote-tracking ref"
+  else
+    fail "git fetch origin failed -- refusing to release on a stale view of origin/main. The sync guard below reads the local remote-tracking ref, so it would pass on stale data and step 3's push would then be rejected non-fast-forward AFTER the bump commit and the annotated tag already exist. Probe with 'git ls-remote origin', fix connectivity or auth, and re-run. Override with ALLOW_STALE_REMOTE=1."
+  fi
+fi
 LOCAL_HEAD=$(current_head_sha)
 REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
 if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
