@@ -460,6 +460,33 @@ describe("redactSecretArgs", () => {
     expect(redactSecretArgs(["--token", "abc", "--port", "3000"])).toEqual(["--token", "<redacted>", "--port", "3000"]);
   });
 
+  it("redacts the value after a secret-bearing HEADER NAME arg (`X-Api-Key:` then the key)", () => {
+    // Not a flag (no dash), so SECRET_FLAG_RE never matched it, and once the
+    // preamble scrubs args one at a time the lone value arg has nothing for
+    // health-score's rules to anchor on -- the joined-line scrub used to
+    // catch this shape and per-arg scrubbing lost it. The name has to END in
+    // `:` or `=`, which is what makes the next arg its value.
+    expect(redactSecretArgs(["-H", "X-Api-Key:", "abc123def456ghi789", "/srv/data"])).toEqual([
+      "-H",
+      "X-Api-Key:",
+      "<redacted>",
+      "/srv/data",
+    ]);
+    // A scheme word between the name and the blob stays legible; the blob
+    // after it is the value.
+    expect(redactSecretArgs(["--header", "Authorization:", "Bearer", "hunter2hunter2", "serve"])).toEqual([
+      "--header",
+      "Authorization:",
+      "Bearer",
+      "<redacted>",
+      "serve",
+    ]);
+    // A header name with nothing after it, and a header name that carries
+    // its value inline, are untouched by this rule (the inline shape is
+    // health-score's, in the second pass).
+    expect(redactSecretArgs(["--port", "3000", "X-Api-Key:"])).toEqual(["--port", "3000", "X-Api-Key:"]);
+  });
+
   it("redacts the --flag=value shape", () => {
     expect(redactSecretArgs(["--api-key=sk-live-123"])).toEqual(["--api-key=<redacted>"]);
   });

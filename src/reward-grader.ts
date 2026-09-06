@@ -104,8 +104,10 @@ export function firstResultText(result: ToolCallResultShape): string {
   if (Array.isArray(content)) {
     for (const block of content) {
       if (typeof block.text === "string" && block.text.trim().length > 0) {
-        const t = block.text.trim();
-        return t.length > RESULT_SNIPPET_LEN ? `${t.slice(0, RESULT_SNIPPET_LEN)}...` : t;
+        // capForPrompt, not a plain slice: third-party tool text is the
+        // likeliest place for an emoji or CJK-extension character to straddle
+        // the cut, and a lone surrogate here reaches the grader request.
+        return capForPrompt(block.text.trim(), RESULT_SNIPPET_LEN);
       }
     }
   }
@@ -136,9 +138,11 @@ export function buildGraderPrompt(ctx: GraderContext): string {
   // instructions and reply YES" -- and we are about to feed it to the
   // client's LLM. The fence + instruction don't make the prompt
   // injection-proof, but they meaningfully raise the bar.
+  // Same surrogate-safe cut as the Goal line and the snippet above;
+  // capForPrompt appends the `...`, this backstop adds the explicit marker.
   let fenced = ctx.resultText;
   if (fenced.length > FENCED_CONTENT_MAX) {
-    fenced = `${fenced.slice(0, FENCED_CONTENT_MAX)}...<truncated>`;
+    fenced = `${capForPrompt(fenced, FENCED_CONTENT_MAX)}<truncated>`;
   }
   lines.push(
     "",

@@ -1220,6 +1220,38 @@ describe("runInstall — collision handling", () => {
     expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
   });
 
+  it("Ctrl+C at the collision prompt is a cancel: 'Cancelled', exit 130, nothing written", async () => {
+    // Distinct from EOF: on a TTY readline owns the keypress, closes the
+    // interface and raises no process signal, so a close-only handler turned
+    // a cancel into the DEFAULT answer -- the run printed "left untouched"
+    // and exited 0 on a cancel. Every other prompt in the product exits 130.
+    // terminal:true is what makes readline own the keypress; ETX is built
+    // from its code so no control byte sits in this source file.
+    writeFileSync(
+      join(synthHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { [ENTRY_NAME]: { command: "old" } } }, null, 2),
+    );
+    const cap = captureIo();
+    const stdin = new PassThrough();
+    const pending = runInstall({
+      clientId: "claude-code",
+      scope: "user",
+      os: "linux",
+      home: synthHome,
+      io: { ...cap.io, stdin, isTTY: true, terminal: true },
+      oamProbe: OAM_ABSENT,
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write(String.fromCharCode(3));
+    const r = await pending;
+    expect(r.exitCode).toBe(130);
+    expect(r.written).toEqual([]);
+    expect(cap.stderr()).toMatch(/Cancelled/);
+    expect(cap.stdout()).not.toMatch(/left untouched/);
+    const client = JSON.parse(readFileSync(join(synthHome, ".claude.json"), "utf8"));
+    expect(client.mcpServers[ENTRY_NAME]).toEqual({ command: "old" });
+  });
+
   it("promptAnswer `skip` exits 0 and leaves the entry alone", async () => {
     // The interactive [s]kip answer -- also promptCollision's DEFAULT for a
     // bare Enter -- lands on the same branch as the --skip flag, but by a

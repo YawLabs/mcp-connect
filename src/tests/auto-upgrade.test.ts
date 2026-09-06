@@ -1338,33 +1338,42 @@ describe("acquireUpgradeLock", () => {
     expect(acquireUpgradeLock(dir)).toBeNull();
   });
 
-  it("steals a fresh lock whose holder process no longer exists", () => {
-    // An MCP client that kills `serve` mid-refresh leaves a lock with a live
-    // mtime and a dead pid. The mtime rule alone honoured it for the full
-    // stale window, refusing the documented recovery command with "try again
-    // in a minute" for ten of them. The pid in the file is the tell.
+  it("steals a fresh lock whose holder process no longer exists -- when the caller opts in", () => {
+    // A killed Yaw Terminal leaves the bundles.json lock with a live mtime
+    // and a dead pid. The mtime rule alone honoured it for the full stale
+    // window, refusing every add/remove for ten minutes. The pid in the file
+    // is the tell -- for a caller whose critical section dies WITH the holder.
     acquireUpgradeLock(dir);
     // A pid that cannot be running: far above any real pid space on every
     // supported OS, and never this process.
     writeFileSync(lockFile(), `${2 ** 31 - 2}\n`);
-    const stolen = acquireUpgradeLock(dir);
+    const stolen = acquireUpgradeLock(dir, undefined, { probeHolder: true });
     expect(stolen).toBeTypeOf("function");
     // The new holder's own pid is now on file, so its release is recognised.
     expect(readFileSync(lockFile(), "utf8").trim()).toBe(String(process.pid));
   });
 
-  it("keeps honouring a fresh lock whose holder is alive (this process stands in)", () => {
-    // Positive control for the test above: a live pid with a fresh mtime is
-    // still contention, so the liveness probe cannot have turned every held
-    // lock into a stealable one.
+  it("does NOT probe the holder by default: a dead pid with a fresh mtime is still honoured", () => {
+    // The self-upgrade and sidecars locks guard an npm CHILD that survives a
+    // plain parent exit on POSIX, so the holder's death does not end the
+    // critical section -- stealing on it would put a second npm reify on the
+    // tree the orphan is still writing. Those callers pass no opts.
     acquireUpgradeLock(dir);
+    writeFileSync(lockFile(), `${2 ** 31 - 2}\n`);
     expect(acquireUpgradeLock(dir)).toBeNull();
+  });
+
+  it("keeps honouring a fresh lock whose holder is alive even with the probe on", () => {
+    // Positive control: a live pid with a fresh mtime is still contention, so
+    // the probe cannot have turned every held lock into a stealable one.
+    acquireUpgradeLock(dir);
+    expect(acquireUpgradeLock(dir, undefined, { probeHolder: true })).toBeNull();
   });
 
   it("honours a fresh lock whose holder cannot be parsed, letting the mtime rule bound the wait", () => {
     acquireUpgradeLock(dir);
     writeFileSync(lockFile(), "not-a-pid\n");
-    expect(acquireUpgradeLock(dir)).toBeNull();
+    expect(acquireUpgradeLock(dir, undefined, { probeHolder: true })).toBeNull();
   });
 
   it("records the attempt in a tmpdir fallback when the prefix is unwritable, so a cached check cannot re-spawn every start", () => {

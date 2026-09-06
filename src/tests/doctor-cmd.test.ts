@@ -25,6 +25,7 @@ import {
 import { claudeCodeProjectKey, ENTRY_NAME } from "../install-targets.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
+import { SECRETS_SCHEMA_VERSION } from "../secrets-vault.js";
 
 /** The shape probeOam returns when oam is not installed at all. */
 const oamNotInstalled = () => ({
@@ -3109,7 +3110,10 @@ describe("runDoctor — SECRET VAULT", () => {
     mkdirSync(join(synthHome, ".yaw-mcp"), { recursive: true });
     writeFileSync(
       join(synthHome, ".yaw-mcp", "secrets.json"),
-      JSON.stringify({ version: 2, salt: SALT_B64, kdf: { N: 16384, r: 8, p: 1 }, entries }),
+      // The CURRENT schema, derived from the constant the code under test
+      // compares against, so a bump does not turn this fixture into a
+      // "behind" vault and fail the no-nudge assertion for the wrong reason.
+      JSON.stringify({ version: SECRETS_SCHEMA_VERSION, salt: SALT_B64, kdf: { N: 16384, r: 8, p: 1 }, entries }),
     );
   }
 
@@ -3205,7 +3209,7 @@ describe("runDoctor — SECRET VAULT", () => {
     writeVault({ gh: { iv: "x", ciphertext: "y", authTag: "z" } });
     const cap2 = captureOut();
     await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap2.out });
-    expect(cap2.text()).toContain("schema:     v2\n");
+    expect(cap2.text()).toContain(`schema:     v${SECRETS_SCHEMA_VERSION}\n`);
     expect(cap2.text()).not.toContain("secrets rotate");
   });
 
@@ -3222,7 +3226,7 @@ describe("runDoctor — SECRET VAULT", () => {
       skipRegistryCheck: true,
     });
     const parsed = JSON.parse(r.lines[0]);
-    expect(parsed.vault).toMatchObject({ exists: true, schemaVersion: 2 });
+    expect(parsed.vault).toMatchObject({ exists: true, schemaVersion: SECRETS_SCHEMA_VERSION });
   });
 
   it("names a MALFORMED ref the spawn is refused over, on both surfaces, even with no vault", async () => {
@@ -3251,7 +3255,7 @@ describe("runDoctor — SECRET VAULT", () => {
     const txt = cap.text();
     expect(txt).toContain("SECRET VAULT");
     expect(txt).toContain("malformed:  refs the spawn is REFUSED over");
-    expect(txt).toContain("gh: <malformed ref> ${secret:gh token}");
+    expect(txt).toContain("gh: <malformed ref> ${secret:gh ...");
 
     const cap2 = captureOut();
     const r = await runDoctor({
@@ -3264,7 +3268,7 @@ describe("runDoctor — SECRET VAULT", () => {
       skipRegistryCheck: true,
     });
     const parsed = JSON.parse(r.lines[0]);
-    expect(parsed.vault.malformed).toEqual([{ namespace: "gh", refs: ["<malformed ref> ${secret:gh token}"] }]);
+    expect(parsed.vault.malformed).toEqual([{ namespace: "gh", refs: ["<malformed ref> ${secret:gh ..."] }]);
   });
 
   it("names the servers whose env references the vault", async () => {

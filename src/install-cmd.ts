@@ -82,7 +82,7 @@ import {
   probeOam,
   resolveStableNpmEntry,
 } from "./oam-spawn.js";
-import { questionOrEmpty } from "./readline-question.js";
+import { QUESTION_CANCELLED, questionOrEmpty } from "./readline-question.js";
 
 export interface InstallCommandOptions {
   /** Target client. Omitted when --list or --all drives the run. */
@@ -146,6 +146,10 @@ export interface InstallCommandOptions {
     stdout: NodeJS.WritableStream;
     stderr: NodeJS.WritableStream;
     isTTY: boolean;
+    /** Forces readline's keypress mode (what a real TTY gets), so a test can
+     *  deliver Ctrl+C the way a terminal does. Defaults to readline's own
+     *  verdict (output.isTTY). */
+    terminal?: boolean;
   };
   /** Override for tests; replaces an interactive prompt with a fixed answer. */
   promptAnswer?: "overwrite" | "skip" | "abort";
@@ -444,7 +448,7 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
   }
 
   if (existingHasEntry) {
-    let decision: "overwrite" | "skip" | "abort";
+    let decision: "overwrite" | "skip" | "abort" | "cancelled";
     // --skip WINS over --dry-run: the preview must describe the run it
     // previews, and the real `--skip` run leaves the entry untouched --
     // dryRun-first made `--skip --dry-run` preview an OVERWRITE.
@@ -470,6 +474,12 @@ export async function runInstall(opts: InstallCommandOptions): Promise<InstallRe
     if (decision === "abort") {
       err("Aborted.");
       return { written: [], wouldWrite: [], messages, exitCode: 1 };
+    }
+    if (decision === "cancelled") {
+      // Ctrl+C at the prompt. Exit 130, the convention every other prompt in
+      // the product (the vault passphrase, trust's [y/N]) already follows.
+      err("Cancelled.");
+      return { written: [], wouldWrite: [], messages, exitCode: 130 };
     }
     // Conditional tense under --dry-run: the decision above maps dryRun onto
     // "overwrite" so this collision path is exercised, but the run returns
@@ -1034,23 +1044,27 @@ function sameFingerprint(a: FileFingerprint, b: FileFingerprint): boolean {
   return a.mtimeMs === b.mtimeMs && a.size === b.size;
 }
 
-async function promptCollision(path: string, io: InstallCommandOptions["io"]): Promise<"overwrite" | "skip" | "abort"> {
+async function promptCollision(
+  path: string,
+  io: InstallCommandOptions["io"],
+): Promise<"overwrite" | "skip" | "abort" | "cancelled"> {
   const stdin = io?.stdin ?? process.stdin;
   const stdout = io?.stdout ?? process.stdout;
-  const rl = createInterface({ input: stdin, output: stdout });
+  const rl = createInterface({ input: stdin, output: stdout, terminal: io?.terminal });
   try {
     // questionOrEmpty, not a bare rl.question(): that promise never settles
     // once stdin closes (Ctrl+D, a pipe running dry), so the install hung at
     // this prompt instead of taking its default. EOF comes back as "", which
     // is what a bare Enter produces -- the `(default: skip)` branch below.
-    const answer = (
-      await questionOrEmpty(
-        rl,
-        `${path} already has an "${ENTRY_NAME}" entry.\n  [o]verwrite, [s]kip, or [a]bort? (default: skip) `,
-      )
-    )
-      .trim()
-      .toLowerCase();
+    // Ctrl+C is a distinct answer: readline closes the interface on it with
+    // no process signal, and treating that as "" answered the prompt with
+    // "skip" and printed a success line at exit 0 on a cancel.
+    const raw = await questionOrEmpty(
+      rl,
+      `${path} already has an "${ENTRY_NAME}" entry.\n  [o]verwrite, [s]kip, or [a]bort? (default: skip) `,
+    );
+    if (raw === QUESTION_CANCELLED) return "cancelled";
+    const answer = raw.trim().toLowerCase();
     if (answer.startsWith("o")) return "overwrite";
     if (answer.startsWith("a")) return "abort";
     return "skip";

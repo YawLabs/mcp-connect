@@ -3128,7 +3128,6 @@ describe("runSecrets -- a schema-v1 vault is reported once per command, and only
     // ...and under --json the notice is JSON too, not prose: the error
     // envelopes share this stream, so a wrapper parses it line by line.
     expect(JSON.parse(errText())).toEqual({
-      ok: true,
       warning: "schema-behind",
       schema: 1,
       current: SECRETS_SCHEMA_VERSION,
@@ -3152,7 +3151,11 @@ describe("runSecrets -- a schema-v1 vault is reported once per command, and only
     expect(lines).toHaveLength(2);
     const parsed = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
     // First the warning about the FILE, then the envelope for the COMMAND.
-    expect(parsed[0]).toMatchObject({ ok: true, warning: "schema-behind", schema: 1, current: SECRETS_SCHEMA_VERSION });
+    expect(parsed[0]).toMatchObject({ warning: "schema-behind", schema: 1, current: SECRETS_SCHEMA_VERSION });
+    // No `ok` on the warning line: `ok` is the error envelope's discriminator,
+    // and a wrapper keying on the first stderr line's `ok` must not read a
+    // failed command as fine.
+    expect(parsed[0]).not.toHaveProperty("ok");
     expect(parsed[1]).toMatchObject({ ok: false, error: 'No secret named "NOPE" in the vault.' });
   });
 

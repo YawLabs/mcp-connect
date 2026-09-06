@@ -87,10 +87,20 @@ Actions:
                           Show the local secret-resolution audit trail
                           (~/.yaw-mcp/secrets-audit.log): which secret
                           NAMES were injected into (or missing for) which
-                          server, and when. Never shows a value.
+                          server, and when. Never shows a value. A missing
+                          row whose name starts with \`<malformed ref>\` is a
+                          \${secret: reference that did not parse (a space
+                          in the name, a dropped brace): fix the typo in
+                          bundles.json. --secret matches that full marker
+                          string, not the bare name.
 
 Flags:
-  --json                  Machine-readable output (where applicable).
+  --json                  Machine-readable output (where applicable). stdout
+                          carries the result envelope; stderr carries one
+                          JSON object per line: {"warning":...} lines about
+                          the FILE (schema-behind) and, on failure, the
+                          {"ok":false,"error":...} envelope last. Key on
+                          "warning" vs "ok", never on line position.
   --value <v>             Inline secret value (set only). The value sits in
                           this process's argv, so it is visible to every
                           other local user via ps / /proc/<pid>/cmdline for
@@ -629,15 +639,16 @@ function freshVaultNudge(io: SecretsIo, path: string): void {
  *  envelope this command emits goes to `err` too, so a --json wrapper parses
  *  stderr line by line -- and a prose warning ahead of an `{"ok":false,...}`
  *  envelope made every failing list/get/set/remove on a pre-v2 vault
- *  unparseable to it. `ok: true` because the warning is about the FILE, not
- *  a failure of the command that loaded it; `warning` is the discriminator
- *  a consumer keys on. */
+ *  unparseable to it. No `ok` key on this line: the warning is about the
+ *  FILE, not the command, and `ok` is the discriminator the error envelopes
+ *  carry -- a wrapper that read the first stderr line and keyed on `ok` took
+ *  a failed command as fine when this line said `ok: true` ahead of the
+ *  `{"ok":false}` envelope. `warning` is this line's discriminator. */
 function schemaBehindNotice(io: SecretsIo, vault: VaultFile, path: string, json: boolean | undefined): void {
   if (vault.version >= SECRETS_SCHEMA_VERSION) return;
   if (json) {
     io.err(
       `${JSON.stringify({
-        ok: true,
         warning: "schema-behind",
         schema: vault.version,
         current: SECRETS_SCHEMA_VERSION,

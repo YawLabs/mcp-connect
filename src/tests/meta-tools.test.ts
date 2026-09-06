@@ -114,7 +114,7 @@ describe("computeSecretsReport (names only, never values)", () => {
         server: "typo-only",
         injectedSecrets: [],
         missing: [],
-        malformed: [`${MALFORMED_REF_MARKER} \${secret:gh token}`],
+        malformed: [`${MALFORMED_REF_MARKER} \${secret:gh ...`],
       },
       {
         server: "mixed",

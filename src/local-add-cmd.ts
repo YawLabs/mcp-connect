@@ -37,7 +37,7 @@ import {
   upsertUserBundle,
 } from "./local-bundles.js";
 import { userConfigDir } from "./paths.js";
-import { questionOrEmpty } from "./readline-question.js";
+import { QUESTION_CANCELLED, type QuestionCancelled, questionOrEmpty } from "./readline-question.js";
 // The removal preview renders command / args / url / name straight out of
 // bundles.json immediately above a [y/N] prompt, so it needs the same
 // control-byte neutering the `trust` gate uses. IMPORTED, never re-spelled:
@@ -62,9 +62,12 @@ export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
                     like any argument, and is stored in plain text (file mode
                     0600) in bundles.json. For a real credential, store it
                     with \`yaw-mcp secrets set NAME\` and pass
-                    --env KEY='\${secret:NAME}' instead (the quotes keep your
-                    shell from expanding it to nothing): the vault resolves it
-                    at launch and only the reference is written. Or leave it
+                    --env KEY='\${secret:NAME}' instead: the vault resolves it
+                    at launch and only the reference is written. The single
+                    quotes stop bash/zsh/PowerShell expanding it to nothing;
+                    in cmd.exe use no quotes ($ is not special there --
+                    cmd.exe keeps single quotes as part of the value, and the
+                    server would receive a quoted token). Or leave it
                     out to keep a shell-resident secret off disk entirely --
                     the server inherits it at launch.
   --dry-run         Print what would be written without writing.
@@ -562,8 +565,10 @@ export interface RemoveCommandOptions {
   isTTY?: boolean;
   /** Test hook: answer the confirmation without a real TTY read. */
   promptAnswer?: string;
-  /** Test hook: replaces process.stdin/stdout for the interactive prompt. */
-  io?: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream };
+  /** Test hook: replaces process.stdin/stdout for the interactive prompt.
+   *  `terminal` forces readline's keypress mode (what a real TTY gets), so a
+   *  test can deliver Ctrl+C the way a terminal does. */
+  io?: { stdin: NodeJS.ReadableStream; stdout: NodeJS.WritableStream; terminal?: boolean };
 }
 
 export function parseRemoveArgs(
@@ -758,13 +763,17 @@ function isInteractive(opts: RemoveCommandOptions): boolean {
  *  pending forever -- no "Aborted", no exit 1, the process ending by
  *  event-loop drain at status 0 with a wrapper reading the decline as
  *  success. */
-async function askYesNo(opts: RemoveCommandOptions, question: string): Promise<string> {
+async function askYesNo(opts: RemoveCommandOptions, question: string): Promise<string | QuestionCancelled> {
   if (opts.promptAnswer !== undefined) return opts.promptAnswer.trim().toLowerCase();
   const input = opts.io?.stdin ?? process.stdin;
   const output = opts.io?.stdout ?? process.stdout;
-  const rl = createInterface({ input, output });
+  // `terminal` is readline's own default (output.isTTY) unless a test forces
+  // it; on a real TTY that is what makes readline own the Ctrl+C keypress.
+  const rl = createInterface({ input, output, terminal: opts.io?.terminal });
   try {
-    return (await questionOrEmpty(rl, question)).trim().toLowerCase();
+    const raw = await questionOrEmpty(rl, question);
+    // Ctrl+C is not "no": it is the user leaving, and the exit code says so.
+    return raw === QUESTION_CANCELLED ? raw : raw.trim().toLowerCase();
   } finally {
     rl.close();
   }
@@ -836,6 +845,12 @@ export async function runRemove(opts: RemoveCommandOptions): Promise<AddCommandR
         return { exitCode: 2, written: [] };
       }
       const answer = await askYesNo(opts, `  Remove "${doomed.namespace}"? [y/N] `);
+      if (answer === QUESTION_CANCELLED) {
+        // Ctrl+C at the prompt: exit 130, like every other prompt in the
+        // product, rather than the decline's exit 1.
+        printErr("yaw-mcp remove: Cancelled. Nothing was removed.");
+        return { exitCode: 130, written: [] };
+      }
       if (answer !== "y" && answer !== "yes") {
         printErr("yaw-mcp remove: Aborted. Nothing was removed.");
         return { exitCode: 1, written: [] };

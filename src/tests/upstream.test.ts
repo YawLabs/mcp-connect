@@ -1158,7 +1158,7 @@ describe("resolveServerEnv", () => {
       }
       expect(err).toBeInstanceOf(Error);
       const message = (err as Error).message;
-      expect(message).toContain("vault: malformed secret refs: <malformed ref> ${secret:gh token}");
+      expect(message).toContain("vault: malformed secret refs: <malformed ref> ${secret:gh ...");
       // Bounded: each span is capped by secrets-vault, so the 300-char tail
       // never reaches the message (an MCP error payload and a log line).
       expect(message).not.toContain("pw=");
@@ -1199,11 +1199,11 @@ describe("resolveServerEnv", () => {
     vi.mocked(resolveSecretRefs).mockReturnValue({
       resolved: { A: "${secret:MISSING_NAME}", B: "${secret:gh token}" },
       missing: ["MISSING_NAME"],
-      malformed: [{ display: "<malformed ref> ${secret:gh token}", auditName: "<malformed ref> gh" }],
+      malformed: [{ display: "<malformed ref> ${secret:gh ...", auditName: "<malformed ref> gh" }],
     });
     const config = makeLocalConfig({ env: { A: "${secret:MISSING_NAME}", B: "${secret:gh token}" } });
     await expect(connectToUpstream(config)).rejects.toThrow(
-      "vault: missing or undecryptable secret refs: MISSING_NAME; malformed secret refs: <malformed ref> ${secret:gh token}",
+      "vault: missing or undecryptable secret refs: MISSING_NAME; malformed secret refs: <malformed ref> ${secret:gh ...",
     );
     // Both kinds land in the trail as "missing" -- the malformed one under
     // its names-only form -- and nothing as "injected": the spawn was refused.

@@ -3607,12 +3607,25 @@ export class ConnectServer {
         const unlisted = blocked.filter((s) => !profile.blocked?.includes(s.namespace));
         const edits: string[] = [];
         if (unlisted.length > 0) edits.push(`add ${quote(unlisted)} to its "servers" allow list`);
-        if (denied.length > 0) edits.push(`remove ${quote(denied)} from its "blocked" list`);
+        // "blocked" is the UNION across every config scope (config-loader's
+        // unionBlocked), while profile.path is only the primary file -- so the
+        // list to edit may live in the user-global file instead. Name both
+        // when both contributed; the allow-list edit above is correctly
+        // pointed at the primary file, which is where "servers" is picked from.
+        if (denied.length > 0) {
+          const where = profile.userPath
+            ? `from the "blocked" list in whichever of ${profile.path} / ${profile.userPath} declares it (blocked lists merge across scopes)`
+            : `from its "blocked" list`;
+          edits.push(`remove ${quote(denied)} ${where}`);
+        }
         parts.push(`The project profile at ${profile.path} keeps ${quote(blocked)} out: ${edits.join(" and ")}.`);
       }
       if (disabled.length > 0) {
+        // Not a hardcoded ~/.yaw-mcp/bundles.json: a trusted project-local
+        // .yaw-mcp/bundles.json defines servers too, and a disabled one may
+        // live only there.
         parts.push(
-          `Set "isActive": true for a server in ~/.yaw-mcp/bundles.json; mcp_connect_discover lists what is installed but disabled.`,
+          `Set "isActive": true for a server in the bundles.json that defines it (~/.yaw-mcp/bundles.json, or a trusted project-local .yaw-mcp/bundles.json); mcp_connect_discover lists what is installed but disabled.`,
         );
       }
       parts.push("Restart this MCP client after editing.");

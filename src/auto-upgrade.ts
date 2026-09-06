@@ -53,8 +53,10 @@
 // over -- see defaultSpawn):
 //   - The lock is advisory and best-effort: a prefix we cannot write to
 //     yields no lock and the old unserialized behavior, and a lock left
-//     behind by a killed process is stolen once it goes stale (by rename, so
-//     two stealers cannot both win -- see acquireUpgradeLock). A crash between
+//     behind by a killed process is stolen once it goes stale by mtime (by
+//     rename, so two stealers cannot both win -- see acquireUpgradeLock). NOT
+//     on the holder's death: the npm child outlives a plain parent exit, so
+//     only the in-process bundles.json lock opts into the pid probe. A crash between
 //     that rename and its unlink leaves a `.yaw-mcp-upgrade.lock.stale-<pid>`
 //     file behind that nothing reads.
 //   - The attempt memo (`<prefix>/.yaw-mcp-upgrade.lock.attempt`) is never
@@ -265,17 +267,26 @@ const UPGRADE_LOCK_STALE_MS = 10 * 60 * 1000;
 const UPGRADE_LOCK_FUTURE_SKEW_MS = 5 * 1000;
 
 /** Is the process that wrote `lockPath` still running? The lock records its
- *  holder's pid (see take() below), so a lock whose holder is gone is stale
- *  NOW, not after the ten-minute mtime window: an MCP client that kills
- *  `serve` mid-refresh leaves the file behind, and the documented recovery
- *  (`yaw-mcp sidecars install`, or the next `add`/`remove` on bundles.json)
- *  was refused for the whole window with a "try again in a minute" that was
- *  wrong for nine of them. `kill(pid, 0)` sends no signal: ESRCH is "no such
- *  process" and settles it; EPERM is a live process we may not signal, which
- *  is still live. Anything unreadable or unparseable answers true -- an
- *  unknown holder is honoured, the mtime rule still bounds the wait. Windows
- *  reuses pids slowly enough that a false positive here costs at most the old
- *  behaviour (wait out the window). */
+ *  holder's pid (see take() below), so for a lock whose critical section is
+ *  IN-PROCESS -- the bundles.json read-modify-write -- a dead holder means a
+ *  dead lock, stale NOW rather than after the ten-minute mtime window. That
+ *  is the case this probe exists for: a killed Yaw Terminal left the file
+ *  behind and every `add` / `remove` was refused for the whole window.
+ *
+ *  It is NOT the right rule for a lock guarding an npm CHILD (the sidecars
+ *  tree, the self-upgrade prefix): on POSIX a plain parent exit does not kill
+ *  that child (see the header), so the holder can be dead while npm is still
+ *  reifying the tree, and stealing on the holder's death would put a second
+ *  reify on the same node_modules -- the collision the lock exists to
+ *  prevent. Those callers keep the heartbeat + mtime rule and do not opt in
+ *  (see AcquireLockOptions.probeHolder).
+ *
+ *  `kill(pid, 0)` sends no signal: ESRCH is "no such process" and settles it;
+ *  EPERM is a live process we may not signal, which is still live. Anything
+ *  unreadable or unparseable answers true -- an unknown holder is honoured,
+ *  the mtime rule still bounds the wait. A reused pid can only produce a
+ *  false "alive" (the old behaviour: wait out the window), never a false
+ *  steal. */
 function lockHolderAlive(lockPath: string): boolean {
   let pid: number;
   try {
@@ -305,8 +316,21 @@ function lockHolderAlive(lockPath: string): boolean {
  *  `openSync(path, "wx")` is the whole mutual-exclusion primitive: O_EXCL is
  *  atomic on both POSIX and Windows, so two processes racing it cannot both
  *  win. */
-export function acquireUpgradeLock(dir: string, lockName: string = UPGRADE_LOCK_NAME): (() => void) | null {
+export interface AcquireLockOptions {
+  /** Steal a fresh lock whose holder PROCESS is gone (lockHolderAlive). Only
+   *  correct when the holder's death ends the critical section -- an
+   *  in-process write. Off by default: the npm-child callers must keep the
+   *  mtime rule. */
+  probeHolder?: boolean;
+}
+
+export function acquireUpgradeLock(
+  dir: string,
+  lockName: string = UPGRADE_LOCK_NAME,
+  opts: AcquireLockOptions = {},
+): (() => void) | null {
   const lockPath = join(dir, lockName);
+  const holderAlive = (path: string): boolean => (opts.probeHolder ? lockHolderAlive(path) : true);
   /** What this process writes into the lock, and what its release reads back
    *  to prove the file it is about to unlink is still the one it took. */
   const mine = String(process.pid);
@@ -368,7 +392,7 @@ export function acquireUpgradeLock(dir: string, lockName: string = UPGRADE_LOCK_
     // than reporting contention over a lock nobody holds.
     ageMs = UPGRADE_LOCK_STALE_MS;
   }
-  if (isLive(ageMs) && lockHolderAlive(lockPath)) return null;
+  if (isLive(ageMs) && holderAlive(lockPath)) return null;
 
   // Steal by RENAME, not unlink. Two processes that both read the lock as
   // stale used to both unlinkSync it, and a successful unlink cannot tell "I
@@ -399,7 +423,7 @@ export function acquireUpgradeLock(dir: string, lockName: string = UPGRADE_LOCK_
   // and yield.
   let stoleLive = false;
   try {
-    stoleLive = isLive(Date.now() - statSync(stolenPath).mtimeMs) && lockHolderAlive(stolenPath);
+    stoleLive = isLive(Date.now() - statSync(stolenPath).mtimeMs) && holderAlive(stolenPath);
   } catch {
     // Vanished under us: nothing to restore and nothing to unlink.
   }

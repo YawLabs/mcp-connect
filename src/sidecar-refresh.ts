@@ -77,11 +77,14 @@
 // activates servers -- spawned from the very tree a refresh rewrites. The
 // check therefore sleeps SIDECAR_REFRESH_START_DELAY_MS past its cheap gates
 // before touching the registry or the tree; see KNOWN GAPS for the window that
-// leaves open. When it wakes it reads the throttle stamp a SECOND time: of N
-// panes started inside the same minute, only the first to wake pays for the
-// config load and the registry probes -- the rest find its stamp and stop.
-// The lock below covers only the install, and a pane that finds nothing stale
-// never takes it, so without that second read every pane would probe.
+// leaves open. When it wakes it reads the throttle stamp a SECOND time, so a
+// pane that wakes after another pane's whole check has stamped stops there
+// instead of probing again. Panes that wake within a few seconds of each
+// other (a burst of restored tabs) still all probe: each sleeps exactly the
+// same delay and the stamp lands only after the probes -- the same window
+// auto-upgrade's check memo leaves open. The lock below covers only the
+// install, and a pane that finds nothing stale never takes it, so without the
+// second read every pane that woke later would probe too.
 //
 // KNOWN GAPS (documented rather than papered over):
 //   - The refresh action is WHOLE-TREE, not per-package. runSidecarsInstall
@@ -99,8 +102,11 @@
 //     `npm ci`, so nothing already in the tree is removed.
 //   - The lock is advisory: a sidecars root we cannot write to yields a no-op
 //     lock and the old unserialized behavior, and a lock left behind by a
-//     killed process is stolen once it goes stale (auto-upgrade owns both
-//     rules and the constants behind them). A lock this process still HOLDS is
+//     killed process is stolen once it goes stale BY MTIME (auto-upgrade owns
+//     both rules and the constants behind them) -- deliberately not on the
+//     holder's death, because the npm child it guards outlives a plain
+//     parent exit and a second reify on that tree is the collision the lock
+//     exists to prevent. A lock this process still HOLDS is
 //     kept out of that stale window by a heartbeat -- see acquireSidecarsLock
 //     in sidecars-cmd, which is why the reused ten-minute window does not have
 //     to cover a whole-tree install.
@@ -710,11 +716,12 @@ export async function maybeRefreshSidecars(deps: SidecarRefreshDeps = {}): Promi
     await (deps.delayImpl ?? defaultDelay)(SIDECAR_REFRESH_START_DELAY_MS);
 
     // 3c. Re-check the throttle now that a minute has passed. The stamp was
-    // read BEFORE the delay, so of N panes started inside the same minute
-    // every one passed the gate at step 3 and every one would go on to load
-    // the config and probe the registry -- the probe count scaled with pane
-    // count instead of being once a day. One more cheap read: whoever woke
-    // first has stamped by now, and the rest stop here.
+    // read BEFORE the delay, so a pane that started while another pane's
+    // check was already under way passed the gate at step 3 and would go on
+    // to load the config and probe the registry. One more cheap read: a pane
+    // whose check finished while this one slept has stamped, and this one
+    // stops here. (Panes that woke within seconds of each other still all
+    // probe -- see the header; the stamp lands after the probes.)
     const afterDelay = (deps.readStateImpl ?? (() => defaultReadState(home)))();
     const lastAfterDelay = afterDelay?.lastSidecarRefreshCheck;
     if (typeof lastAfterDelay === "number") {

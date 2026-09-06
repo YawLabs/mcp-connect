@@ -1299,6 +1299,39 @@ describe("runRemove confirmation gate", () => {
   // rl.close() never ran, and the process ended by event-loop drain at status
   // 0, so a wrapper checking $? read the decline as success. It has to settle
   // as a NO. (A hang here fails on the test timeout.)
+  it("Ctrl+C at the prompt is a cancel: 'Cancelled', exit 130, bytes untouched", async () => {
+    // Distinct from EOF: readline closes the interface on the keypress with
+    // no process signal, and treating that as "" made the decline path
+    // answer for the user -- exit 1 and "Aborted" for what was a cancel.
+    // Every other prompt in the product exits 130 on Ctrl+C. terminal:true
+    // is what makes readline own the keypress, as it does on a TTY; ETX is
+    // built from its code so no control byte sits in this source file.
+    await addFetch();
+    const before = bytes();
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdout.resume();
+    const io = captureIO();
+    const pending = runRemove({
+      target: "fetch",
+      home: synthHome,
+      cwd: synthCwd,
+      isTTY: true,
+      io: { stdin, stdout, terminal: true },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // Let the interface attach before the keypress lands.
+    await new Promise<void>((r) => setImmediate(r));
+    stdin.write(String.fromCharCode(3));
+    const r = await pending;
+    expect(r.exitCode).toBe(130);
+    expect(io.errText()).toMatch(/Cancelled/);
+    expect(io.errText()).not.toMatch(/Aborted/);
+    expect(r.written).toEqual([]);
+    expect(bytes().equals(before)).toBe(true);
+  });
+
   it("EOF at the prompt settles as a decline: 'Aborted', exit 1, bytes untouched", async () => {
     await addFetch();
     const before = bytes();

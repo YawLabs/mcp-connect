@@ -605,9 +605,12 @@ function describeClient(c: ClientProbeResult): { client: string; label: string; 
 }
 
 /** errno codes for a read failure that is a moment's contention, not a state
- *  of the file: EBUSY is win32's answer while an AV scanner or the search
- *  indexer holds the handle, EAGAIN the POSIX would-block. The file is fine
- *  and the next read succeeds. */
+ *  of the file. EBUSY is the one live member: win32's answer while an AV
+ *  scanner or the search indexer holds the handle (libuv maps
+ *  ERROR_SHARING_VIOLATION to it). EAGAIN is defensive only -- a blocking
+ *  read of a regular file never returns it on any supported platform -- and
+ *  is kept so nobody re-adds it on the same reasoning. The file is fine and
+ *  the next read succeeds. */
 const TRANSIENT_READ_CODES: ReadonlySet<string> = new Set(["EBUSY", "EAGAIN"]);
 
 /** True when the probe's read failure is one of TRANSIENT_READ_CODES. Decided

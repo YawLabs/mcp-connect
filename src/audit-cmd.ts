@@ -132,6 +132,16 @@ const SECRET_FLAG_NAMES = new Set<string>([
  *  prints a live credential. */
 const SECRET_FLAG_RE = /^--?[a-z0-9_-]*(token|secret|passw|apikey|api[-_]?key|auth|cred|bearer)[a-z0-9_-]*$/i;
 
+/** A secret-bearing HEADER NAME arg whose value comes in the NEXT arg:
+ *  `["-H", "X-Api-Key:", "<key>"]`, `["--header", "Authorization:", "Bearer",
+ *  "<key>"]`. Not a flag (no dash), so SECRET_FLAG_RE never fires, and once
+ *  the args are scrubbed one at a time (see runAudit) the lone value arg has
+ *  nothing for health-score's rules to anchor on -- the joined-line scrub
+ *  used to catch this shape and per-arg scrubbing lost it. The name has to
+ *  END in `:` or `=` with nothing after it, which is what makes the next arg
+ *  its value. */
+const SECRET_HEADER_NAME_RE = /^[a-z0-9_-]*(token|secret|passw|apikey|api[-_]?key|auth|cred|bearer)[a-z0-9_-]*[:=]$/i;
+
 /**
  * Return a copy of `args` with the VALUE following any secret-bearing flag
  * replaced by "<redacted>". Two shapes are handled:
@@ -160,11 +170,19 @@ export function redactSecretArgs(args: readonly string[]): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i] ?? "";
-    if (isSecretFlag(a)) {
+    if (isSecretFlag(a) || SECRET_HEADER_NAME_RE.test(a)) {
       out.push(a);
       if (i + 1 < args.length) {
-        out.push("<redacted>");
-        i += 1;
+        // A scheme word between the name and the blob (`Authorization:`
+        // `Bearer` `<key>`) is kept legible; the blob after it is the value.
+        const next = args[i + 1] ?? "";
+        if (/^(bearer|basic|token|digest)$/i.test(next) && i + 2 < args.length) {
+          out.push(next, "<redacted>");
+          i += 2;
+        } else {
+          out.push("<redacted>");
+          i += 1;
+        }
       }
       continue;
     }

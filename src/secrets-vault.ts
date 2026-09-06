@@ -781,22 +781,41 @@ export interface MalformedSecretRef {
  *  Anchored and non-global, so it carries no lastIndex state. */
 const SECRET_NAME_PREFIX_RE = new RegExp(`^${SECRET_NAME_CLASS}`);
 
+/** How much of the name-shaped prefix of a malformed span the audit name and
+ *  the display keep. The realistic typo this feature exists for is a VALUE
+ *  pasted where a name belongs (`${secret:ghp_...` with the brace dropped):
+ *  every character of a classic token is in the name class, so an unbounded
+ *  prefix put the whole token into the names-only audit log. Sixteen chars
+ *  is enough to recognise which reference is meant and too few to be the
+ *  credential. */
+const MALFORMED_REF_NAME_CHARS = 16;
+
 function describeMalformedSecretRef(span: string): MalformedSecretRef {
-  // Control characters (C0, DEL, C1) dropped rather than escaped: this string
-  // is headed for a terminal, a log line and an MCP error payload, and a raw
-  // ESC or newline in any of them can forge a line or a cursor move. A
-  // char-code loop instead of a regex character class so the range is spelled
-  // out rather than hidden in escapes.
+  // Control characters dropped rather than escaped: this string is headed
+  // for a terminal, a log line and an MCP error payload, and a raw ESC or
+  // newline in any of them can forge a line or a cursor move. C0, DEL and C1
+  // by code range, plus Unicode format controls (bidi overrides and isolates,
+  // zero-width joiners, BOM) by property -- a right-to-left override in the
+  // quoted typo would otherwise redraw the rest of the doctor line.
   let printable = "";
   for (const ch of span) {
     const code = ch.codePointAt(0) ?? 0;
-    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) continue;
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || /\p{Cf}/u.test(ch)) continue;
     printable += ch;
   }
-  const clipped =
-    printable.length > MALFORMED_REF_MAX_CHARS ? `${printable.slice(0, MALFORMED_REF_MAX_CHARS)}...` : printable;
   const body = span.startsWith(SECRET_REF_OPENER) ? span.slice(SECRET_REF_OPENER.length) : "";
-  const namePrefix = SECRET_NAME_PREFIX_RE.exec(body)?.[0] ?? "";
+  const namePrefix = (SECRET_NAME_PREFIX_RE.exec(body)?.[0] ?? "").slice(0, MALFORMED_REF_NAME_CHARS);
+  // Display shows the opener, the bounded name prefix and the first
+  // character AFTER it -- the typo itself (`${secret:gh token`, `${secret:DB`
+  // with no brace) -- and nothing further: past that point is env-value text
+  // that may be a credential. The cut is on code points so it can never end
+  // on half of a surrogate pair.
+  const printableBody = printable.startsWith(SECRET_REF_OPENER) ? printable.slice(SECRET_REF_OPENER.length) : "";
+  const shown = Array.from(printableBody)
+    .slice(0, namePrefix.length + 1)
+    .join("");
+  const truncated = Array.from(printableBody).length > namePrefix.length + 1;
+  const clipped = `${SECRET_REF_OPENER}${shown}${truncated ? "..." : ""}`.slice(0, MALFORMED_REF_MAX_CHARS + 3);
   return {
     display: `${MALFORMED_REF_MARKER} ${clipped}`,
     auditName: namePrefix.length > 0 ? `${MALFORMED_REF_MARKER} ${namePrefix}` : MALFORMED_REF_MARKER,

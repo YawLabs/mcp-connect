@@ -872,10 +872,11 @@ export async function runSidecarsInstall(opts: SidecarsInstallOptions = {}): Pro
   // document.
   const release = (opts.acquireLock ?? acquireSidecarsLock)(root);
   if (release === null) {
-    // Name the lock: acquireUpgradeLock already steals a lock whose holder
-    // process is gone, so what is left here is a genuinely live refresh (or a
-    // holder it could not identify), and the one thing an operator can do
-    // with that is look at the file.
+    // Name the lock: what holds it is a live refresh, or one whose serve was
+    // killed mid-install and whose npm child may still be reifying the tree
+    // (the lock is honoured until its mtime goes stale for exactly that
+    // reason), and the one thing an operator can do with either is look at
+    // the file.
     print(
       `Another yaw-mcp process is refreshing ${root} right now (lock: ${join(root, SIDECARS_LOCK_NAME)}); try again once it finishes.`,
     );

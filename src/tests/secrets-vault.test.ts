@@ -673,10 +673,17 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
       // Its OWN list, never folded into `missing`: `missing` is NAMES, and
       // every consumer (the audit trail above all) treats it as such.
       expect(missing, literal).toEqual([]);
-      // `display` quotes the span the user actually wrote, behind the marker,
-      // so the refusal can point at the typo; `auditName` keeps only the
-      // prefix that IS legal name text.
-      expect(malformed, literal).toEqual([{ display: `${MALFORMED_REF_MARKER} ${literal}`, auditName }]);
+      // `display` quotes the opener, the name prefix and the one character
+      // that broke the reference, behind the marker, so the refusal can point
+      // at the typo without printing what follows it (env-value text that
+      // may be a credential); `auditName` keeps only the prefix that IS legal
+      // name text.
+      expect(malformed, literal).toHaveLength(1);
+      expect(malformed[0].auditName, literal).toBe(auditName);
+      expect(malformed[0].display.startsWith(`${MALFORMED_REF_MARKER} \${secret:`), literal).toBe(true);
+      expect(malformed[0].display.length, literal).toBeLessThanOrEqual(
+        MALFORMED_REF_MARKER.length + 1 + MALFORMED_REF_MAX_CHARS + 3,
+      );
     }
   });
 
@@ -692,8 +699,10 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
     // The good ref still resolves; the value is refused over the other two.
     expect(resolved.AUTH).toBe("ghp_abc ${secret:bad name} ${secret:absent}");
     expect(missing).toEqual(["absent"]);
+    // display stops one character past the name prefix -- the typo itself
+    // (the space) -- and elides the rest: past that point is env-value text.
     expect(malformed).toEqual([
-      { display: `${MALFORMED_REF_MARKER} \${secret:bad name}`, auditName: `${MALFORMED_REF_MARKER} bad` },
+      { display: `${MALFORMED_REF_MARKER} \${secret:bad ...`, auditName: `${MALFORMED_REF_MARKER} bad` },
     ]);
   });
 
@@ -712,8 +721,10 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
     const [ref] = malformed;
     // Bounded: marker + space + MALFORMED_REF_MAX_CHARS of span + "...".
     expect(ref.display.length).toBeLessThanOrEqual(MALFORMED_REF_MARKER.length + 1 + MALFORMED_REF_MAX_CHARS + 3);
-    expect(ref.display.startsWith(`${MALFORMED_REF_MARKER} \${secret:DB_PASS`)).toBe(true);
-    expect(ref.display.endsWith("...")).toBe(true);
+    // display shows the opener, the name prefix and the ONE character after
+    // it (the typo), then elides: the host, port and query never print.
+    expect(ref.display).toBe(`${MALFORMED_REF_MARKER} \${secret:DB_PASS@...`);
+    expect(ref.display).not.toContain("db.internal");
     expect(ref.display).not.toContain("pw=");
     // The audit form never carries anything past the legal-name prefix --
     // not the host, not the port, not the query string.
@@ -727,9 +738,46 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
     const ESC = String.fromCharCode(0x1b);
     const NL = String.fromCharCode(0x0a);
     const ctl = resolveSecretRefs({ X: `\${secret:gh${ESC}[2J${NL}token}` }, vault, key).malformed;
+    // After stripping, the body reads `gh[2Jtoken}`: name prefix `gh`, then
+    // `[` is the character that broke the reference.
     expect(ctl).toEqual([
-      { display: `${MALFORMED_REF_MARKER} \${secret:gh[2Jtoken}`, auditName: `${MALFORMED_REF_MARKER} gh` },
+      { display: `${MALFORMED_REF_MARKER} \${secret:gh[...`, auditName: `${MALFORMED_REF_MARKER} gh` },
     ]);
+  });
+
+  it("bounds the name prefix, so a token pasted where a NAME belongs never reaches the audit log whole", async () => {
+    // The realistic typo: a value pasted instead of a name, brace dropped.
+    // Every character of a classic PAT is in the name class, so an unbounded
+    // prefix put the entire token into the names-only audit log and most of
+    // it into display.
+    const vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    const token = `ghp_${"A".repeat(36)}`;
+    const [ref] = resolveSecretRefs({ T: `\${secret:${token}` }, vault, key).malformed;
+    expect(ref.auditName.length).toBeLessThanOrEqual(MALFORMED_REF_MARKER.length + 1 + 16);
+    expect(ref.auditName).not.toContain(token);
+    expect(ref.display).not.toContain(token);
+    expect(ref.display.endsWith("...")).toBe(true);
+  });
+
+  it("never leaves a lone surrogate in display, and strips Unicode format controls", async () => {
+    const vault = newVault();
+    const key = await unlock(vault, "hunter2");
+    // A key emoji right after a 16-char name prefix: the old code-unit slice
+    // could end on the emoji's high half. The cut is on code points now.
+    const emojiSpan = `\${secret:${"a".repeat(16)}${String.fromCodePoint(0x1f511)} tail`;
+    const [emoji] = resolveSecretRefs({ X: emojiSpan }, vault, key).malformed;
+    // No lone surrogate anywhere: a high half not followed by a low half, or
+    // a low half not preceded by a high half. (String.prototype.isWellFormed
+    // is the same predicate, but this project's TS lib target predates it.)
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emoji.display)).toBe(false);
+    // A right-to-left override (U+202E) would redraw the rest of a doctor
+    // line; it is a format control, stripped like the C0 range. Built from
+    // the code point so no control character sits in this source file.
+    const rlo = String.fromCodePoint(0x202e);
+    const [bidi] = resolveSecretRefs({ X: `\${secret:x${rlo}token}` }, vault, key).malformed;
+    expect(bidi.display).not.toContain(rlo);
+    expect(bidi.auditName).toBe(`${MALFORMED_REF_MARKER} x`);
   });
 
   it("does not mistake a `${secret:` inside a DECRYPTED value for an unparsed reference", async () => {
@@ -754,7 +802,7 @@ describe("hasSecretRefs + resolveSecretRefs (spawn-time substitution)", () => {
     expect(collectMalformedSecretRefs({ A: "${secret:ok}", B: "plain" })).toEqual([]);
     expect(
       collectMalformedSecretRefs({ A: "${secret:gh token}", B: "x ${secret:gh token} y", C: "${secret:tail" }),
-    ).toEqual([`${MALFORMED_REF_MARKER} \${secret:gh token}`, `${MALFORMED_REF_MARKER} \${secret:tail`]);
+    ).toEqual([`${MALFORMED_REF_MARKER} \${secret:gh ...`, `${MALFORMED_REF_MARKER} \${secret:tail`]);
     const long = collectMalformedSecretRefs({ C: `\${secret:DB_PASS@db.internal/${"q".repeat(100)}` });
     expect(long).toHaveLength(1);
     expect(long[0].length).toBeLessThanOrEqual(MALFORMED_REF_MARKER.length + 1 + MALFORMED_REF_MAX_CHARS + 3);

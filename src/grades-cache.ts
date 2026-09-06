@@ -240,16 +240,18 @@ async function takeLock(lockPath: string, token: string): Promise<boolean> {
   }
   try {
     await fh.writeFile(token);
+    await fh.close();
   } catch (err) {
-    // The O_EXCL open succeeded, so a 0-byte lock now sits at lockPath and
-    // NOBODY will release it: this throw escapes before withGradesLock's
-    // try/finally is entered, and the next audit would wait the whole stale
-    // age on a lock that never held anything. Remove it before rethrowing.
+    // The O_EXCL open succeeded, so a lock now sits at lockPath and NOBODY
+    // will release it: this throw escapes before withGradesLock's try/finally
+    // is entered, and the next audit would wait the whole stale age on a lock
+    // that never held anything. Both the write and the close are inside the
+    // guard -- a close failure after a successful write orphans a fully
+    // formed lock the same way. Remove it before rethrowing.
     await fh.close().catch(() => {});
     await rm(lockPath, { force: true }).catch(() => {});
     throw err;
   }
-  await fh.close();
   return true;
 }
 

@@ -763,11 +763,13 @@ export async function loadLocalBundles(
 // predates BUNDLES_LOCK_NAME, a hand edit in a text editor) is still
 // last-write-wins against a locked one; a lock this process cannot CREATE
 // (EACCES on the dir) does not block the write, which then fails on its own
-// with its own message; and a lock left behind by a crashed holder is
-// honoured until it is provably stale (acquireUpgradeLock steals it after its
+// with its own message; and a lock whose holder is still RUNNING but stuck is
+// honoured until it goes stale by mtime (acquireUpgradeLock's
 // UPGRADE_LOCK_STALE_MS) or the user deletes it -- a writer that waits
 // BUNDLES_LOCK_WAIT_MS on one gives up with a message naming the file rather
-// than writing around it.
+// than writing around it. (A lock whose holder process is GONE is stolen on
+// the first take: this lock opts into acquireUpgradeLock's pid probe, which
+// is correct here because the critical section is in-process.)
 let bundleWriteChain: Promise<void> = Promise.resolve();
 
 /** Sidecar the cross-process write lock is taken on, inside the user config
@@ -800,7 +802,7 @@ async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const lockPath = join(dir, BUNDLES_LOCK_NAME);
   const deadline = Date.now() + BUNDLES_LOCK_WAIT_MS;
-  let release = acquireUpgradeLock(dir, BUNDLES_LOCK_NAME);
+  let release = acquireUpgradeLock(dir, BUNDLES_LOCK_NAME, { probeHolder: true });
   while (release === null) {
     if (Date.now() >= deadline) {
       throw new Error(
@@ -810,7 +812,7 @@ async function withBundlesLock<T>(home: string, fn: () => Promise<T>): Promise<T
     // Global setTimeout rather than timers/promises so a fake-timer test can
     // drive the wait to its deadline without sleeping through it for real.
     await new Promise<void>((resolve) => setTimeout(resolve, BUNDLES_LOCK_POLL_MS));
-    release = acquireUpgradeLock(dir, BUNDLES_LOCK_NAME);
+    release = acquireUpgradeLock(dir, BUNDLES_LOCK_NAME, { probeHolder: true });
   }
   try {
     return await fn();
