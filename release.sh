@@ -164,6 +164,23 @@ run_npm_check() {
       return 0
     fi
   fi
+  # Refine the message when the failure is a toolchain that cannot resolve its
+  # own executable: an empty node_modules (npm's cmd.exe wrapper prints
+  # "'biome' is not recognized..."), or a missing OPTIONAL platform package
+  # that leaves node_modules/.bin/<tool> in place while the binary it execs is
+  # absent (@biomejs/cli-win32-arm64 backs lint, @rollup/rollup-win32-arm64-msvc
+  # backs test). No fail_re or done_re matches those shapes, so they surfaced
+  # as a bare "Lint failed (exit 1)" -- which is what sent the v0.80.0 release
+  # down the segfault rabbit hole. Placed AFTER the ARM64 tolerance block so it
+  # can only make an already-failing run legible, never turn a tolerated
+  # segfault into a hard failure. The quote in "module '?@" is optional because
+  # rollup prints its own unquoted variant; the colon in ": command not found"
+  # is load-bearing against captured test output, same trap the test fail_re
+  # comment documents. The step-2 build gate is a separate code path and is
+  # NOT covered here.
+  if echo "$out" | grep -qE "Cannot find module '?@|is not recognized as an internal|: command not found|installed .* for another platform"; then
+    fail "$label failed (exit $rc) -- the toolchain could not resolve its own executable (see the error above). node_modules is missing or only partially installed. Run \`npm ci\`, then re-run ./release.sh ${VERSION}."
+  fi
   fail "$label failed (exit $rc)"
 }
 
@@ -225,6 +242,40 @@ command -v curl >/dev/null || fail "curl not installed (needed for step 5, the M
 command -v tar  >/dev/null || fail "tar not installed (needed for step 5, the MCP registry publish)"
 { command -v sha256sum >/dev/null || command -v shasum >/dev/null; } \
   || fail "sha256sum/shasum not installed (needed for step 5, the MCP registry publish)"
+
+# --- Guard: the repo-local toolchain must actually be installed. The
+# `command -v` checks above cover the PATH tools; these four live in
+# node_modules/.bin and are exactly what package.json's scripts exec:
+#   biome  -> "lint"      (step 1)   vitest -> "test"  (step 1)
+#   tsc    -> "typecheck" (step 1)   tsup   -> "build" (step 2, and again via
+#                                              prepublishOnly inside step 4)
+# A present-but-EMPTY node_modules (npm ci never ran, or was interrupted)
+# passes every other pre-flight check, survives the confirm prompt, and then
+# dies in step 1 with npm's opaque "'biome' is not recognized as an internal
+# or external command" plus a bare "Lint failed (exit 1)" -- after a git fetch
+# and two npm view round-trips have already been paid for. Observed on the
+# v0.80.0 release. These are O(1) stat calls, so they run ahead of all of it.
+#
+# The EXTENSIONLESS shim is the portable thing to test: npm's cmd-shim writes
+# <bin>, <bin>.cmd and <bin>.ps1 as a set on Windows but only <bin> on POSIX,
+# so testing <bin>.cmd would make this a silent no-op on the linux/darwin
+# hosts step 5 supports. -e rather than -x: the question is "did the install
+# happen", not "are the exec bits right" -- exec-bit reporting through MSYS on
+# a Windows filesystem is not something to gate a release on.
+MISSING_BINS=""
+for REQUIRED_BIN in biome tsc vitest tsup; do
+  # SKIP_LINT=1 takes biome out of the run entirely (see run_npm_check), so
+  # do not block a release on a tool this run will never invoke.
+  if [ "$REQUIRED_BIN" = "biome" ] && [ "${SKIP_LINT:-}" = "1" ]; then
+    continue
+  fi
+  [ -e "node_modules/.bin/${REQUIRED_BIN}" ] || MISSING_BINS="${MISSING_BINS} ${REQUIRED_BIN}"
+done
+if [ -n "$MISSING_BINS" ]; then
+  INSTALL_CMD="npm install"
+  if [ -f package-lock.json ]; then INSTALL_CMD="npm ci"; fi
+  fail "Dependencies are not installed -- missing node_modules/.bin/{${MISSING_BINS# }}. Step 1 would die with an opaque 'not recognized as an internal or external command'. Run \`${INSTALL_CMD}\`, then re-run ./release.sh ${VERSION}."
+fi
 
 # Re-read state from disk at every step boundary (per project rule: release
 # scripts must not cache at script-start). Functions call these helpers to
@@ -357,6 +408,41 @@ if [ "$RESUMING" != true ] && git rev-parse -q --verify "refs/tags/v${VERSION}" 
   EXISTING_TAG_COMMIT=$(git rev-list -n1 "v${VERSION}")
   fail "Tag v${VERSION} already exists (at ${EXISTING_TAG_COMMIT:0:9}) -- refusing to reuse an existing release number on a new commit. Pick an unused version, or delete the stale tag if it is wrong."
 fi
+
+# --- Guard: server.json must satisfy the MCP registry's own field limits
+# BEFORE anything is built, committed, or published. The registry caps
+# ServerDetail.description at 100 characters (and name at 3-200); it reports a
+# violation as a 422 from `mcp-publisher publish` in STEP 5 -- which runs after
+# the irreversible npm publish in step 4, stranding a version that is live on
+# npm and can never be registered. Same class as the mcpName/version drift
+# guards before the push in step 3, but a length violation is a STATIC property
+# of a file this script never rewrites, so checking it here costs nothing and
+# fails before the ~2-minute lint/typecheck/test/build block.
+#
+# Observed on v0.80.0, which died at step 5 with
+#   {"message":"expected length <= 100","location":"body.description"}
+# against a 121-character description, after npm had already accepted 0.80.0.
+# The schema is the source of truth for these numbers:
+# https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json
+REGISTRY_FIELD_ERRS=$(node -e '
+const j = require("./server.json");
+const errs = [];
+const d = j.description;
+if (typeof d !== "string" || d.length < 1) {
+  errs.push("description is missing or empty (registry requires 1-100 chars)");
+} else if (d.length > 100) {
+  errs.push("description is " + d.length + " chars, registry cap is 100 -- trim " + (d.length - 100));
+}
+const n = j.name;
+if (typeof n !== "string" || n.length < 3 || n.length > 200) {
+  errs.push("name must be 3-200 chars, got " + (typeof n === "string" ? n.length : typeof n));
+}
+console.log(errs.join("; "));
+') || fail "Could not read server.json to check the MCP-registry field limits -- is it valid JSON?"
+if [ -n "$REGISTRY_FIELD_ERRS" ]; then
+  fail "server.json violates the MCP registry schema: ${REGISTRY_FIELD_ERRS}. Fix server.json before releasing (package.json's description is meant to match it, so change both). Step 5 would otherwise 422 AFTER step 4's npm publish has already gone out, and npm forbids re-publishing a version."
+fi
+info "server.json passes the MCP-registry field limits"
 
 if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
