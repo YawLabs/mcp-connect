@@ -46,6 +46,11 @@
 #                                    origin/main sync guard then runs against a
 #                                    STALE remote-tracking ref. Deliberate
 #                                    degraded runs only.
+#   ALLOW_UNVERIFIED_VERSION=1       Proceed when `npm view` cannot read the
+#                                    registry, skipping the backward-version
+#                                    ordering guard for that run. Implied on a
+#                                    resume, where the version was already
+#                                    chosen by the earlier run.
 #   GITHUB_TOKEN=<pat>               GitHub token for the step-5 MCP-registry
 #                                    login (needs publish rights on
 #                                    io.github.YawLabs/*). Only read when the
@@ -525,6 +530,33 @@ fi
 # steps skip it), so only a not-yet-published version at or below the current
 # npm latest is blocked.
 LATEST_NPM=$(npm view "@yawlabs/mcp" version 2>/dev/null || echo "")
+# `npm view` cannot distinguish "the registry read failed" from "the package is
+# unpublished" -- both yield an empty string -- and the ordering guard below is
+# gated on LATEST_NPM being non-empty, so a transient 5xx, proxy hiccup or DNS
+# blip silently turned the whole backward-version check into a no-op, with zero
+# output saying so. @yawlabs/mcp has been published continuously since 2026-05,
+# so an empty result here is ALWAYS a read failure, never a first publish.
+#
+# The gap this closes is narrow but real. A fat-finger onto a PREVIOUSLY
+# RELEASED number is already caught by the tag-collision guard below, since the
+# tag is local after the fetch above. What slips through is a version that is
+# untagged AND unpublished AND <= latest -- precisely what the "bump past a
+# dead release, then delete the stale tag" recovery leaves behind (0.79.3,
+# 0.77.0 and 0.75.3 all sit in that state in this repo today). npm still
+# rejects the backward publish in step 4, so nothing bad ships; the cost is a
+# junk bump commit and tag on protected main plus a wasted gate cycle.
+#
+# warn rather than fail on a RESUME: the version was already chosen, and
+# possibly already published, by the earlier run, so refusing to continue over
+# an unrelated probe would block the recovery re-run -- the same carve-out the
+# npm-auth guard below makes on ALREADY_PUBLISHED.
+if [ -z "$LATEST_NPM" ]; then
+  if [ "$RESUMING" = true ] || [ "${ALLOW_UNVERIFIED_VERSION:-}" = "1" ]; then
+    warn "npm view returned nothing for @yawlabs/mcp -- the registry is unreadable, so the backward-version ordering guard is SKIPPED for this run"
+  else
+    fail "npm view returned nothing for @yawlabs/mcp -- cannot verify version ordering. The package IS published, so this is a registry read failure, not a first publish; continuing would silently disable the backward-version guard. Retry, or set ALLOW_UNVERIFIED_VERSION=1 to proceed deliberately."
+  fi
+fi
 ALREADY_PUBLISHED=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ -n "$LATEST_NPM" ] && [ "$ALREADY_PUBLISHED" != "$VERSION" ]; then
   if node -e 'const a=process.argv[1].split(".").map(Number),b=process.argv[2].split(".").map(Number);for(let i=0;i<3;i++){if((a[i]||0)>(b[i]||0))process.exit(0);if((a[i]||0)<(b[i]||0))process.exit(1);}process.exit(1);' "$VERSION" "$LATEST_NPM"; then
