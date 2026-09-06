@@ -41,6 +41,10 @@
 #                                    neither is set, `gh auth token` is tried.
 #
 # Required tools on PATH: node, npm, git, curl, tar, sha256sum (or shasum).
+# Optional but load-bearing in practice: gh -- the step-5 registry-auth
+# fallback, used whenever GITHUB_TOKEN and MCP_REGISTRY_TOKEN are unset, which
+# is every release on this workstation, since the persisted registry JWT's
+# 300-second TTL never survives steps 1-4.
 # The first run also needs `mcp-publisher` (downloaded to a temp dir on
 # demand, sha256-verified against the registry's per-release
 # `registry_<ver>_checksums.txt`) and a one-time `mcp-publisher login
@@ -291,6 +295,24 @@ current_server_name() { node -p "require('./server.json').name || ''"; }
 current_head_sha() { git rev-parse HEAD; }
 current_branch() { git rev-parse --abbrev-ref HEAD; }
 
+# The credential step 5's `mcp-publisher login github` actually runs on. The
+# persisted registry JWT at ~/.config/mcp-publisher/token.json has a 300-second
+# TTL (measured 2026-09-06: iat 14:35:51Z, exp 14:40:51Z), and no release gets
+# through steps 1-4 inside five minutes, so the "reuse the persisted token"
+# branch in step 5 is dead in practice and THIS is the load-bearing credential
+# on every run. Kept as a helper so the pre-flight probe and the step-5 call
+# site resolve it identically and cannot drift.
+#
+# stdout must carry ONLY the token: both callers capture it in a command
+# substitution, so any info()/warn() belongs at the call site, never in here.
+mcp_registry_gh_token() {
+  local t="${GITHUB_TOKEN:-${MCP_REGISTRY_TOKEN:-}}"
+  if [ -z "$t" ] && command -v gh >/dev/null 2>&1; then
+    t=$(gh auth token 2>/dev/null || echo "")
+  fi
+  printf %s "$t"
+}
+
 # Rewrite server.json's version + packages[0].version to $1. Used by both the
 # fresh-bump path and the resume self-heal, so the two can never drift.
 # mcp-publisher's `publish` validates that server.json's version matches what
@@ -397,6 +419,41 @@ if [ -n "$LATEST_NPM" ] && [ "$ALREADY_PUBLISHED" != "$VERSION" ]; then
   else
     fail "Version ${VERSION} is not greater than the published latest ${LATEST_NPM} -- npm will not move the 'latest' tag backward. This is almost always a fat-finger; pick a version > ${LATEST_NPM}."
   fi
+fi
+
+# --- Guard: the ~/.npmrc credential is not exercised until step 4's publish,
+# which runs AFTER step 3 has committed, tagged and pushed v${VERSION} to
+# protected main. The `npm view` calls above are public reads and prove nothing
+# about auth. Probe it here -- but fail OPEN on anything that is not a
+# definitive auth error: an unreachable registry and npm's ARM64 exit-cleanup
+# segfault both produce empty output, and neither is a reason to refuse a
+# release (the publish itself still gates on the real thing).
+#
+# Honest scope: this proves credential PRESENCE, not publish rights on
+# @yawlabs/mcp. A read-only or wrong-scope granular token passes `npm whoami`
+# and still E403s in step 4. It moves a RECOVERABLE failure earlier (re-running
+# the script resumes and publishes); it does not make anything irreversible
+# safe. What it buys is not spending 3-5 minutes of gates and leaving main
+# carrying a tag npm does not have yet.
+WHOAMI_RC=0
+NPM_WHO=$(npm whoami 2>&1) || WHOAMI_RC=$?
+if [ "$WHOAMI_RC" -eq 0 ] && [ -n "$NPM_WHO" ]; then
+  info "npm auth: ${NPM_WHO}"
+elif printf '%s' "$NPM_WHO" | grep -qE 'ENEEDAUTH|E401|need auth|log in'; then
+  fail "npm is not authenticated -- step 4 would fail AFTER v${VERSION} is committed, tagged and pushed to main. Restore the ~/.npmrc automation token (see CLAUDE.md npm-token-restore); do NOT run 'npm login --auth-type=web' -- it overwrites the automation token."
+else
+  warn "npm whoami inconclusive (exit ${WHOAMI_RC}) -- proceeding; step 4 will surface a real auth failure"
+fi
+
+# --- Guard: the same shape for the OTHER credential, the one step 5 needs.
+# Resolving it is pure local computation (two env reads plus one `gh` call)
+# that depends on nothing steps 1-4 produce, yet it first runs at the
+# `mcp-publisher login github` call -- after the irreversible npm publish.
+# warn and not fail, deliberately: on a legitimate resume where the registry
+# already lists this version, step 5's own probe skips the entire auth block,
+# so a hard failure here would block a run that succeeds today.
+if [ -z "$(mcp_registry_gh_token)" ]; then
+  warn "No GitHub token for the step-5 MCP-registry login (GITHUB_TOKEN and MCP_REGISTRY_TOKEN unset, \`gh auth token\` empty). The persisted JWT's 300-second TTL never survives steps 1-4, so step 5 will need one -- and it runs after the npm publish. Fix it now with \`gh auth login\`, or export GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*)."
 fi
 
 # --- Guard: on a FRESH bump, a tag v${VERSION} that already exists is a
@@ -818,13 +875,13 @@ else
     # The mcp-publisher binary only needs a GitHub token at login time; it
     # persists its own registry JWT to ${TOKEN_FILE} afterward, so the
     # GitHub token does NOT need to be in env for subsequent releases.
-    REGISTRY_GH_TOKEN="${GITHUB_TOKEN:-${MCP_REGISTRY_TOKEN:-}}"
-    if [ -z "$REGISTRY_GH_TOKEN" ] && command -v gh >/dev/null 2>&1; then
-      if REGISTRY_GH_TOKEN=$(gh auth token 2>/dev/null) && [ -n "$REGISTRY_GH_TOKEN" ]; then
-        info "MCP-registry auth: using \`gh auth token\` (fallback)"
-      else
-        REGISTRY_GH_TOKEN=""
-      fi
+    # Same resolution the pre-flight probe ran, through the shared helper so
+    # the two cannot drift. The info() stays HERE rather than inside the
+    # helper: the helper's stdout is captured, so anything printed in it would
+    # be concatenated into the token itself.
+    REGISTRY_GH_TOKEN=$(mcp_registry_gh_token)
+    if [ -n "$REGISTRY_GH_TOKEN" ] && [ -z "${GITHUB_TOKEN:-}" ] && [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
+      info "MCP-registry auth: using \`gh auth token\` (fallback)"
     fi
     if [ -z "$REGISTRY_GH_TOKEN" ]; then
       fail "mcp-publisher token ${TOKEN_STATE} and no GitHub token available. Set GITHUB_TOKEN (a PAT with publish rights on io.github.YawLabs/*), or run \`gh auth login\` so the \`gh auth token\` fallback works, or run once interactively: ${WORKDIR}/${BIN_NAME} login github"
