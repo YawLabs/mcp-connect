@@ -31,8 +31,8 @@
 #                                    on every input with no output, so the
 #                                    tolerance paths in run_npm_check could not
 #                                    engage. Fixed in v0.72.0 by pinning biome
-#                                    to 2.4.16 (66c48f3; the pin lives at
-#                                    package.json:42), and lint runs clean on
+#                                    to 2.4.16 (66c48f3; the pin lives in
+#                                    package.json), and lint runs clean on
 #                                    win32-arm64 with it. Kept as an escape
 #                                    valve for a future regression, NOT a
 #                                    required workaround -- a failing lint on
@@ -141,11 +141,11 @@ MCP_PUBLISHER_VERSION="v1.7.9"
 # MINGW64 on Windows ARM64 intermittently segfaults in npm's exit cleanup AFTER
 # a tool has finished and printed its report. This is npm's WRAPPER, not any one
 # tool -- distinct from the biome-2.5.x binary crash that v0.72.0 fixed by
-# pinning 2.4.16 (package.json:42); do not merge the two. Being intermittent, a
-# clean run does not retire it. The tool's OUTPUT is authoritative:
-# a 139/134 from `npm run` is tolerated only if the tool's own success marker is
-# in the captured output (or a direct re-run bypasses the wrapper). Other
-# platforms treat any non-zero as a hard failure.
+# pinning 2.4.16 (the @biomejs/biome pin in package.json); do not merge the two.
+# Being intermittent, a clean run does not retire it. The tool's OUTPUT is
+# authoritative: a 139/134 from `npm run` is tolerated only if the tool's own
+# success marker is in the captured output (or a direct re-run bypasses the
+# wrapper). Other platforms treat any non-zero as a hard failure.
 IS_MINGW_ARM64=false
 case "$(uname -s 2>/dev/null)" in
   MINGW*ARM64* | MSYS*ARM64* | CYGWIN*ARM64*) IS_MINGW_ARM64=true ;;
@@ -201,12 +201,17 @@ run_npm_check() {
   # as a bare "Lint failed (exit 1)" -- which is what sent the v0.80.0 release
   # down the segfault rabbit hole. Placed AFTER the ARM64 tolerance block so it
   # can only make an already-failing run legible, never turn a tolerated
-  # segfault into a hard failure. The quote in "module '?@" is optional because
-  # rollup prints its own unquoted variant; the colon in ": command not found"
-  # is load-bearing against captured test output, same trap the test fail_re
-  # comment documents. The step-2 build gate is a separate code path and is
-  # NOT covered here.
-  if echo "$out" | grep -qE "Cannot find module '?@|is not recognized as an internal|: command not found|installed .* for another platform"; then
+  # segfault into a hard failure. Pattern notes: "Cannot find (module|package)"
+  # covers CJS and ESM and both scoped and unscoped names; ": not found$" is
+  # what /bin/sh prints on the linux release drivers (dash: "sh: 1: biome: not
+  # found", busybox ash: "sh: biome: not found") since npm runs scripts through
+  # sh, not bash. Both "not found" alternatives stay anchored -- to a leading
+  # colon and to end-of-line -- because src/ carries 54 bare "not found"
+  # strings that captured test output can echo verbatim; the same trap the test
+  # fail_re comment documents. A false match here can only reword an
+  # already-failing gate, never fail a passing one. The step-2 build gate is a
+  # separate code path and is NOT covered here.
+  if echo "$out" | grep -qE ': not found$|: command not found|is not recognized as an internal|Cannot find (module|package)|installed .* for another platform'; then
     fail "$label failed (exit $rc) -- the toolchain could not resolve its own executable (see the error above). node_modules is missing or only partially installed. Run \`npm ci\`, then re-run ./release.sh ${VERSION}."
   fi
   fail "$label failed (exit $rc)"
@@ -304,6 +309,56 @@ if [ -n "$MISSING_BINS" ]; then
   if [ -f package-lock.json ]; then INSTALL_CMD="npm ci"; fi
   fail "Dependencies are not installed -- missing node_modules/.bin/{${MISSING_BINS# }}. Step 1 would die with an opaque 'not recognized as an internal or external command'. Run \`${INSTALL_CMD}\`, then re-run ./release.sh ${VERSION}."
 fi
+
+# --- Guard: server.json must satisfy the MCP registry's own field limits
+# BEFORE anything is built, committed, or published. The registry caps
+# ServerDetail.description at 100 characters, caps name at 3-200, and requires
+# name to match ^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$; a violation comes back as a
+# 422 from `mcp-publisher publish` in STEP 5, which runs after the irreversible
+# npm publish in step 4.
+#
+# That does NOT burn the version: a rejected publish registers nothing, so
+# fixing server.json and re-running completes it -- which is exactly how
+# v0.80.0 recovered. What it does cost is a version sitting live on npm with no
+# registry entry until someone notices. Same class as the mcpName/version drift
+# guards before the push in step 3.
+#
+# Checked HERE, ahead of every network probe and the whole gate block, because
+# it is pure local computation over fields the script never rewrites. (It does
+# rewrite server.json's version, via write_server_version on both the bump and
+# the resume self-heal -- but never its description or name.)
+#
+# Observed on v0.80.0, which died at step 5 with
+#   {"message":"expected length <= 100","location":"body.description"}
+# against a 121-character description, after npm had already accepted 0.80.0.
+# The schema is the source of truth for these numbers:
+# https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json
+# Lengths are counted in CODE POINTS, which is what JSON Schema maxLength
+# counts; String.length would double-count astral characters and reject a
+# description the registry accepts.
+REGISTRY_FIELD_ERRS=$(node -e '
+const j = require("./server.json");
+const errs = [];
+const d = j.description;
+const dLen = typeof d === "string" ? [...d].length : -1;
+if (dLen < 1) {
+  errs.push("description is missing or empty (registry requires 1-100 characters)");
+} else if (dLen > 100) {
+  errs.push("description is " + dLen + " characters, registry cap is 100 -- trim " + (dLen - 100));
+}
+const n = j.name;
+const nLen = typeof n === "string" ? [...n].length : -1;
+if (nLen < 3 || nLen > 200) {
+  errs.push("name must be 3-200 characters, got " + (nLen < 0 ? typeof n : nLen));
+} else if (!/^[a-zA-Z0-9.-]+\/[a-zA-Z0-9._-]+$/.test(n)) {
+  errs.push("name " + JSON.stringify(n) + " does not match the registry pattern ^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$");
+}
+console.log(errs.join("; "));
+') || fail "Could not read server.json to check the MCP-registry field limits -- is it valid JSON?"
+if [ -n "$REGISTRY_FIELD_ERRS" ]; then
+  fail "server.json violates the MCP registry schema: ${REGISTRY_FIELD_ERRS}. Fix server.json before releasing (package.json's description is meant to match it, so change both). Step 5 would otherwise 422 AFTER step 4's npm publish has gone out, leaving the version live on npm with no registry entry until a re-run."
+fi
+info "server.json passes the MCP-registry field limits"
 
 # Re-read state from disk at every step boundary (per project rule: release
 # scripts must not cache at script-start). Functions call these helpers to
@@ -416,13 +471,34 @@ fi
 # failed fetch never touched, so it compared HEAD against a stale snapshot and
 # passed cleanly. The "offline?" rationale did not hold either -- this script
 # cannot finish offline; it pushes in step 3, publishes to npm in step 4, and
-# downloads mcp-publisher from github.com in step 5. Tolerating the failure
-# bought nothing and cost the guard.
-if ! git fetch --tags --prune origin >/dev/null 2>&1; then
-  if [ "${ALLOW_STALE_REMOTE:-}" = "1" ]; then
-    warn "git fetch failed and ALLOW_STALE_REMOTE=1 -- the origin/main sync guard below is running against a STALE remote-tracking ref"
+# downloads mcp-publisher from github.com in step 5.
+#
+# But the EXIT CODE alone does not answer the question this guard asks.
+# `--tags` makes the WHOLE fetch exit non-zero when ANY ref is rejected -- most
+# often a divergent local tag ("would clobber existing tag"), precisely what
+# the bump-past-a-dead-release recovery leaves behind -- while
+# refs/remotes/origin/main updates cleanly in the same run. So re-probe the
+# branch ref directly and decide on THAT, and always surface the fetch output:
+# discarding it with >/dev/null 2>&1 hid the one line naming the cause, for
+# genuine auth and connectivity failures as much as for the tag case.
+FETCH_RC=0
+FETCH_OUT=$(git fetch --tags --prune origin 2>&1) || FETCH_RC=$?
+if [ "$FETCH_RC" -ne 0 ]; then
+  # `|| echo ""` is load-bearing: under `set -e` with `pipefail` an unreachable
+  # remote makes ls-remote exit 128, which would abort the script HERE -- before
+  # either branch below runs -- and the operator would get the bare failure
+  # banner with none of the fetch output this block exists to surface.
+  REMOTE_MAIN_SHA=$(git ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}' || echo "")
+  LOCAL_TRACKING_SHA=$(git rev-parse origin/main 2>/dev/null || echo "")
+  if [ -n "$REMOTE_MAIN_SHA" ] && [ "$REMOTE_MAIN_SHA" = "$LOCAL_TRACKING_SHA" ]; then
+    warn "git fetch exited ${FETCH_RC}, but origin/main is confirmed current at ${REMOTE_MAIN_SHA:0:9} -- continuing. Fetch output:"
+    printf '%s\n' "$FETCH_OUT" >&2
+  elif [ "${ALLOW_STALE_REMOTE:-}" = "1" ]; then
+    warn "git fetch failed and ALLOW_STALE_REMOTE=1 -- the origin/main sync guard below is running against a possibly STALE remote-tracking ref. Fetch output:"
+    printf '%s\n' "$FETCH_OUT" >&2
   else
-    fail "git fetch origin failed -- refusing to release on a stale view of origin/main. The sync guard below reads the local remote-tracking ref, so it would pass on stale data and step 3's push would then be rejected non-fast-forward AFTER the bump commit and the annotated tag already exist. Probe with 'git ls-remote origin', fix connectivity or auth, and re-run. Override with ALLOW_STALE_REMOTE=1."
+    printf '%s\n' "$FETCH_OUT" >&2
+    fail "git fetch origin failed AND origin/main could not be confirmed current (fetch output above) -- refusing to release on a stale view of origin/main. The sync guard below reads the local remote-tracking ref, so it would pass on stale data and step 3's push would then be rejected non-fast-forward AFTER the bump commit and the annotated tag already exist. Fix connectivity or auth and re-run. Override with ALLOW_STALE_REMOTE=1."
   fi
 fi
 LOCAL_HEAD=$(current_head_sha)
@@ -461,25 +537,40 @@ fi
 # --- Guard: the ~/.npmrc credential is not exercised until step 4's publish,
 # which runs AFTER step 3 has committed, tagged and pushed v${VERSION} to
 # protected main. The `npm view` calls above are public reads and prove nothing
-# about auth. Probe it here -- but fail OPEN on anything that is not a
-# definitive auth error: an unreachable registry and npm's ARM64 exit-cleanup
-# segfault both produce empty output, and neither is a reason to refuse a
-# release (the publish itself still gates on the real thing).
+# about auth. Probe it here -- but fail OPEN unless the output actually carries
+# a definitive auth error. An unreachable registry and npm's ARM64 exit-cleanup
+# segfault both match none of the auth patterns, so both land in the warn: the
+# segfault in particular fires AFTER the tool has printed its report, which is
+# this script's model of it everywhere else, so NPM_WHO is typically populated
+# rather than empty.
+#
+# stderr goes to a FILE rather than through 2>&1: npm writes its update-notifier
+# block to stderr on a SUCCESSFUL run, and merging the streams would print five
+# "npm notice" lines as the operator's npm identity.
+#
+# The hard fail is conditioned on ALREADY_PUBLISHED (computed just above).
+# When this version is already on npm, step 4 skips the publish outright, so a
+# lapsed token blocks nothing and must not abort a resume that only needs
+# step 5 -- the same carve-out the GitHub-token guard below is built around.
 #
 # Honest scope: this proves credential PRESENCE, not publish rights on
 # @yawlabs/mcp. A read-only or wrong-scope granular token passes `npm whoami`
-# and still E403s in step 4. It moves a RECOVERABLE failure earlier (re-running
-# the script resumes and publishes); it does not make anything irreversible
-# safe. What it buys is not spending 3-5 minutes of gates and leaving main
-# carrying a tag npm does not have yet.
+# and still E403s in step 4.
 WHOAMI_RC=0
-NPM_WHO=$(npm whoami 2>&1) || WHOAMI_RC=$?
+WHOAMI_ERR=$(mktemp)
+NPM_WHO=$(npm whoami 2>"$WHOAMI_ERR") || WHOAMI_RC=$?
+WHOAMI_DIAG=$(cat "$WHOAMI_ERR" 2>/dev/null || true)
+rm -f "$WHOAMI_ERR"
 if [ "$WHOAMI_RC" -eq 0 ] && [ -n "$NPM_WHO" ]; then
   info "npm auth: ${NPM_WHO}"
-elif printf '%s' "$NPM_WHO" | grep -qE 'ENEEDAUTH|E401|need auth|log in'; then
-  fail "npm is not authenticated -- step 4 would fail AFTER v${VERSION} is committed, tagged and pushed to main. Restore the ~/.npmrc automation token (see CLAUDE.md npm-token-restore); do NOT run 'npm login --auth-type=web' -- it overwrites the automation token."
+elif printf '%s\n%s' "$NPM_WHO" "$WHOAMI_DIAG" | grep -qE 'ENEEDAUTH|E401|need auth|log in'; then
+  if [ "$ALREADY_PUBLISHED" = "$VERSION" ]; then
+    warn "npm is not authenticated, but @yawlabs/mcp@${VERSION} is already published so step 4 will skip the publish -- continuing. Restore the ~/.npmrc automation token before the next release."
+  else
+    fail "npm is not authenticated -- step 4 would fail AFTER v${VERSION} is committed, tagged and pushed to main. Restore the ~/.npmrc automation token (see CLAUDE.md npm-token-restore); do NOT run 'npm login --auth-type=web' -- it overwrites the automation token."
+  fi
 else
-  warn "npm whoami inconclusive (exit ${WHOAMI_RC}) -- proceeding; step 4 will surface a real auth failure"
+  warn "npm whoami inconclusive (exit ${WHOAMI_RC}): ${WHOAMI_DIAG:-${NPM_WHO:-no output}} -- proceeding; step 4 will surface a real auth failure"
 fi
 
 # --- Guard: the same shape for the OTHER credential, the one step 5 needs.
@@ -502,41 +593,6 @@ if [ "$RESUMING" != true ] && git rev-parse -q --verify "refs/tags/v${VERSION}" 
   EXISTING_TAG_COMMIT=$(git rev-list -n1 "v${VERSION}")
   fail "Tag v${VERSION} already exists (at ${EXISTING_TAG_COMMIT:0:9}) -- refusing to reuse an existing release number on a new commit. Pick an unused version, or delete the stale tag if it is wrong."
 fi
-
-# --- Guard: server.json must satisfy the MCP registry's own field limits
-# BEFORE anything is built, committed, or published. The registry caps
-# ServerDetail.description at 100 characters (and name at 3-200); it reports a
-# violation as a 422 from `mcp-publisher publish` in STEP 5 -- which runs after
-# the irreversible npm publish in step 4, stranding a version that is live on
-# npm and can never be registered. Same class as the mcpName/version drift
-# guards before the push in step 3, but a length violation is a STATIC property
-# of a file this script never rewrites, so checking it here costs nothing and
-# fails before the ~2-minute lint/typecheck/test/build block.
-#
-# Observed on v0.80.0, which died at step 5 with
-#   {"message":"expected length <= 100","location":"body.description"}
-# against a 121-character description, after npm had already accepted 0.80.0.
-# The schema is the source of truth for these numbers:
-# https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json
-REGISTRY_FIELD_ERRS=$(node -e '
-const j = require("./server.json");
-const errs = [];
-const d = j.description;
-if (typeof d !== "string" || d.length < 1) {
-  errs.push("description is missing or empty (registry requires 1-100 chars)");
-} else if (d.length > 100) {
-  errs.push("description is " + d.length + " chars, registry cap is 100 -- trim " + (d.length - 100));
-}
-const n = j.name;
-if (typeof n !== "string" || n.length < 3 || n.length > 200) {
-  errs.push("name must be 3-200 chars, got " + (typeof n === "string" ? n.length : typeof n));
-}
-console.log(errs.join("; "));
-') || fail "Could not read server.json to check the MCP-registry field limits -- is it valid JSON?"
-if [ -n "$REGISTRY_FIELD_ERRS" ]; then
-  fail "server.json violates the MCP registry schema: ${REGISTRY_FIELD_ERRS}. Fix server.json before releasing (package.json's description is meant to match it, so change both). Step 5 would otherwise 422 AFTER step 4's npm publish has already gone out, and npm forbids re-publishing a version."
-fi
-info "server.json passes the MCP-registry field limits"
 
 if [ "$SKIP_CONFIRM" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
