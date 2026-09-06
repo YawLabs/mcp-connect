@@ -27,6 +27,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // one-shot so atomicWriteFile and later callers see the real fs.
 const failNextRead = vi.hoisted(() => ({ code: null as string | null }));
 const failNextRename = vi.hoisted(() => ({ code: null as string | null }));
+// Fails the NEXT write through a handle `open` returned -- the one window
+// where a lock file exists but nothing has claimed it yet.
+const failNextHandleWrite = vi.hoisted(() => ({ code: null as string | null }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const real = await importOriginal<typeof import("node:fs/promises")>();
@@ -53,6 +56,26 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       }
       return real.rename(...args);
     }) as typeof real.rename,
+    open: (async (...args: Parameters<typeof real.open>) => {
+      const handle = await real.open(...args);
+      const code = failNextHandleWrite.code;
+      if (!code) return handle;
+      failNextHandleWrite.code = null;
+      // The handle is REAL and the file it created is on disk -- only the
+      // write through it fails, which is the exact shape takeLock has to
+      // clean up after.
+      return new Proxy(handle, {
+        get(target, prop, receiver) {
+          if (prop === "writeFile") {
+            return async () => {
+              throw injected(code);
+            };
+          }
+          const v = Reflect.get(target, prop, receiver);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      });
+    }) as typeof real.open,
   };
 });
 
@@ -68,6 +91,7 @@ let synthHome: string;
 beforeEach(() => {
   failNextRead.code = null;
   failNextRename.code = null;
+  failNextHandleWrite.code = null;
   synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-grades-strict-"));
 });
 
@@ -113,6 +137,27 @@ describe("writeGrade -- strict read (read fails, path writable)", () => {
     await writeGrade("gh", ENTRY_A, synthHome);
     const parsed = JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8"));
     expect(parsed.gh).toEqual(ENTRY_A);
+  });
+});
+
+describe("writeGrade -- the lock file is created but the write through it fails", () => {
+  it("removes the half-made lock before rethrowing, so the next audit does not wait out the stale age", async () => {
+    // takeLock's O_EXCL open succeeds and THEN the write fails (EIO, a full
+    // disk, a handle revoked under it). The throw escapes before
+    // withGradesLock's try/finally is entered, so nothing releases the file:
+    // pre-fix, a lock nobody ever held sat at the path and the next
+    // `yaw-mcp audit` -- which the MCP panel fires per server -- paid the
+    // whole stale age before it could steal it.
+    failNextHandleWrite.code = "EIO";
+    await expect(writeGrade("gh", ENTRY_A, synthHome)).rejects.toMatchObject({ code: "EIO" });
+
+    const lockPath = `${gradesCachePath(synthHome)}.lock`;
+    expect(existsSync(lockPath), "a lock nobody holds was left behind").toBe(false);
+
+    // ...and the very next call goes straight through: no wait, no steal.
+    await writeGrade("gh", ENTRY_A, synthHome, { lockWaitMs: 200 });
+    expect(JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8")).gh).toEqual(ENTRY_A);
+    expect(existsSync(lockPath)).toBe(false);
   });
 });
 

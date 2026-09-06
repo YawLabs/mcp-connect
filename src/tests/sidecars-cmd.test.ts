@@ -1337,7 +1337,12 @@ describe("runSidecarsInstall", () => {
     // back, which a script cannot learn from a clean document -- and exit 1
     // with `error: null` is the shape the JSON tests above forbid.
     expect(res.exitCode).toBe(1);
+    // The message NAMES the lock file: the holder may be a live refresh or a
+    // serve that was killed mid-install (the lock is honoured until its mtime
+    // goes stale for exactly that reason), and looking at the file is the one
+    // thing an operator can do with either.
     expect(res.lines.join("\n")).toContain("try again");
+    expect(res.lines.join("\n")).toContain(join(sidecarsRoot(home), SIDECARS_LOCK_NAME));
     const doc = JSON.parse(out);
     expect(Object.keys(doc).sort()).toEqual(JSON_KEYS);
     expect(doc.reason).toBe("locked");

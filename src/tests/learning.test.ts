@@ -112,6 +112,26 @@ describe("LearningStore", () => {
       expect(store.get("junk")).toBeUndefined();
       expect(Object.keys(store.exportSnapshot())).toEqual([]);
     });
+
+    it("drops an ARRAY row and an empty-object row, which typeof calls objects too", () => {
+      // `typeof [] === "object"` and `typeof {} === "object"`, so both passed
+      // the object check and every field fell to 0 -- the same phantom
+      // {0, 0, 0} entry the primitive case above is about. Once admitted it
+      // round-trips through exportSnapshot to state.json on the next flush
+      // and survives every restart, quietly weighting a namespace nobody
+      // dispatched.
+      const store = new LearningStore();
+      store.loadSnapshot({
+        arr: [1, 2, 3],
+        empty: {},
+        gh: { dispatched: 3, succeeded: 2, lastUsedAt: 7 },
+      } as unknown as Record<string, NamespaceUsage>);
+      expect(store.get("arr")).toBeUndefined();
+      expect(store.get("empty")).toBeUndefined();
+      // The good row alongside them still restores.
+      expect(store.get("gh")).toEqual({ dispatched: 3, succeeded: 2, lastUsedAt: 7 });
+      expect(Object.keys(store.exportSnapshot())).toEqual(["gh"]);
+    });
   });
 
   describe("recordSuccess without prior recordDispatch (fix 11)", () => {

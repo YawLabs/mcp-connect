@@ -203,13 +203,24 @@ describe("writeGrade -- add new entry", () => {
 });
 
 describe("writeGrade -- concurrent writes (serialization)", () => {
+  // What these two assert is the MERGE: neither writer may lose the other's
+  // entry or a pre-existing one. They must not also assert the machine's
+  // scheduling. With production timings the loser polls against a 15s
+  // deadline and a 10s stale window, and this suite packs ~200s of test time
+  // into ~45s of wall clock across workers -- one run in four hit a failure
+  // here that no isolated run, no CPU-starved run (8 runs under 14 burners on
+  // 12 cores) and no tiny-stale-window probe could reproduce. Both bounds are
+  // therefore pinned far past anything a loaded worker can reach, so a red
+  // here means a lost update, which is the only thing these cases are for.
+  const PATIENT = { lockWaitMs: 120_000, lockStaleMs: 120_000 };
+
   it("two simultaneous writeGrade calls do not lose either entry", async () => {
     const entryA: CachedGrade = { grade: "A", score: 99, gradedAt: "2026-06-11T00:00:00.000Z" };
     const entryB: CachedGrade = { grade: "B", score: 80, gradedAt: "2026-06-11T01:00:00.000Z" };
 
     // Fire both writes concurrently without await between them so they both
     // contend for the lock before either read-modify-write starts.
-    await Promise.all([writeGrade("ns-a", entryA, synthHome), writeGrade("ns-b", entryB, synthHome)]);
+    await Promise.all([writeGrade("ns-a", entryA, synthHome, PATIENT), writeGrade("ns-b", entryB, synthHome, PATIENT)]);
 
     const disk = JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8")) as Record<string, unknown>;
     expect(disk["ns-a"]).toEqual(entryA);
@@ -223,7 +234,7 @@ describe("writeGrade -- concurrent writes (serialization)", () => {
     const newA: CachedGrade = { grade: "A", score: 95, gradedAt: "2026-06-11T02:00:00.000Z" };
     const newB: CachedGrade = { grade: "F", score: 42, gradedAt: "2026-06-11T03:00:00.000Z" };
 
-    await Promise.all([writeGrade("new-a", newA, synthHome), writeGrade("new-b", newB, synthHome)]);
+    await Promise.all([writeGrade("new-a", newA, synthHome, PATIENT), writeGrade("new-b", newB, synthHome, PATIENT)]);
 
     const disk = JSON.parse(readFileSync(gradesCachePath(synthHome), "utf8")) as Record<string, unknown>;
     expect(disk.pre).toEqual(pre);

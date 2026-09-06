@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,7 @@ function writeYawMcpConfig(root: string, filename: string, obj: unknown): void {
   writeFileSync(join(root, ".yaw-mcp", filename), JSON.stringify(obj));
 }
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DOCTOR_ENV_VARS,
@@ -26,6 +26,50 @@ import { claudeCodeProjectKey, ENTRY_NAME } from "../install-targets.js";
 import { MIN_OAM_VERSION, OAM_INSTALL_PS1, OAM_INSTALL_SH } from "../oam-spawn.js";
 import { STATE_FILENAME, STATE_SCHEMA_VERSION } from "../persistence.js";
 import { SECRETS_SCHEMA_VERSION } from "../secrets-vault.js";
+
+// An UNREADABLE project bundles.json is a doctor branch of its own (the
+// "could not be read" line, and the approved-but-unreadable "loads NO
+// servers" line), and the only way to reach it is for the loader's single
+// read of that file -- readFile in local-bundles.readBundlesRawAt -- to fail
+// with something other than ENOENT/EISDIR. Staging that on disk needs POSIX:
+// chmod 000 is a no-op on Windows, the `.yaw-mcp`-is-a-file shape reports
+// ENOENT there rather than ENOTDIR, and symlink loops need a privileged
+// account -- which is why these two cases used to be skipped on win32 and so
+// never ran on this machine at all. The errno is therefore injected at the
+// readFile boundary instead, exactly as src/tests/local-bundles.test.ts does
+// for the same module. Nothing else changes: the SUT still walks to the real
+// project file, still consults the real trust store, and still renders the
+// warning from the errno it saw, so the assertions below are the same ones
+// the chmod version made. Reads of every other path -- and this file is full
+// of tests that read real config files -- pass straight through to the real
+// implementation.
+const { readFileErrors } = vi.hoisted(() => ({ readFileErrors: new Map<string, string>() }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const readFile = ((target: unknown, ...rest: unknown[]) => {
+    const code = typeof target === "string" ? readFileErrors.get(target) : undefined;
+    if (code !== undefined) {
+      const err: NodeJS.ErrnoException = new Error(`${code}: injected read failure, open '${String(target)}'`);
+      err.code = code;
+      return Promise.reject(err);
+    }
+    return (actual.readFile as (...a: unknown[]) => unknown)(target, ...rest);
+  }) as unknown as typeof actual.readFile;
+  return { ...actual, readFile };
+});
+
+/** Make every read of `path` fail with `code`, the way chmod 000 made it fail
+ *  for real on POSIX.
+ *
+ *  One key is enough because beforeEach realpaths the synthetic roots (see
+ *  below): the logical path a caller builds from synthCwd and the physical one
+ *  findProjectConfigDir resolves its walk to are then the same string, so this
+ *  key matches the open the SUT actually makes -- and so do the assertions
+ *  that go looking for that path in doctor's output. */
+function failReadsOf(path: string, code: string): void {
+  readFileErrors.set(path, code);
+}
 
 /** The shape probeOam returns when oam is not installed at all. */
 const oamNotInstalled = () => ({
@@ -52,11 +96,17 @@ let synthHome: string;
 let synthCwd: string;
 
 beforeEach(() => {
-  synthHome = mkdtempSync(join(tmpdir(), "yaw-mcp-doctor-home-"));
+  // realpathSync both roots, the same convention as config-loader.test.ts and
+  // local-bundles.test.ts: the SUT resolves paths physically (findProjectConfigDir
+  // realpaths its walk, and trust grants are keyed on the real path), so on a
+  // platform whose os.tmpdir() sits behind a symlink -- macOS /var -> /private/var --
+  // a raw mkdtemp path never byte-matches the spelling doctor renders, and both
+  // the injected-errno keys and the toContain(path) assertions below silently miss.
+  synthHome = realpathSync(mkdtempSync(join(tmpdir(), "yaw-mcp-doctor-home-")));
   // synthCwd lives INSIDE synthHome so walk-up terminates at the
   // synthetic home boundary rather than escaping into the real user
   // dir, where a real ~/.yaw-mcp/config.json would otherwise get claimed.
-  synthCwd = mkdtempSync(join(synthHome, "cwd-"));
+  synthCwd = realpathSync(mkdtempSync(join(synthHome, "cwd-")));
 });
 
 afterEach(() => {
@@ -64,6 +114,9 @@ afterEach(() => {
   // recursive remove takes both -- a second rmSync(synthCwd) would always
   // be a no-op against an already-deleted path.
   rmSync(synthHome, { recursive: true, force: true });
+  // Injected read failures are per-test: leaving one set would make the next
+  // test's read of that path fail for a reason it never asked for.
+  readFileErrors.clear();
 });
 
 function captureOut() {
@@ -2690,43 +2743,62 @@ describe("runDoctor — project-trust gate", () => {
   // An unreadable project bundles.json is not a consent refusal, so it takes
   // its own branch. Doctor is the only surface it reaches: the loader's
   // bundles warnings never join config.warnings.
-  it.skipIf(process.platform === "win32")("reports an unreadable, never-approved project file", async () => {
-    const { chmodSync } = await import("node:fs");
+  //
+  // The file is written for real and then the errno is injected at the one
+  // read of it (see failReadsOf at the top of this file) instead of the
+  // chmod 000 this used to do -- chmod is a no-op on Windows, so both of
+  // these cases were skipped there and had never run on this machine. What
+  // the SUT sees is identical either way: a project file that exists, that
+  // the trust probe locates, and whose bytes will not come back.
+  //
+  // Two errnos because the branch keys on "the read failed with something
+  // that is not ENOENT/EISDIR", not on EACCES in particular: EACCES is the
+  // chmod-000 shape, and ELOOP is the attacker-controlled one that survives
+  // a git clone -- a real `.yaw-mcp/` DIRECTORY (so it passes the isDirectory
+  // gate in findProjectConfigDir) holding a bundles.json committed as a
+  // symlink loop, so the walk still hands doctor a path and only the read of
+  // it fails. src/tests/local-bundles.test.ts injects ELOOP for that same
+  // shape. Both must produce this same warning.
+  //
+  // NOT ENOTDIR, which local-bundles.ts documents for the sibling shape (a
+  // repo committing `.yaw-mcp` itself as a regular file): that one is honest
+  // there because those tests synthesize the probe path directly and bypass
+  // the walk, but it is unreachable end-to-end from here. findProjectConfigDir
+  // stats each candidate and SKIPS a non-directory rather than returning it
+  // (src/paths.ts:223-225), then keeps walking up, so no path ever reaches
+  // readBundlesRawAt for doctor's read to fail with ENOTDIR on.
+  it.each(["EACCES", "ELOOP"])("reports an unreadable, never-approved project file (%s)", async (code) => {
     const path = writeProjectBundles(synthCwd, HOSTILE);
-    chmodSync(path, 0o000);
-    try {
-      const cap = captureOut();
-      const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
-      expect(r.exitCode).toBe(2);
-      expect(cap.text()).toContain("could not be read");
-      expect(cap.text()).toContain(path);
-    } finally {
-      chmodSync(path, 0o644);
-    }
+    failReadsOf(path, code);
+    const cap = captureOut();
+    const r = await runDoctor({ cwd: synthCwd, home: synthHome, env: {}, os: "linux", out: cap.out, err: () => {} });
+    expect(r.exitCode).toBe(2);
+    expect(cap.text()).toContain("could not be read");
+    expect(cap.text()).toContain(path);
   });
 
-  it.skipIf(process.platform === "win32")("says an APPROVED-but-unreadable file loads no servers at all", async () => {
-    const { chmodSync } = await import("node:fs");
+  // Trust is granted from the real bytes BEFORE the injection, which is the
+  // honest ordering: the user approved a file that was readable at the time
+  // and it went bad afterwards. That is what makes pathTrusted true here and
+  // sends doctor down the "stays committed to that location" half of the
+  // unreadable branch rather than the never-approved half above.
+  it("says an APPROVED-but-unreadable file loads no servers at all", async () => {
     const { grantTrust } = await import("../trust.js");
     const path = writeProjectBundles(synthCwd, HOSTILE);
     await grantTrust(path, readFileSync(path), { home: synthHome });
-    chmodSync(path, 0o000);
-    try {
-      const cap = captureOut();
-      const r = await runDoctor({
-        cwd: synthCwd,
-        home: synthHome,
-        env: {},
-        os: "linux",
-        out: cap.out,
-        err: () => {},
-      });
-      expect(r.exitCode).toBe(2);
-      expect(cap.text()).toContain("loads NO servers");
-      expect(cap.text()).toContain("trust --revoke");
-    } finally {
-      chmodSync(path, 0o644);
-    }
+    failReadsOf(path, "EACCES");
+    const cap = captureOut();
+    const r = await runDoctor({
+      cwd: synthCwd,
+      home: synthHome,
+      env: {},
+      os: "linux",
+      out: cap.out,
+      err: () => {},
+    });
+    expect(r.exitCode).toBe(2);
+    expect(cap.text()).toContain("loads NO servers");
+    expect(cap.text()).toContain("trust --revoke");
   });
 });
 

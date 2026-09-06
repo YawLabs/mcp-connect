@@ -173,6 +173,31 @@ describe("handleDispatch", () => {
     expect(text).not.toContain('"isActive": true');
   });
 
+  it("names BOTH config files for a block-list edit when a user-global profile is layered under the project one", async () => {
+    // `blocked` is the UNION across scopes (config-loader's unionBlocked)
+    // while profile.path is only the primary file, so the entry that keeps
+    // the server out can live in the user-global config. Naming just the
+    // project file sent the model to edit a file with no "blocked" list in
+    // it -- it adds one there, nothing changes, and the server stays
+    // invisible.
+    const priv = getPrivate(server);
+    priv.config = {
+      configVersion: "v1",
+      servers: [makeServerConfig({ namespace: "gh", name: "GitHub" })],
+    };
+    priv.profile = {
+      path: "/proj/.yaw-mcp/config.json",
+      userPath: "/h/.yaw-mcp/config.json",
+      blocked: ["gh"],
+    };
+    const result = await priv.handleDispatch("do something", 1);
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain("/proj/.yaw-mcp/config.json");
+    expect(text).toContain("/h/.yaw-mcp/config.json");
+    expect(text).toContain("blocked lists merge across scopes");
+  });
+
   it("names both fixes when one server is disabled and another is profile-blocked", async () => {
     const priv = getPrivate(server);
     priv.config = {

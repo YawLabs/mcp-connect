@@ -100,6 +100,25 @@ describe("buildTiebreakPrompt", () => {
     expect(prompt).toContain(`User intent: ${"y".repeat(INTENT_MAX)}\n`);
   });
 
+  it("never cuts a surrogate pair in half, in the intent or a description", () => {
+    // A pasted chat message with an emoji at the cap boundary. A lone high
+    // surrogate here reaches the client's LLM API as a lone escape, which a
+    // strict encoder rejects -- the tiebreak comes back a null vote for a
+    // reason nobody can see in the prompt.
+    const key = String.fromCodePoint(0x1f511);
+    const prompt = buildTiebreakPrompt(`${"z".repeat(INTENT_MAX - 1)}${key} rest`, [
+      {
+        namespace: "github",
+        score: 1,
+        description: `${"d".repeat(CANDIDATE_DESCRIPTION_MAX - 1)}${key} rest`,
+        tools: [],
+      },
+      { namespace: "gitlab", score: 0.95, description: "short", tools: [] },
+    ]);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(prompt)).toBe(false);
+    expect(prompt).toContain(`User intent: ${"z".repeat(INTENT_MAX - 1)}...`);
+  });
+
   it("caps each candidate description at CANDIDATE_DESCRIPTION_MAX", () => {
     // Descriptions come from local-bundles.ts with no bound of their own.
     const prompt = buildTiebreakPrompt("x", [

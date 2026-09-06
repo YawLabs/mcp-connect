@@ -2512,6 +2512,30 @@ describe("write-path warnings reach the user as prose", () => {
     }
   });
 
+  it("add prints them on the COLLISION path too, where the user is about to edit the file", async () => {
+    // The refusal sends the user into bundles.json to resolve the namespace
+    // clash, so a diagnostic about that same file -- here a defaultRuntime
+    // the loader dropped -- is exactly what they need before they open it.
+    // The dry run printed it and the real run threw the warnings away with
+    // the BundleCollisionError, which inverted the parity the preview is
+    // supposed to have with the run it previews.
+    seed([{ namespace: "github", name: "GitHub", slug: "github-enterprise", command: "other", args: [] }]);
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "github",
+      home: synthHome,
+      cwd: synthCwd,
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_x" },
+      fetchCatalog,
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(io.errText()).toMatch(/^warning: .*defaultRuntime.*"omm"/m);
+    expect(io.errText()).toContain('added as "github-enterprise"');
+    expect(r.written).toEqual([]);
+  });
+
   it("remove prints it once, not once per candidate namespace it tried", async () => {
     // Target "brave-search" tries the literal first (a miss that still reads
     // the file) and only then the derived "bravesearch" -- two reads, one

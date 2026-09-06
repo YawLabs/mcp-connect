@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, constants, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -39,6 +39,79 @@ import {
   specConstraint,
   winNormalize,
 } from "../oam-spawn.js";
+
+// isExecutableFile (oam-spawn.ts) asks the REAL filesystem two questions --
+// statSync for "is this a regular file", accessSync(X_OK) for "would the loader
+// run it" -- and the two POSIX-side branches of resolveBinAbsolute need
+// fixtures a Windows runner cannot stage for either one. A ':'-joined PATH
+// cannot carry a drive-lettered temp path (it splits at the drive letter), and
+// X_OK is a no-op on Windows -- Node degrades it to F_OK -- so a chmod 0644
+// file still reads as executable there. Both tests were skipIf(win32) for that
+// reason, which in this repo meant they ran NOWHERE: there are no CI legs, and
+// release.sh runs the suite on the Windows machine that cuts the release.
+//
+// So the DISK is injected, not the decision. Only statSync/accessSync answers
+// for paths under SYNTH_ROOT come from the map below; every other path passes
+// straight through to node:fs, which is load-bearing -- almost every other
+// fixture in this file is a real temp dir. resolveBinAbsolute and
+// isExecutableFile run unmodified, including isExecutableFile's own
+// `platform !== "win32"` gate and its everything-is-"not the binary" catch, so
+// the assertions still measure the search rather than a stub of it. accessLog
+// records the X_OK calls the staged paths receive, which lets the tests pin the
+// DECISION -- X_OK demanded off Windows, never asked for on it -- and not just
+// its outcome.
+const { SYNTH_ROOT, fsKey, fsEntries, accessLog } = vi.hoisted(() => ({
+  SYNTH_ROOT: "/yaw-mcp-synthetic-posix",
+  // node:path is platform-NATIVE: a POSIX-shaped path run through join() comes
+  // back backslashed on a Windows runner. Both the map keys and the lookups
+  // are folded to forward slashes so the two spellings of one staged path
+  // cannot disagree.
+  fsKey: (p: string) => p.replace(/\\/g, "/"),
+  fsEntries: new Map<string, "exec" | "noexec">(),
+  accessLog: [] as { path: string; mode: number | undefined }[],
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  /** "exec"/"noexec" for a staged path, "absent" for an unstaged one under the
+   *  synthetic root (the map is authoritative there, so a real directory of
+   *  that name on the runner could not answer instead), and null for every
+   *  real path -- which passes through untouched. */
+  const staged = (target: unknown): "exec" | "noexec" | "absent" | null => {
+    if (typeof target !== "string") return null;
+    const key = fsKey(target);
+    if (!key.startsWith(`${SYNTH_ROOT}/`)) return null;
+    return fsEntries.get(key) ?? "absent";
+  };
+  const errno = (code: string, syscall: string, target: string): NodeJS.ErrnoException => {
+    const err: NodeJS.ErrnoException = new Error(`${code}: injected fs failure, ${syscall} '${target}'`);
+    err.code = code;
+    return err;
+  };
+  const statSync = ((target: unknown, ...rest: unknown[]) => {
+    const kind = staged(target);
+    if (kind === null) return (actual.statSync as (...a: unknown[]) => unknown)(target, ...rest);
+    if (kind === "absent") throw errno("ENOENT", "stat", String(target));
+    // A staged path is always a regular FILE: the directory-shaped candidate is
+    // covered by a real mkdir fixture (the "skips a DIRECTORY" test) and needs
+    // no injection, so isFile() is the only thing the search asks of this.
+    return { isFile: () => true, isDirectory: () => false };
+  }) as unknown as typeof actual.statSync;
+  const accessSync = ((target: unknown, mode?: number) => {
+    const kind = staged(target);
+    if (kind === null) return (actual.accessSync as (...a: unknown[]) => unknown)(target, mode);
+    accessLog.push({ path: String(target), mode });
+    if (kind === "absent") throw errno("ENOENT", "access", String(target));
+    // EACCES on an X_OK request is exactly what a real chmod 0644 file answers
+    // off Windows; anything weaker than X_OK (an F_OK existence check) still
+    // succeeds, so the staged file is "there but not runnable", not "missing".
+    if (kind === "noexec" && ((mode ?? actual.constants.F_OK) & actual.constants.X_OK) !== 0) {
+      throw errno("EACCES", "access", String(target));
+    }
+    return undefined;
+  }) as unknown as typeof actual.accessSync;
+  return { ...actual, statSync, accessSync };
+});
 
 describe("winNormalize", () => {
   it("converts forward slashes to backslashes on Windows (cmd-safe)", () => {
@@ -379,6 +452,31 @@ describe("resolveBinAbsolute", () => {
     return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
   }
 
+  /** A POSIX-shaped bin directory that exists only in the injected fs at the
+   *  top of this file, for the two branches a real temp dir cannot express on a
+   *  Windows runner (see that block for why). The path carries no drive letter,
+   *  so it survives a ':'-delimited PATH; `noexec` gives a file that stats as a
+   *  regular file but denies X_OK, which is what chmod 0644 produces for real.
+   *
+   *  The staged keys go through the same join() the search uses, so a Windows
+   *  runner's backslashed spelling of this POSIX path still matches. */
+  function posixBinDir(leaf: string, files: Record<string, "exec" | "noexec">): { dir: string; cleanup: () => void } {
+    const dir = `${SYNTH_ROOT}/${leaf}`;
+    const keys = Object.entries(files).map(([name, kind]) => {
+      const key = fsKey(join(dir, name));
+      fsEntries.set(key, kind);
+      return key;
+    });
+    accessLog.length = 0;
+    return {
+      dir,
+      cleanup: () => {
+        for (const key of keys) fsEntries.delete(key);
+        accessLog.length = 0;
+      },
+    };
+  }
+
   it("finds a bare name through PATHEXT on Windows, where `oam` is a file called oam.exe", () => {
     // The case the install path lives on: `oam` spawns because the loader
     // appends an extension, so a PATH-only search finds nothing on disk.
@@ -502,24 +600,31 @@ describe("resolveBinAbsolute", () => {
     }
   });
 
-  // POSIX-only for the reason above: a colon-joined PATH cannot carry a
-  // drive-lettered fixture path, so this can only be exercised where absolute
-  // paths are POSIX-shaped.
-  //
-  // NOTHING RUNS THIS TODAY. There are no CI legs -- this repo ships no
-  // workflows, and release.sh runs `npm test` on the releasing machine, which
-  // is Windows. So this and the X_OK test below are gates for a POSIX
-  // developer's local run, not covered branches: treat the ':' split and the
-  // X_OK enforcement as unverified by the suite until either a POSIX leg
-  // exists or the executable check becomes injectable the way `platform` is.
-  it.skipIf(process.platform === "win32")("splits PATH on ':' off Windows, and needs no PATHEXT", () => {
-    const { dir, cleanup } = binDir("oam");
-    const other = mkdtempSync(join(tmpdir(), "resolvebin-empty-"));
+  // The fixture is injected rather than staged on disk (see the node:fs block
+  // at the top of this file): a real temp dir is drive-lettered on the runner
+  // that cuts every release, and a ':'-delimited PATH would split it at that
+  // drive letter, so the test would be measuring the fixture rather than the
+  // search. Only "what is on disk at this path" is answered from the map --
+  // the split, the PATHEXT decision and isExecutableFile all run for real, so
+  // what this proves is unchanged: a ';' split would leave the whole
+  // "<other>:<dir>" string as ONE entry and find nothing, and applying the
+  // default PATHEXT off Windows would search oam.COM/.EXE/... and never the
+  // extensionless `oam` that is the only file staged.
+  it("splits PATH on ':' off Windows, and needs no PATHEXT", () => {
+    const { dir, cleanup } = posixBinDir("split", { oam: "exec" });
+    const other = `${SYNTH_ROOT}/split-empty`;
     try {
+      // Expectation built with the SAME join the search uses. node:path is
+      // platform-native, so this POSIX path builds with backslashes on a
+      // Windows runner and a hardcoded "/.../oam" would fail there for a
+      // reason that has nothing to do with the ':' split.
       expect(resolveBinAbsolute("oam", { PATH: `${other}:${dir}` }, "linux")).toBe(join(dir, "oam"));
+      // ...and the POSIX branch paid the X_OK it owes, on the file it answered
+      // with and on nothing else: the miss in `other` never got that far,
+      // because statSync said ENOENT first.
+      expect(accessLog).toEqual([{ path: join(dir, "oam"), mode: constants.X_OK }]);
     } finally {
       cleanup();
-      rmSync(other, { recursive: true, force: true });
     }
   });
 
@@ -613,21 +718,41 @@ describe("resolveBinAbsolute", () => {
     }
   });
 
-  // Real fs permissions, so this is gated on the RUNNER, not on the injected
-  // platform: X_OK is a no-op on Windows (Node treats it as F_OK), where
-  // executability is the extension and PATHEXT has already decided it.
-  it.skipIf(process.platform === "win32")("skips a non-executable file off Windows", () => {
-    const dir = mkdtempSync(join(tmpdir(), "resolvebin-noexec-"));
-    writeFileSync(join(dir, "oam"), "");
-    chmodSync(join(dir, "oam"), 0o644);
+  // The permission is injected, not real (see the node:fs block at the top). A
+  // real `chmodSync(..., 0o644)` fixture WOULD force a runner-gated test,
+  // because X_OK is a no-op on Windows -- Node degrades it to F_OK -- so the
+  // real fs there cannot produce a file that stats as a regular file and still
+  // refuses X_OK; injecting the errno instead is what lets this one run
+  // everywhere, including the Windows machine that cuts the release. The staged
+  // file answers EACCES to exactly that X_OK request, which is what the real
+  // 0644 file answers off Windows, and isExecutableFile's own platform gate,
+  // its accessSync call and its catch are all the shipped code.
+  it("skips a non-executable file off Windows, and asks no X_OK on Windows", () => {
+    const { dir, cleanup } = posixBinDir("noexec", { oam: "noexec" });
     try {
       // The loader skips it in favour of the real binary further down PATH, and
       // this is the shape that makes probeOam report a `spawn` failure -- so
       // returning it as the answer to "where is oam" is doubly wrong.
       expect(resolveBinAbsolute("oam", { PATH: dir }, "linux")).toBeNull();
       expect(resolveBinAbsolute(join(dir, "oam"), {}, "linux")).toBeNull();
+      // Both refusals came from X_OK and nothing else. The file stats as a
+      // regular file, so this is the assertion that separates "skipped because
+      // it is not executable" from "skipped because the stat missed" -- an
+      // isExecutableFile that stopped asking would have returned it twice.
+      expect(accessLog).toEqual([
+        { path: join(dir, "oam"), mode: constants.X_OK },
+        { path: join(dir, "oam"), mode: constants.X_OK },
+      ]);
+      // The win32 half of the same gate, which the runner skip also hid: the
+      // IDENTICAL file is the answer there, because executability is the
+      // extension and PATHEXT has already decided it. Asserted through the
+      // absolute branch on purpose -- a bare `oam` on win32 is searched as
+      // oam.COM/.EXE/... and would never reach an extensionless file at all.
+      accessLog.length = 0;
+      expect(resolveBinAbsolute(join(dir, "oam"), {}, "win32")).toBe(winNormalize(join(dir, "oam"), "win32"));
+      expect(accessLog).toEqual([]);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      cleanup();
     }
   });
 });

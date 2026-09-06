@@ -9,6 +9,7 @@ import {
   isUnlocked,
   loadVault,
   lock,
+  MALFORMED_REF_MARKER,
   rotateVault,
   SECRETS_SCHEMA_VERSION,
   saveVault,
@@ -1055,6 +1056,32 @@ describe("runSecrets audit", () => {
     expect(r.exitCode).toBe(0);
     const out = io.out.mock.calls.map((c) => c[0] as string).join("");
     expect(out.toLowerCase()).toContain("no secret-resolution audit");
+  });
+
+  it("renders a MALFORMED-ref row and lets --secret filter on the marker string the help documents", async () => {
+    // resolveServerEnv refuses a spawn over a `${secret:` the strict regex
+    // cannot parse and records it as a `missing` event whose secret NAME is
+    // the bounded marker form (upstream.ts). The audit help now tells the
+    // operator that such a row means a typo in bundles.json and that
+    // --secret matches the full marker string -- so the renderer must show
+    // the row, and the filter must accept that name. Without this an
+    // operator filtering for "gh" sees nothing and concludes the spawn never
+    // reached the vault at all.
+    const { appendAuditEvent } = await import("../secrets-audit.js");
+    const marker = `${MALFORMED_REF_MARKER} gh`;
+    await appendAuditEvent({ server: "gh", secret: marker, event: "missing" }, home);
+    await appendAuditEvent({ server: "gh", secret: "other", event: "injected" }, home);
+
+    const rendered = await runSecrets({ action: "audit", home }, io);
+    expect(rendered.exitCode).toBe(0);
+    expect(io.out.mock.calls.map((c) => c[0] as string).join("")).toContain(marker);
+
+    io.out.mockReset();
+    const filtered = await runSecrets({ action: "audit", secretFilter: marker, home, json: true }, io);
+    expect(filtered.exitCode).toBe(0);
+    const parsed = JSON.parse(io.out.mock.calls.map((c) => c[0] as string).join(""));
+    expect(parsed.count).toBe(1);
+    expect(parsed.events[0]).toMatchObject({ server: "gh", secret: marker, event: "missing" });
   });
 
   it("renders recorded events and filters by server", async () => {
