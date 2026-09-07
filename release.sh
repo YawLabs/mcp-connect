@@ -486,6 +486,10 @@ fi
 # branch ref directly and decide on THAT, and always surface the fetch output:
 # discarding it with >/dev/null 2>&1 hid the one line naming the cause, for
 # genuine auth and connectivity failures as much as for the tag case.
+# Set before the fetch so the sync guard below can prefer it over the local
+# tracking ref, and so `set -u` is satisfied on the success path where the
+# fetch never populates it.
+REMOTE_MAIN_SHA=""
 FETCH_RC=0
 FETCH_OUT=$(git fetch --tags --prune origin 2>&1) || FETCH_RC=$?
 if [ "$FETCH_RC" -ne 0 ]; then
@@ -499,7 +503,11 @@ if [ "$FETCH_RC" -ne 0 ]; then
     warn "git fetch exited ${FETCH_RC}, but origin/main is confirmed current at ${REMOTE_MAIN_SHA:0:9} -- continuing. Fetch output:"
     printf '%s\n' "$FETCH_OUT" >&2
   elif [ "${ALLOW_STALE_REMOTE:-}" = "1" ]; then
-    warn "git fetch failed and ALLOW_STALE_REMOTE=1 -- the origin/main sync guard below is running against a possibly STALE remote-tracking ref. Fetch output:"
+    if [ -n "$REMOTE_MAIN_SHA" ]; then
+      warn "git fetch failed and ALLOW_STALE_REMOTE=1 -- but ls-remote DID answer: origin/main is at ${REMOTE_MAIN_SHA:0:9} while the local tracking ref reads ${LOCAL_TRACKING_SHA:0:9}. The sync guard below will use the ls-remote value, not the stale ref. Fetch output:"
+    else
+      warn "git fetch failed and ALLOW_STALE_REMOTE=1, and ls-remote could not answer either -- the sync guard below is running against a possibly STALE remote-tracking ref. Fetch output:"
+    fi
     printf '%s\n' "$FETCH_OUT" >&2
   else
     printf '%s\n' "$FETCH_OUT" >&2
@@ -507,7 +515,15 @@ if [ "$FETCH_RC" -ne 0 ]; then
   fi
 fi
 LOCAL_HEAD=$(current_head_sha)
-REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
+# Prefer the sha ls-remote actually returned over the local tracking ref. When
+# the fetch failed we may be holding proof of where origin/main really is, and
+# the tracking ref is precisely the stale value this guard exists to distrust.
+# On the success path REMOTE_MAIN_SHA is empty and the tracking ref is fresh.
+if [ -n "$REMOTE_MAIN_SHA" ]; then
+  REMOTE_HEAD="$REMOTE_MAIN_SHA"
+else
+  REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
+fi
 if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
   if [ "$RESUMING" = true ]; then
     info "Local HEAD differs from origin/main (resuming after a prior push) -- proceeding"
@@ -765,7 +781,34 @@ else
 fi
 
 if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-  info "Tag v${VERSION} already exists"
+  # A pre-existing tag is the normal resume shape, but "the tag exists" is not
+  # the same as "the tag describes what step 4 is about to publish". If the
+  # operator committed a fix on main after an interrupted run had already
+  # tagged, HEAD has moved and `npm publish` would pack a working tree the
+  # tagged commit does not contain -- and npm forbids re-publishing, so the
+  # tarball and the tag disagree permanently. The resume dirt guard only covers
+  # UNCOMMITTED changes; this covers committed ones.
+  #
+  # Conditioned on the publish still being PENDING, and deliberately so: when
+  # the version is already on npm, step 4 packs nothing, so tag/HEAD drift is
+  # harmless -- that is exactly the v0.80.0 recovery (tag at the bump commit, a
+  # description fix committed after it, re-run to finish step 5), and failing
+  # there would block a recovery that works. The npm read is fresh rather than
+  # the pre-flight value, per the re-read-at-every-step-boundary rule; an
+  # unreadable registry leaves it empty and therefore fails CLOSED, which is
+  # the right default in front of an irreversible publish.
+  EXISTING_TAG_SHA=$(git rev-list -n1 "v${VERSION}")
+  HEAD_SHA=$(current_head_sha)
+  if [ "$EXISTING_TAG_SHA" != "$HEAD_SHA" ]; then
+    TAG_DRIFT_PUBLISHED=$(npm view "@yawlabs/mcp@${VERSION}" version 2>/dev/null || echo "")
+    if [ "$TAG_DRIFT_PUBLISHED" = "$VERSION" ]; then
+      warn "Tag v${VERSION} points at ${EXISTING_TAG_SHA:0:9}, not HEAD (${HEAD_SHA:0:9}), but ${VERSION} is already on npm so step 4 will pack nothing -- continuing. The tag describes what was published; commits made since it are NOT in that tarball."
+    else
+      fail "Tag v${VERSION} exists at ${EXISTING_TAG_SHA:0:9} but HEAD is ${HEAD_SHA:0:9}, and ${VERSION} is not yet on npm -- refusing to publish a tree the tag does not describe. Either cut a new version, or, if the tag has NOT been pushed, move it onto HEAD: git tag -f -a v${VERSION} -m v${VERSION}. If it is already on origin, cut a new version instead; moving a published tag rewrites release history."
+    fi
+  else
+    info "Tag v${VERSION} already exists at HEAD (${HEAD_SHA:0:9})"
+  fi
 else
   # Annotated (-a) so --follow-tags picks it up; lightweight tags are ignored
   # by --follow-tags and would silently fail to push.
