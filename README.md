@@ -167,6 +167,8 @@ yaw-mcp doctor [--json]        # diagnose config, clients, learning, reliability
 
 ```bash
 yaw-mcp add <slug> [--env KEY=value] [--dry-run]   # add a catalog server to bundles.json
+yaw-mcp add <name> --command "npx -y my-mcp"       # ...or define a local server yourself
+yaw-mcp add <name> --url https://host/mcp          # ...or a remote one
 yaw-mcp remove <slug-or-namespace>                 # drop a server
 yaw-mcp list [--json]                              # list configured servers with their cached compliance grade
 yaw-mcp try <slug> [--client <name>] [--ttl 1h]    # wire a one-off trial straight into your client (expires)
@@ -175,6 +177,16 @@ yaw-mcp trust [--yes|--list|--revoke [<path>]]     # approve the project-local .
 ```
 
 `add` is not `install`: `install <client>` connects an AI client to yaw-mcp; `add <slug>` adds an MCP server to yaw-mcp itself. `try` points the client directly at the upstream server, bypassing yaw-mcp, so you can evaluate it in isolation. A `--env` value lands in your shell history and process argv like any argument. With `add` it is stored in plain text (file mode `0600`) in `bundles.json` -- keep real credentials in the [local secret vault](#local-secret-vault) and pass `--env KEY='${secret:NAME}'` instead (the single quotes are for bash, zsh and PowerShell; in cmd.exe pass it unquoted, since `$` is not special there and cmd.exe would keep the quotes as part of the value). A `missing` row in `yaw-mcp secrets audit` whose name starts with `<malformed ref>` is a reference that did not parse -- fix the typo in `bundles.json`. With `try` the value is written inline, in plain text, into the client's own config for the trial's lifetime, and is not vault-resolved (the client spawns the server, not yaw-mcp).
+
+**Servers the catalog does not list.** The catalog is a curated front door, not the only one. Pass `--command` for a local (stdio) server or `--url` for a remote (HTTP) one, and `add` defines the server from your flags instead of looking up a slug -- no catalog fetch, so this also works offline:
+
+```bash
+yaw-mcp add mytool --command "npx -y @scope/my-mcp@latest" --description "what it is for"
+yaw-mcp add linear --url https://mcp.linear.app/mcp \
+  --header 'Authorization: Bearer ${secret:linear}'
+```
+
+`--header` is repeatable and remote-only: a remote server spawns no process, so `--env` cannot reach it (see [`headers`](#remote-servers-headers)). `--transport sse` selects SSE over the streamable-HTTP default. `--description` is worth setting either way, since dispatch ranks servers on it.
 
 A project-local `.yaw-mcp/bundles.json` (committed with a repo) is ignored until `yaw-mcp trust` approves it, since every server in it is a command yaw-mcp spawns as you. Approval is pinned to the file's exact contents, so an edited file needs approving again; `--list` shows approvals (stale ones flagged) and `--revoke` withdraws one. Your own `~/.yaw-mcp/bundles.json` is never gated.
 

@@ -18,7 +18,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
-import { CATALOG_SLUG_RE, type FetchCatalog, resolveCatalogSlug } from "./catalog.js";
+import { CATALOG_SLUG_RE, type FetchCatalog, resolveCatalogSlug, tokenizeCommand } from "./catalog.js";
 import { type GradesCache, readGradesCache } from "./grades-cache.js";
 // The removal gate must see the same files the WRITE path can modify, so it
 // parses with the loader's JSONC parser (comments + trailing commas) rather
@@ -49,12 +49,31 @@ import type { UpstreamServerConfig } from "./types.js";
 // --- add --------------------------------------------------------------------
 
 export const ADD_USAGE = `Usage: yaw-mcp add <slug> [flags]
+       yaw-mcp add <name> --command "<launch line>" [flags]
+       yaw-mcp add <name> --url <https://...> [flags]
 
-  Resolve <slug> from the yaw.sh/mcp catalog and add it to your local
-  ~/.yaw-mcp/bundles.json so yaw-mcp loads it (no account needed).
+  Add an MCP server to your local ~/.yaw-mcp/bundles.json so yaw-mcp loads it
+  (no account needed). With neither --command nor --url, <slug> is resolved
+  from the yaw.sh/mcp catalog; with either, you are defining the server
+  yourself and no catalog is fetched -- so this also works offline.
 
   This is NOT the same as \`yaw-mcp install\` -- install wires the yaw-mcp
   aggregator into an AI client; add adds an MCP server to yaw-mcp itself.
+
+  Defining a server directly:
+
+  --command <line>  Launch line for a LOCAL (stdio) server, quoted as one
+                    argument: --command "npx -y @scope/my-mcp@latest". Split
+                    with the same tokenizer the catalog's launch lines use.
+  --url <url>       Endpoint for a REMOTE (http) server. http or https only.
+  --header "K: V"   Send an HTTP header on every request to a remote server.
+                    Repeatable. This is how a remote server gets a credential
+                    -- it spawns no process, so --env cannot reach it. Use a
+                    vault reference for a real one:
+                    --header 'Authorization: Bearer \${secret:NAME}'
+  --transport <t>   streamable-http (default) or sse, for --url.
+  --description <s> Free text describing what the server is for. Worth
+                    setting: dispatch ranks servers on it.
 
   --env KEY=value   Provide a required env var's value. Repeatable. Required
                     vars not given here AND not in your shell block the add.
@@ -83,6 +102,16 @@ export interface AddCommandOptions {
   dryRun?: boolean;
   json?: boolean;
   catalogUrl?: string;
+  /** `--command "npx -y foo"`: define a LOCAL server directly, no catalog. */
+  command?: string;
+  /** `--url https://...`: define a REMOTE server directly, no catalog. */
+  url?: string;
+  /** `--header "K: V"`, repeatable. Remote entries only. */
+  headers?: Record<string, string>;
+  /** `--transport sse` for a remote entry; defaults to streamable-http. */
+  transport?: "streamable-http" | "sse";
+  /** `--description`: free text the BM25 ranker indexes for dispatch. */
+  description?: string;
   home?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -105,6 +134,29 @@ function parseEnvFlag(v: string | undefined, bag: Record<string, string>): strin
   return null;
 }
 
+/** RFC 7230 field-name: no spaces, no colon, no control bytes. Enforced so a
+ *  typo cannot produce an entry that fails opaquely at connect time, and so a
+ *  newline can never be smuggled into a header name. */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+
+/** `--header "Authorization: Bearer x"`. Split on the FIRST colon only: a
+ *  value legitimately contains colons (a URL, a `Bearer` blob), and splitting
+ *  greedily would truncate them. */
+function parseHeaderFlag(v: string | undefined, bag: Record<string, string>): string | null {
+  if (v === undefined) return '--header requires "Name: value"';
+  const colon = v.indexOf(":");
+  if (colon <= 0) return `--header: expected "Name: value", got ${JSON.stringify(v)}`;
+  const name = v.slice(0, colon).trim();
+  const value = v.slice(colon + 1).trim();
+  if (!HEADER_NAME_RE.test(name)) return `--header: invalid header name ${JSON.stringify(name)}`;
+  // A blank value is refused rather than dropped: silently omitting the header
+  // the user just asked for would send an unauthenticated request and leave
+  // them reading a 401 with no sign their flag did nothing.
+  if (value === "") return `--header: ${name} has no value`;
+  bag[name] = value;
+  return null;
+}
+
 export function parseAddArgs(
   argv: string[],
 ): { ok: true; options: AddCommandOptions } | { ok: false; error: string; help?: boolean } {
@@ -112,6 +164,7 @@ export function parseAddArgs(
   const positional: string[] = [];
   const opts: AddCommandOptions = {};
   const env: Record<string, string> = {};
+  const headers: Record<string, string> = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = (): string | undefined => argv[++i];
@@ -119,6 +172,40 @@ export function parseAddArgs(
       case "--env": {
         const e = parseEnvFlag(next(), env);
         if (e) return { ok: false, error: e };
+        break;
+      }
+      case "--command": {
+        const v = next();
+        // Reject a following flag for the same reason --catalog does: a
+        // launch line never starts with "-", and swallowing the next flag
+        // would drop it silently.
+        if (!v || v.startsWith("-")) return { ok: false, error: "--command requires a launch line" };
+        opts.command = v;
+        break;
+      }
+      case "--url": {
+        const v = next();
+        if (!v || v.startsWith("-")) return { ok: false, error: "--url requires a URL" };
+        opts.url = v;
+        break;
+      }
+      case "--header": {
+        const e = parseHeaderFlag(next(), headers);
+        if (e) return { ok: false, error: e };
+        break;
+      }
+      case "--transport": {
+        const v = next();
+        if (v !== "streamable-http" && v !== "sse") {
+          return { ok: false, error: "--transport must be streamable-http or sse" };
+        }
+        opts.transport = v;
+        break;
+      }
+      case "--description": {
+        const v = next();
+        if (v === undefined || v.startsWith("-")) return { ok: false, error: "--description requires text" };
+        opts.description = v;
         break;
       }
       case "--dry-run":
@@ -151,11 +238,45 @@ export function parseAddArgs(
         positional.push(a);
     }
   }
+  const custom = opts.command !== undefined || opts.url !== undefined;
   if (positional.length !== 1) {
-    return { ok: false, error: `Expected exactly one server slug, got ${positional.length}.\n${ADD_USAGE}` };
+    // The positional means different things in the two modes -- a catalog
+    // slug, or the name for a server you are defining -- so the message says
+    // which one is missing rather than always saying "slug".
+    const what = custom ? "server name" : "server slug";
+    return { ok: false, error: `Expected exactly one ${what}, got ${positional.length}.\n${ADD_USAGE}` };
+  }
+  if (opts.command !== undefined && opts.url !== undefined) {
+    return { ok: false, error: "--command and --url are mutually exclusive: a server is local or remote, not both." };
+  }
+  // Flags that only mean something on the mode they belong to are refused
+  // rather than ignored. Accepting-and-dropping is how you get a user who
+  // passed --header to a stdio server and cannot work out why their token is
+  // not being sent -- the same failure `install` was fixed for in 0.79.2.
+  if (Object.keys(headers).length > 0) {
+    if (opts.url === undefined) {
+      return {
+        ok: false,
+        error: "--header applies to a remote server: pass --url, or set env vars with --env for a local one.",
+      };
+    }
+    opts.headers = headers;
+  }
+  if (opts.transport !== undefined && opts.url === undefined) {
+    return { ok: false, error: "--transport applies to a remote server: pass --url." };
+  }
+  if (Object.keys(env).length > 0) {
+    if (opts.url !== undefined) {
+      // Not a style preference: upstream.ts ignores `env` on a remote entry
+      // outright, because there is no child process to put it in.
+      return {
+        ok: false,
+        error: "--env does not apply to a remote server: it spawns no process. Use --header to send a credential.",
+      };
+    }
+    opts.envOverrides = env;
   }
   opts.slug = positional[0];
-  if (Object.keys(env).length > 0) opts.envOverrides = env;
   return { ok: true, options: opts };
 }
 
@@ -252,8 +373,12 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     return { exitCode: 2, written: [] };
   }
   const slug = opts.slug;
+  // The same shape gates both modes: it is a catalog slug in one and the name
+  // of a server you are defining in the other, and lowercase-dashes suits both.
+  const custom = opts.command !== undefined || opts.url !== undefined;
   if (!CATALOG_SLUG_RE.test(slug)) {
-    printErr(`yaw-mcp add: invalid slug "${slug}" (lowercase letters, digits, and dashes only).`);
+    const what = custom ? "name" : "slug";
+    printErr(`yaw-mcp add: invalid ${what} "${slug}" (lowercase letters, digits, and dashes only).`);
     return { exitCode: 2, written: [] };
   }
 
@@ -261,20 +386,74 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   const home = opts.home ?? homedir();
   const cwd = opts.cwd ?? process.cwd();
 
-  // Resolve the launch shape from the catalog.
+  // Resolve the launch shape -- from the flags when the user supplied one, and
+  // from the catalog otherwise.
+  //
+  // `--command` / `--url` make NO network call: the point of them is that the
+  // 80-entry catalog is a curated front door rather than the only door, so a
+  // server it does not list must not depend on reaching it. That also makes
+  // this the one add path that works offline.
   let server: Awaited<ReturnType<typeof resolveCatalogSlug>>;
-  try {
-    server = await resolveCatalogSlug(slug, {
-      // A set-but-EMPTY YAW_MCP_CATALOG_URL survives this `??` (it is not
-      // nullish) -- resolveCatalogSlug normalizes empty/whitespace-only back to
-      // the default catalog so it can never reach fetch(""). See
-      // normalizeCatalogUrl in catalog.ts for why that guard lives there.
-      catalogUrl: opts.catalogUrl ?? env.YAW_MCP_CATALOG_URL,
-      fetchCatalog: opts.fetchCatalog,
-    });
-  } catch (e) {
-    printErr(`yaw-mcp add: ${(e as Error).message}`);
-    return { exitCode: 1, written: [] };
+  if (custom) {
+    if (opts.url !== undefined) {
+      // Parse here rather than at connect time. upstream.ts already classifies
+      // a malformed url as a permanent config error, but that is a failure the
+      // user meets on their next session; refusing at add time keeps an entry
+      // that can never connect out of bundles.json in the first place.
+      let parsed: URL;
+      try {
+        parsed = new URL(opts.url);
+      } catch {
+        printErr(`yaw-mcp add: invalid url ${JSON.stringify(opts.url)} -- include the scheme, e.g. https://host/mcp`);
+        return { exitCode: 2, written: [] };
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        printErr(`yaw-mcp add: url must be http or https, got ${JSON.stringify(parsed.protocol)}`);
+        return { exitCode: 2, written: [] };
+      }
+    }
+    let command = "";
+    let args: string[] = [];
+    if (opts.command !== undefined) {
+      // Same tokenizer the catalog's single-string launch lines go through, so
+      // a quoted argument behaves identically however the entry was added.
+      let tokens: string[];
+      try {
+        tokens = tokenizeCommand(opts.command);
+      } catch (e) {
+        printErr(`yaw-mcp add: ${(e as Error).message}`);
+        return { exitCode: 2, written: [] };
+      }
+      [command = "", ...args] = tokens;
+      if (!command) {
+        printErr(`yaw-mcp add: --command had no executable in it.`);
+        return { exitCode: 2, written: [] };
+      }
+    }
+    server = {
+      slug,
+      name: slug,
+      command,
+      args,
+      // Nothing declares a requirement for a hand-defined server, so there is
+      // no required-env gate to fail: whatever --env carries is all there is.
+      requiredEnvKeys: [],
+      description: opts.description,
+    };
+  } else {
+    try {
+      server = await resolveCatalogSlug(slug, {
+        // A set-but-EMPTY YAW_MCP_CATALOG_URL survives this `??` (it is not
+        // nullish) -- resolveCatalogSlug normalizes empty/whitespace-only back to
+        // the default catalog so it can never reach fetch(""). See
+        // normalizeCatalogUrl in catalog.ts for why that guard lives there.
+        catalogUrl: opts.catalogUrl ?? env.YAW_MCP_CATALOG_URL,
+        fetchCatalog: opts.fetchCatalog,
+      });
+    } catch (e) {
+      printErr(`yaw-mcp add: ${(e as Error).message}`);
+      return { exitCode: 1, written: [] };
+    }
   }
 
   // Derive the namespace from the resolved catalog NAME via the same algorithm
@@ -329,16 +508,29 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
   // namespace "googleanalytics" and neither the literal target nor
   // deriveNamespace("ga") could ever find it again. The write path round-trips
   // unknown per-server fields, so the slug survives later add/remove writes.
+  const remote = opts.url !== undefined;
   const entry: Partial<UpstreamServerConfig> & { slug: string } = {
     id: `local-${namespace}`,
     name: server.name,
     namespace,
     slug: server.slug,
-    type: "local",
-    transport: "stdio",
-    command: server.command,
-    args: server.args,
-    env: Object.keys(entryEnv).length > 0 ? entryEnv : undefined,
+    // A remote entry carries url + headers and NO command/args: the two shapes
+    // are exclusive, and leaving a stray `command: ""` on a remote entry would
+    // read to the loader as a stdio server with no executable.
+    ...(remote
+      ? {
+          type: "remote" as const,
+          transport: opts.transport ?? ("streamable-http" as const),
+          url: opts.url,
+          headers: opts.headers,
+        }
+      : {
+          type: "local" as const,
+          transport: "stdio" as const,
+          command: server.command,
+          args: server.args,
+          env: Object.keys(entryEnv).length > 0 ? entryEnv : undefined,
+        }),
     isActive: true,
     description: server.description,
     // The catalog's published grade, recorded at add time so the

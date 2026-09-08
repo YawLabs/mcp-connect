@@ -130,6 +130,87 @@ describe("parseAddArgs", () => {
     const r = parseAddArgs(["github", "--env", "GITHUB_PERSONAL_ACCESS_TOKEN=ghp_x"]);
     expect(r.ok && r.options.envOverrides?.GITHUB_PERSONAL_ACCESS_TOKEN).toBe("ghp_x");
   });
+
+  // Defining a server directly. Before these flags the catalog's 80 entries
+  // were the only thing `add` could reach, and anything else meant hand-editing
+  // bundles.json -- the exact friction the command exists to remove.
+
+  it("takes a launch line with --command", () => {
+    const r = parseAddArgs(["mytool", "--command", "npx -y @scope/my-mcp@latest"]);
+    expect(r.ok && r.options.command).toBe("npx -y @scope/my-mcp@latest");
+  });
+
+  it("takes a url and repeatable headers with --url", () => {
+    const r = parseAddArgs([
+      "remotey",
+      "--url",
+      "https://mcp.example.test/mcp",
+      "--header",
+      "Authorization: Bearer ${secret:tok}",
+      "--header",
+      "X-Trace: 1",
+    ]);
+    expect(r.ok && r.options.url).toBe("https://mcp.example.test/mcp");
+    expect(r.ok && r.options.headers).toEqual({ Authorization: "Bearer ${secret:tok}", "X-Trace": "1" });
+  });
+
+  it("splits a header on the FIRST colon, so a value keeps its own", () => {
+    // `Bearer` blobs and URLs contain colons; a greedy split truncates them.
+    const r = parseAddArgs(["r", "--url", "https://a.test/mcp", "--header", "X-Endpoint: https://b.test:8443/x"]);
+    expect(r.ok && r.options.headers).toEqual({ "X-Endpoint": "https://b.test:8443/x" });
+  });
+
+  it("refuses --command together with --url", () => {
+    const r = parseAddArgs(["x", "--command", "npx foo", "--url", "https://a.test/mcp"]);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.error).toContain("mutually exclusive");
+  });
+
+  it("refuses a flag that belongs to the other mode instead of dropping it", () => {
+    // Accepting-and-ignoring is how a user ends up unable to work out why the
+    // token they passed is not being sent.
+    const header = parseAddArgs(["x", "--command", "npx foo", "--header", "A: b"]);
+    expect(!header.ok && header.error).toContain("--header applies to a remote server");
+
+    const transport = parseAddArgs(["x", "--command", "npx foo", "--transport", "sse"]);
+    expect(!transport.ok && transport.error).toContain("--transport applies to a remote server");
+
+    // `env` is not merely unused on a remote entry -- upstream.ts ignores it
+    // outright, because there is no child process to put it in.
+    const env = parseAddArgs(["x", "--url", "https://a.test/mcp", "--env", "FOO=bar"]);
+    expect(!env.ok && env.error).toContain("--env does not apply to a remote server");
+  });
+
+  it("rejects a malformed --header rather than guessing", () => {
+    for (const bad of ["no-colon", ":novalue", "Bad Name: v", "A:", "A:    "]) {
+      const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--header", bad]);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("rejects a --transport that is not one of the two real ones", () => {
+    const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--transport", "websocket"]);
+    expect(r.ok).toBe(false);
+  });
+
+  it("rejects a value-taking flag that swallowed the next flag", () => {
+    // `--command --dry-run` would otherwise set command="--dry-run" and
+    // silently drop the dry run -- the same trap --catalog already guards.
+    for (const argv of [
+      ["x", "--command", "--dry-run"],
+      ["x", "--url", "--json"],
+      ["x", "--description", "--json"],
+    ]) {
+      expect(parseAddArgs(argv).ok, argv.join(" ")).toBe(false);
+    }
+  });
+
+  it("names what the missing positional IS, per mode", () => {
+    expect(!parseAddArgs(["--command", "npx foo"]).ok && parseAddArgs(["--command", "npx foo"])).toMatchObject({
+      error: expect.stringContaining("server name"),
+    });
+    expect(parseAddArgs(["a", "b"])).toMatchObject({ error: expect.stringContaining("server slug") });
+  });
   it("rejects malformed --env", () => {
     expect(parseAddArgs(["github", "--env", "nope"]).ok).toBe(false);
   });
@@ -303,6 +384,121 @@ describe("runAdd", () => {
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     const entry = loaded.config?.servers.find((s) => s.namespace === "tailscale");
     expect(entry?.env?.TAILSCALE_API_KEY).toBe("tskey-x");
+  });
+
+  it("writes a local entry from --command without fetching the catalog at all", async () => {
+    // The no-fetch part is the point, not an optimisation: the catalog being
+    // a curated front door rather than the only door means a server it does
+    // not list must not depend on reaching it. It also makes this the one
+    // add path that works offline.
+    const io = captureIO();
+    let fetched = false;
+    const r = await runAdd({
+      slug: "mytool",
+      command: "npx -y @scope/my-mcp@latest --flag",
+      description: "does a thing",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => {
+        fetched = true;
+        return [];
+      },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(fetched).toBe(false);
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "mytool");
+    expect(entry?.type).toBe("local");
+    expect(entry?.command).toBe("npx");
+    // Tokenized by the same splitter the catalog's launch lines use, so a
+    // quoted argument behaves identically however the entry was added.
+    expect(entry?.args).toEqual(["-y", "@scope/my-mcp@latest", "--flag"]);
+    expect(entry?.description).toBe("does a thing");
+  });
+
+  it("writes a remote entry from --url, with headers and no command", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:tok}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "remotey");
+    expect(entry?.type).toBe("remote");
+    expect(entry?.url).toBe("https://mcp.example.test/mcp");
+    expect(entry?.transport).toBe("streamable-http");
+    expect(entry?.headers).toEqual({ Authorization: "Bearer ${secret:tok}" });
+    // The two shapes are exclusive: a stray `command: ""` on a remote entry
+    // would read to the loader as a stdio server with no executable.
+    expect(entry?.command).toBeUndefined();
+    expect(entry?.args).toBeUndefined();
+  });
+
+  it("honours --transport sse on a remote entry", async () => {
+    const io = captureIO();
+    await runAdd({
+      slug: "ssey",
+      url: "https://mcp.example.test/sse",
+      transport: "sse",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "ssey")?.transport).toBe("sse");
+  });
+
+  it("refuses a url it could never connect to, at add time rather than at connect time", async () => {
+    // upstream.ts does classify a malformed url as a permanent config error,
+    // but that is a failure the user meets in their next session. Refusing
+    // here keeps the unusable entry out of bundles.json entirely.
+    for (const url of ["not-a-url", "ftp://a.test/mcp", "//a.test/mcp"]) {
+      const io = captureIO();
+      const r = await runAdd({
+        slug: "bad",
+        url,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode, url).toBe(2);
+      expect(r.written, url).toEqual([]);
+    }
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "bad")).toBeUndefined();
+  });
+
+  it("refuses a --command with no executable in it", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "empty",
+      command: '""',
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // The same degenerate quoted-empty launch line the catalog path already
+    // refuses -- it would otherwise be written as a server with no command
+    // and fail opaquely at spawn time.
+    expect(r.exitCode).toBe(2);
   });
 
   it("records the catalog's compliance grade so the floor has something to gate on", async () => {
