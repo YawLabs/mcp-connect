@@ -4789,19 +4789,28 @@ export class ConnectServer {
     // server between two steps of this exec.
     await settleIdleTracking();
 
+    // An EXPLICIT `return` is the caller telling us which output it wants,
+    // and echoing `steps` anyway hands back everything it just said it did
+    // not -- plus a verbatim second copy of the value it did. The tool exists
+    // to spend fewer tokens than the equivalent back-to-back calls; on the
+    // documented example (`a = gh_list_prs(); b = gh_get_pr(a[0].number);
+    // return b`) it was returning the whole PR list and `b` twice.
+    //
+    // `stepKeys` still names every step that ran, so nothing becomes
+    // invisible: the caller can see the pipeline completed end to end, and
+    // ask for a value it skipped by re-running with a different `return`.
+    // Without an explicit return there is nothing to have selected, so the
+    // full bindings stay -- that is the shape a caller relying on the last
+    // step's value alongside its intermediates already gets.
+    const body = explicitReturn
+      ? { ok: true, result: finalResult, stepKeys }
+      : { ok: true, result: finalResult, steps: bindings };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              ok: true,
-              result: finalResult,
-              steps: bindings,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(body, null, 2),
         },
       ],
     };
