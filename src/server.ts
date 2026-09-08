@@ -998,13 +998,20 @@ export class ConnectServer {
   }
 
   // Overlay the A-F grades `yaw-mcp audit` cached in ~/.yaw-mcp/grades.json
-  // onto the loaded server list. That cache is the ONLY supplier of
-  // `complianceGrade` in local mode — validateEntry drops unknown fields, so
-  // a grade never rides along in bundles.json. Without this overlay every
-  // server is permanently ungraded, which silently disables the
-  // YAW_MCP_MIN_COMPLIANCE gate (ungraded always passes) and blanks the
-  // `[A]`-`[F]` badge in discover. Mirrors the same overlay `yaw-mcp list`
-  // applies (local-add-cmd.ts runList) so the CLI and the server agree.
+  // onto the loaded server list, and note the DIRECTION: the cache goes on
+  // top. A bundles.json entry can now carry a grade of its own -- `yaw-mcp
+  // add` records the catalog's published one, and validateEntry passes it
+  // through -- so the two suppliers can disagree, and the locally-measured
+  // letter has to win. The cached one was produced by running the suite
+  // against the bytes on THIS machine; the config one is a claim the catalog
+  // published at add time, about a version that may since have moved.
+  //
+  // This overlay used to be the only supplier, which is what made
+  // YAW_MCP_MIN_COMPLIANCE inert on a fresh install: `audit` has to be run
+  // per server by hand, so until it had been, every server was ungraded, and
+  // ungraded always passes. Also blanks the `[A]`-`[F]` badge in discover.
+  // Mirrors the same overlay `yaw-mcp list` applies (local-add-cmd.ts
+  // runList) so the CLI and the server agree.
   //
   // `home` is a parameter rather than a field so tests can point it at a
   // synthetic ~/.yaw-mcp without running the whole of start().

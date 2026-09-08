@@ -305,6 +305,45 @@ describe("runAdd", () => {
     expect(entry?.env?.TAILSCALE_API_KEY).toBe("tskey-x");
   });
 
+  it("records the catalog's compliance grade so the floor has something to gate on", async () => {
+    // End of the chain this fix reconnected. The catalog publishes an A-F
+    // grade; before, `add` dropped it and validateEntry dropped it again, so
+    // grades.json -- written only by a manual `yaw-mcp audit` -- was the sole
+    // supplier. Until the user ran that per server, everything was ungraded,
+    // ungraded always passes, and YAW_MCP_MIN_COMPLIANCE refused nothing.
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "graded",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => [
+        { slug: "graded", name: "Graded", install: { command: "npx -y graded-mcp" }, complianceGrade: "B" },
+      ],
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "graded")?.complianceGrade).toBe("B");
+  });
+
+  it("writes no grade for an ungraded catalog entry, leaving it to pass as before", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "plain",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => [{ slug: "plain", name: "Plain", install: { command: "npx -y plain-mcp" } }],
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "plain")?.complianceGrade).toBeUndefined();
+  });
+
   it("treats a whitespace-only --env required value as missing (no blank-ish persist)", async () => {
     const io = captureIO();
     const r = await runAdd({

@@ -341,6 +341,19 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
     env: Object.keys(entryEnv).length > 0 ? entryEnv : undefined,
     isActive: true,
     description: server.description,
+    // The catalog's published grade, recorded at add time so the
+    // YAW_MCP_MIN_COMPLIANCE gate has something to read on a fresh install.
+    // Without it the gate was inert for every catalog server: grades.json is
+    // written only by `yaw-mcp audit`, which the user has to run per server
+    // by hand, so until they did, every server was ungraded and ungraded
+    // always passes -- a floor nothing could fall below.
+    //
+    // It is a CLAIM recorded at a moment in time, not a measurement of the
+    // bytes on this machine, and it does not go stale gracefully. A local
+    // `audit` supersedes it: hydrateComplianceGrades (server.ts) and runList
+    // both overlay grades.json ON TOP of the config value, so the letter the
+    // user measured here always wins over the one the catalog published.
+    complianceGrade: server.complianceGrade,
   };
 
   if (opts.dryRun) {
@@ -1013,10 +1026,13 @@ export async function runList(opts: ListCommandOptions): Promise<AddCommandResul
   // Overlay the compliance grades `yaw-mcp audit` cached in ~/.yaw-mcp/
   // grades.json. This is the ONLY reader of that cache in local mode -- without
   // it, `audit` would be write-only and the grade would never reach a human.
-  // bundles.json entries never carry a grade of their own (validateEntry drops
-  // unknown fields), so the cache is the sole source; the `?? s.complianceGrade`
-  // fallback keeps any future in-file grade rather than blanking it. Applied to
-  // BOTH --json and the table so the two surfaces agree. readGradesCache never
+  // A bundles.json entry can also carry a grade now (`yaw-mcp add` records the
+  // catalog's published one), so the map below is a genuine precedence
+  // decision rather than a fill-in: a cache hit REPLACES the config value,
+  // because that letter was measured against the bytes on this machine while
+  // the config one is what the catalog claimed at add time. A miss leaves
+  // `s.complianceGrade` standing rather than blanking it. Applied to BOTH
+  // --json and the table so the two surfaces agree. readGradesCache never
   // throws -- a missing or garbled cache just means no overlay.
   const gradesReader = opts.gradesReader ?? readGradesCache;
   const grades = await gradesReader(home).catch(() => ({}) as GradesCache);
