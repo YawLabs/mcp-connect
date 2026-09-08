@@ -2,6 +2,106 @@
 
 All notable changes to `@yawlabs/mcp` (formerly `@yawlabs/mcph`) are documented here. This project uses [semantic versioning](https://semver.org) and a script-gated release flow: `./release.sh <version>` runs lint + typecheck + tests + build, bumps, tags, publishes to npm, and publishes `server.json` to the MCP registry.
 
+## 0.80.0 -- yaw-mcp's own secrets stop riding into the processes it spawns, and a typo'd secret reference stops reaching the server as a literal
+
+Recorded after the fact: 0.79.2 and 0.80.0 both shipped to npm without release notes, and these two entries were reconstructed from the diffs. 0.80.0 is 119 files and roughly 11,600 insertions -- the full-pass sweep that followed 0.79.2, plus the nineteen findings from the PR #110 review and a round of test work. The security items come first because several of them share one root cause.
+
+**Security -- yaw-mcp's own secrets are stripped from every child it starts, not just from upstream servers**
+
+The README tells you to put `YAW_MCP_VAULT_PASSPHRASE` in the env block your MCP client spawns yaw-mcp with, on the stated promise that yaw-mcp strips its own secrets from the env of every child it starts. Only the upstream-server spawn kept that promise. The strip helpers lived inside `upstream.ts`, and every other spawn passed no `env` option at all, so it inherited `process.env` whole: the background self-upgrade's `npm install -g`, `yaw-mcp upgrade`, `sidecars install` and its daily background refresh, the uv bootstrap and its PATH probe, the `oam --version` probe, and the compliance suite.
+
+The npm ones are the sharpest. npm runs every transitive dependency's pre- and post-install lifecycle script with whatever environment it inherits, so one compromised install script plus `~/.yaw-mcp/secrets.json` was the whole vault -- and the daily sidecar refresh reaches that spawn from inside a running broker, with the passphrase live in the process. The compliance path had the same shape by a different route: the suite is a registry package that runs arbitrary code and spawns the audited server with its own environment, and `audit` was already scrubbing while `compliance` was not.
+
+The three helpers moved out of `upstream.ts` into a dependency-free `internal-secret-env.ts` that every spawn site can import, and each of those spawns now builds its child env with `stripInternalSecretsFromEnv(process.env)`. It covers `YAW_MCP_VAULT_PASSPHRASE`, `YAW_MCP_VAULT_PASSPHRASE_NEW` (the incoming passphrase mid-rotate) and the retired `YAW_MCP_TOKEN`. Matching is case-insensitive, which is load-bearing on Windows: env lookups there are case-insensitive, so a `yaw_mcp_vault_passphrase=` set in PowerShell unlocks the vault fine, and a byte-exact strip would have walked straight past it.
+
+**Security -- three more paths that wrote a credential somewhere it outlived the session**
+
+A secret split across two lines reached the broker's log in the clear. The scrubber ran its patterns over the raw text and collapsed whitespace afterwards, inside the truncation helper; the name/value rule's separator admits only spaces and tabs, so a key and value split by a newline -- a pretty-printed JSON body with the key, colon and value on three lines -- matched nothing, and the collapse then joined the two halves into a cleartext `NAME: value` line. That is worst for the callers that scrub without truncating, because `proxy.ts` writes the result to the broker's stderr, which for a stdio server is the client's on-disk log. The collapse now runs first, so the patterns see the same one-line text the reader will.
+
+`install --dry-run` printed every other server's secrets into a transcript designed to be pasted. The preview logged the whole post-merge config, and for `~/.claude.json` that is every sibling server's `env` block. It now prints only what the run adds, rendered at its container path so the `projects[<dir>]` nesting stays visible; the one part that is not ours, an existing entry's own `env`, keeps its KEYS so you can see the block survives the overwrite, with every value replaced by a placeholder.
+
+And upstream error text is now scrubbed before it reaches yaw-mcp's log. Third-party servers routinely echo arguments and credentials in error text -- URLs carrying `api_key=`, request bodies, tracebacks with locals -- and all three proxied failure paths wrote it verbatim to stderr. The client still receives the full unscrubbed text in the tool result, so nothing is lost for debugging; only the copy written to disk is redacted. A debug line that copied a server's entire `args` array into the log for an unparsed npx flag now logs the flag and the argument count instead.
+
+**Changed (BREAKING) -- a typo'd `${secret:...}` reference refuses the spawn instead of reaching the child as a literal**
+
+Two different rules decided what a secret reference was. The gate that routes an env value into the vault path is the loose substring `${secret:`, while the resolver only ever substituted the strict `${secret:NAME}` shape. A value with a space in the name or a dropped brace passed the gate, demanded a passphrase, unlocked the vault, and then came out of the substitution untouched -- so the child was spawned with the literal `${secret:gh token}` as its token, with nothing recorded as missing. A one-character typo silently broke the fail-closed promise the vault is bought for.
+
+Malformed references are now a third outcome alongside resolved and missing, and a spawn is refused over one exactly as over an absent name. `doctor`'s vault section and the `mcp_connect_secrets` tool grew a column for them. Because a malformed span is a slice of an env VALUE rather than a name -- an unterminated `${secret:DB_PASS@db.host/` runs to the end of the value -- the raw span is never echoed: every surface gets a bounded form behind a `<malformed ref>` marker, capped near the name-shaped prefix, with control and bidi characters stripped so a quoted typo cannot forge a log line.
+
+**Changed (BREAKING) -- `try --base` and `$YAW_MCP_BASE_URL` are gone**
+
+0.77.0 removed the event-reporting seam behind them but kept parsing the flag so existing scripts would not break. The flag is now an unknown-flag error.
+
+**Fixed -- arrow keys at the secret prompt silently corrupted what got stored**
+
+The raw-mode prompt reader dropped a bare ESC byte as a control character but buffered everything after it. An arrow key sends ESC `[` D, so the ESC vanished and `[D` was appended to the value -- at a prompt with echo deliberately turned off, where you could not see it. Pressing Left to fix a typo in a pasted token stored `ghp_abc[D`, the CLI reported success, and the server failed authentication days later with nothing pointing back at the vault. The reader now carries a three-state escape parser across chunk boundaries, since a terminal can split a key's bytes over two reads, and consumes a CSI or SS3 sequence through its final byte. Any other byte after an ESC is still treated as typed input, so a lone Escape then Enter still submits.
+
+**Fixed -- concurrent writers stopped losing each other's work**
+
+Two `yaw-mcp add` runs could each read `bundles.json`, add their entry, and write back, with the second silently discarding the first; it now takes a cross-process lock. Two `yaw-mcp audit` runs finishing together dropped one of the grades the same way. And `install` refuses to publish over a config another process wrote while it was running, rather than overwriting it.
+
+**Fixed -- install and doctor stopped misreporting the state of a client**
+
+`install` revoked a live server's Claude Code permission grant on upgrade. Its collision prompt now survives a closed stdin and a Ctrl+C rather than hanging or answering itself, and an unreadable client config says so instead of being reported as malformed JSON. `doctor` exits 2 when a client cannot start yaw-mcp, instead of printing the problem and then saying "All good"; it stopped telling a WSL user that a Windows launch path resolves against PATH; and its SECRET VAULT section reports the vault's schema version and any reference a typo made unusable. `yaw-mcp remove` no longer hangs on EOF at its confirmation prompt, and Ctrl+C there exits 130.
+
+**Changed -- `compliance` runs the suite that ships with it**
+
+`yaw-mcp compliance` fetched the suite through npx at run time; it now runs the copy that ships as a dependency. The daily sidecar refresh waits out the startup burst, shares its lock with the CLI, and stops flashing a console window on Windows. `try` refuses to write an inline credential into a commit-to-share project config unless you pass `--yes`. The empty-state messages stop pointing at a hosted UI that no longer exists, and the README stopped crediting response pruning with a security property it does not have.
+
+## 0.79.2 -- the error scrubber stops leaking prefixed credentials, and a failed `exec` step stops costing you the step before it
+
+Recorded after the fact, with 0.80.0 above. 0.79.2 is 150 files and roughly 16,200 insertions: the 526 confirmed findings from the v0.79.0 full-pass review, plus three rounds of adversarial review on top of them.
+
+**Security -- the error scrubber leaked whole credentials whenever the key name carried a prefix**
+
+The secret-name rule anchored its alternation with `\b`, but `_` is a word character, so a bare `\b` in front of `api_key` never matches inside `NOTION_API_KEY` -- and env-var spellings are the dominant shape in MCP spawn and config errors. The raw value went straight into the excerpt whenever the key carried a prefix. Single-quoted values missed for a different reason: the separator knew only the double quote, so `token='abcdef'` matched nothing at all. And any `Authorization:` scheme other than bearer or basic fell through to the name rule, which then captured the scheme WORD as the value and left the token in the clear.
+
+The rewrite bounds the name prefix, accepts both quote styles and widens the scheme list, but the load-bearing decision is that it stops guessing. Three earlier attempts to tell a diagnostic from a credential each either inverted a real message (`SLACK_BOT_TOKEN: must be provided` becoming `<redacted> be provided`) or exempted a real secret, because `abcdef` and `missing` are the same shape in the same position. Every redaction is whole now, with one safe-list of absence words so the common diagnostics still read; the accepted cost, stated in the source, is that a diagnostic whose first value token is not on that list is hidden rather than shown. This reaches further than `discover`: `proxy.ts` routes every failed tool call, resource read and prompt get through the same function into the broker's stderr, and `audit` scrubs its preamble with it.
+
+**Security -- `audit`'s preamble printed the value of any secret flag nobody had enumerated**
+
+The redaction that blanks credentials out of the `Auditing "<ns>"` line matched an exact eight-name denylist, which is a leak-prevention control that fails open on the first spelling nobody thought of: `--access-token`, `--client-secret`, `--api_key`, `--bearer`, `--passwd` and `--credential` all printed their values in the clear. A name pattern now backs the exact set, matching any flag whose name contains token, secret, passw, apikey, api-key, auth, cred or bearer. It deliberately over-matches -- `--author` redacts too -- because redaction here is display-only and the runner still receives the unredacted argv, so a false positive costs one line of visibility while a false negative prints a live credential.
+
+**Fixed -- a typo in step 2 of an `exec` pipeline no longer costs you the side effect of step 1**
+
+`exec` resolved `{"$ref": ...}` markers at the moment each step ran, so an unknown, forward or malformed ref in step 2 of `create issue -> comment on it` was only discovered after the issue had been filed -- and the usual reaction, fix the ref and re-run, filed a second one. Every producer key is known statically from the steps array, so the whole pipeline is now ref-checked before step 0 fires, as is the meta-tool refusal that used to sit inside the dispatch loop. Two more shapes are refused up front: a step `id` containing `.`, `[` or `]`, which are the `$ref` path separators and so could never be named by a ref; and any unknown key on a step, since `{tool, arguments: {...}}` used to validate clean and dispatch the tool with `{}` -- a real call with every argument silently dropped.
+
+The refusal SHAPE now says whether anything ran. Plain `exec: ...` text means the pipeline never started, while the `{ok, failedStep, error, partial}` envelope means execution began and `partial` holds what completed. That distinction is what tells a reader whether a retry is free or can double a side effect. Separately, a pipeline no longer loses a server between two steps: exec's own idle tick was already deferred, but a concurrent tool call completing mid-pipeline could tick the reaper and disconnect a server the next step was about to use, so every namespace the pipeline can reach is pinned for its lifetime.
+
+**Fixed -- one mistyped credential no longer costs the server for the rest of the session**
+
+When a child reported a missing credential, yaw-mcp elicited it, retried, and stored the answer -- right or wrong. The stored-but-wrong value then made every later activation of that namespace skip the prompt entirely, so a single transposed character disabled that server until the client restarted. Re-asking is now bounded at two prompts per namespace rather than latching after one, counted per namespace because a wrong `GITHUB_TOKEN` says nothing about the next server's, and counted before the round trip so a client that fails the request in a loop cannot re-prompt forever.
+
+The vault passphrase got the same budget plus concurrency handling: prewarm activates three namespaces at once, and each locked-vault namespace used to open its own modal for the one question a vault has, spending the whole shared budget in a single round. Followers now await the prompt already in flight. A passphrase that was typed and rejected is reported as exactly that, rather than re-reporting the original "vault is locked" error and booking a health penalty against a server that never got to run.
+
+**Fixed -- response pruning could hand the model a different number than the server sent**
+
+Pruning re-serializes a JSON response, so it first checks that every number literal survives the round trip. The fractional branch of that check was a digit-count bound of 17 significant digits, which accepts `0.12345678901234567` -- a value a double does not hold, and one that comes back as `...66` after the round trip. The check now compares the two spellings in canonical form, which accepts a pure reformat (`19.90` to `19.9`) and rejects an actual change; a digit bound cannot do both, since tightening it to 15 would reject ordinary computed doubles like `0.30000000000000004` and cost the whole document its pruning.
+
+**Fixed -- the daily sidecar refresh rewrote the tree every project shares**
+
+The refresh planned against one project's config and then wrote to the shared sidecar tree, so a project-local `bundles.json` could move versions for every other project on the machine. `sidecars install` also stopped installing version ranges into a tree nothing would ever read, and a relocated npm cache set as `NPM_CONFIG_CACHE` no longer leaves every pinned sidecar resolving through npx. The oam floor moved to 0.13.1, and a stale `OAM_BIN` stops reading as "oam is not installed".
+
+**Fixed -- Windows paths, and the flags install used to accept and drop**
+
+On Windows, `install` wrote one Claude Desktop config path while `--list`, `doctor` and `try` reported another. `try` told Windows users a required env var was missing when it was sitting in the shell. A trial could be reported cleaned up while its entry, inline secret and all, was still wired. `install` now refuses the flags it used to accept and ignore, and stops printing claims about writes that never happened. `doctor`'s SHADOWED CLI USAGE missed every Windows-shell spelling of a command, and it called a perfectly parseable client config malformed when its args carried a number.
+
+**Fixed -- the learning signal stopped punishing servers that had answered correctly**
+
+A large successful result that merely mentioned "not found" was graded as a failure, and enough of them marked a healthy server flaky. A backwards clock step pinned a server at the health penalty and kept telling the model its activation had failed a minute ago. `discover` said a server was "often loaded with" a server you had already uninstalled, and `reset-learning` reported "0 entries removed" for a file that held five. A typo in dispatch's `routeEffort` argument silently downgraded a deployment that had asked for aggressive routing.
+
+**Added -- `MCP_CALL_TIMEOUT`, and an install-time Node version guard**
+
+The last unbounded leg of a request is tunable, and all three timeout knobs stopped mis-parsing values like `3e9` and `30s` into 3 and 30 milliseconds. Installing on Node 18 now fails at install time, naming the version, instead of installing a build that cannot run. `.yaw-mcp/config.json` validates in your editor against a published schema, and the documented deny-list example stopped being a namespace that can never match.
+
+**Fixed -- trust, config and catalog surfaces that reported the wrong thing**
+
+`yaw-mcp trust --revoke` stopped reporting success for consent it never withdrew, and the approval prompt renders the argv it is asking you to approve. A `.yaw-mcp/` skipped for ownership, or a stray file named `.yaw-mcp`, no longer reads as "there is no project config here". Config typos in `servers`, `blocked` and `installNudge` stop failing open in silence and now move `doctor`'s exit code. A malformed `YAW_MCP_CATALOG_URL` gets the friendly catalog error, and a quoted-empty install line is refused rather than written into `bundles.json` as a server with no command.
+
+**Fixed -- upgrade stopped misclassifying where it was installed**
+
+A project directory under `~/.local` (or `n/`, `fnm/`, `.asdf/`) is no longer mistaken for a global npm install, and a global install invoked through its npm bin symlink is classified correctly instead of falling through to "unknown". The background self-upgrade stops probing the registry on every startup and stops re-running an install that keeps failing. A self-upgrade lock is released only by the process that took it, and pnpm, bun and npm no longer contend on one lockfile. `upgrade` now tells you which directory a local install's command has to run in.
+
 ## 0.79.1 -- `classifyError` stops scanning bodies that cannot match, and two timing assertions stop flaking the release
 
 **Fixed -- a release died on a perf tripwire that nothing had regressed**
