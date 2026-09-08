@@ -49,7 +49,7 @@ import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
 import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
-import { createProgressReporter, type ProgressReporter } from "./progress.js";
+import { createProgressReporter, isProgressRequested, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
   brandRoutingFault,
@@ -1496,7 +1496,11 @@ export class ConnectServer {
   private async handleToolCall(
     name: string,
     args: Record<string, unknown>,
-    extra?: { sendNotification?: any; _meta?: Record<string, unknown> },
+    // `signal` rides along with the two progress fields because the SDK's
+    // RequestHandlerExtra has always carried it -- it was simply never read,
+    // so a downstream cancel aborted this handler and left the upstream call
+    // running. The proxy path below forwards it.
+    extra?: { sendNotification?: any; _meta?: Record<string, unknown>; signal?: AbortSignal },
     // When deferLearning is set (exec steps), the proxy path does NOT record
     // the cross-session learning signal — handleExec records step-level,
     // cascading-blame credit instead so a failing consumer doesn't wrongly
@@ -1576,7 +1580,7 @@ export class ConnectServer {
       return this.attachGuideNudge(this.handleSuggest());
     }
     if (name === META_TOOLS.exec.name) {
-      const result = await this.handleExec(args);
+      const result = await this.handleExec(args, extra?.signal);
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.bundles.name) {
@@ -1795,7 +1799,20 @@ export class ConnectServer {
     // between the initial lookup and this call can't misdirect us.
     let result: { content: Array<{ type: string; text?: string }>; isError?: boolean };
     try {
-      result = await routeToolCall(name, args, routes, this.connections);
+      result = await routeToolCall(name, args, routes, this.connections, {
+        // Cancellation crosses the hop: the SDK sends notifications/cancelled
+        // upstream and rejects the pending call, instead of leaving it to run
+        // to CALL_TIMEOUT after the client that wanted it has gone.
+        signal: extra?.signal,
+        // Relay upstream progress under the DOWNSTREAM token, and only when
+        // the client asked -- see isProgressRequested. `progress` is the same
+        // reporter the meta-tool branches use, so its monotonic clamp keeps
+        // the sequence legal even if activation already emitted under this
+        // token earlier in the call.
+        onprogress: isProgressRequested(extra)
+          ? (p) => progress(p.message ?? `${route?.namespace ?? "upstream"} working`, p.progress, p.total)
+          : undefined,
+      });
     } finally {
       if (callNamespace !== undefined) {
         const remaining = (this.inflightCalls.get(callNamespace) ?? 1) - 1;
@@ -4447,6 +4464,10 @@ export class ConnectServer {
   // top level of the model's reasoning.
   private async handleExec(
     args: Record<string, unknown>,
+    // The downstream request's abort signal, forwarded to each step so a
+    // cancelled pipeline actually stops. Deliberately NOT the whole `extra`:
+    // see the step dispatch below for why exec withholds the progress half.
+    signal?: AbortSignal,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const validation = validateExecRequest(args);
     if (!validation.ok) {
@@ -4635,8 +4656,13 @@ export class ConnectServer {
       // and pack-detector logic so exec steps behave identically to
       // direct calls — the caller pays no per-step cost in surprises.
       //
-      // `extra` is omitted so exec steps don't fight for the top-level
-      // progress token; the exec itself emits no progress.
+      // The progress half of `extra` is still withheld so exec steps don't
+      // fight for the top-level progress token; the exec itself emits no
+      // progress. The SIGNAL is forwarded, though: that reasoning was only
+      // ever about the token, and without it a cancelled pipeline kept
+      // dispatching its remaining steps. Passing an object carrying nothing
+      // but `signal` keeps the old behaviour exactly -- createProgressReporter
+      // returns its no-op when there is no token and no sendNotification.
       // Step-level (process) reward: defer the proxy path's learning signal
       // and attribute credit per step here, using the $ref dependency graph
       // so a step that fails on bad INPUT it consumed from an upstream step
@@ -4659,10 +4685,15 @@ export class ConnectServer {
       }
       let stepResult: { content: Array<{ type: string; text?: string }>; isError?: boolean };
       try {
-        stepResult = await this.handleToolCall(step.tool, resolvedArgs, undefined, {
-          deferLearning: true,
-          deferIdleTracking: true,
-        });
+        stepResult = await this.handleToolCall(
+          step.tool,
+          resolvedArgs,
+          { signal },
+          {
+            deferLearning: true,
+            deferIdleTracking: true,
+          },
+        );
       } catch (err) {
         // Every ordinary exit from this method settles idle tracking (and
         // with it releases the pins). An unexpected throw must not be the

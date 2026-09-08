@@ -1032,6 +1032,69 @@ describe("routeToolCall — request options", () => {
     }
   });
 
+  // The two fields below used to stop at routeToolCall's parameter list. The
+  // CallToolRequest handler holds the client's abort signal and its progress
+  // token, but the call was `routeToolCall(name, args, routes, connections)`
+  // -- four arguments -- so the upstream request went out with a timeout and
+  // nothing else. Measured against that build: a downstream cancel produced
+  // zero notifications/cancelled at the upstream, and a progress-reporting
+  // upstream produced zero notifications downstream. Both are now forwarded.
+  //
+  // The `toEqual({ timeout })` assertions above cannot guard this: toEqual
+  // treats an explicitly-undefined property as absent, so they pass whether
+  // or not the keys are wired. These name the keys.
+
+  it("forwards the downstream abort signal, so a cancel reaches the upstream", async () => {
+    const calls: unknown[][] = [];
+    const connections = new Map([["gh", recordingConnection(calls)]]);
+    const controller = new AbortController();
+    await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections, {
+      signal: controller.signal,
+    });
+    const opts = calls[0][2] as { signal?: AbortSignal };
+    // Identity, not truthiness: the SDK registers an abort listener on this
+    // exact object to send notifications/cancelled, so a copy would be inert.
+    expect(opts.signal).toBe(controller.signal);
+  });
+
+  it("forwards the progress relay so the upstream is asked to report at all", async () => {
+    const calls: unknown[][] = [];
+    const connections = new Map([["gh", recordingConnection(calls)]]);
+    const onprogress = (): void => {};
+    await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections, { onprogress });
+    const opts = calls[0][2] as { onprogress?: unknown };
+    // Passing onprogress is what makes the SDK stamp a progressToken onto the
+    // upstream request. Without it the upstream is never asked, so this is
+    // the difference between "client sees nothing" and "client sees progress".
+    expect(opts.onprogress).toBe(onprogress);
+  });
+
+  it("leaves both keys undefined when the caller supplies neither", async () => {
+    const calls: unknown[][] = [];
+    const connections = new Map([["gh", recordingConnection(calls)]]);
+    await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections);
+    const opts = calls[0][2] as { timeout: number; signal?: unknown; onprogress?: unknown };
+    expect(opts.timeout).toBe(60_000);
+    // Specifically NOT a stub callback. An unconditional onprogress would add
+    // a progress token to every proxied call -- changing the wire shape of
+    // each one to collect notifications no client asked for.
+    expect(opts.onprogress).toBeUndefined();
+    expect(opts.signal).toBeUndefined();
+  });
+
+  it("does not set resetTimeoutOnProgress, so progress cannot extend the ceiling", async () => {
+    const calls: unknown[][] = [];
+    const connections = new Map([["gh", recordingConnection(calls)]]);
+    await routeToolCall("gh_create_issue", {}, buildToolRoutes(connections), connections, {
+      onprogress: () => {},
+    });
+    const opts = calls[0][2] as { resetTimeoutOnProgress?: unknown };
+    // Deliberate: it would let a chatty upstream push a call past
+    // MCP_CALL_TIMEOUT indefinitely. That is a change to how long a call may
+    // run and wants its own bound, separate from relaying progress.
+    expect(opts.resetTimeoutOnProgress).toBeUndefined();
+  });
+
   it("warns at module load when MCP_CALL_TIMEOUT is rejected", async () => {
     // The diagnostic has to survive where the value is actually resolved: the
     // constant is latched in a module-level initialiser, so the only place the

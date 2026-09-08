@@ -17,6 +17,27 @@ interface ProgressSender {
   }) => Promise<void>;
 }
 
+/** The `extra` a request handler receives, narrowed to the parts progress
+ *  reporting reads. */
+export type ProgressExtra =
+  | { sendNotification?: ProgressSender["sendNotification"]; _meta?: Record<string, unknown> }
+  | undefined;
+
+/** Whether this request can actually receive progress: the client supplied a
+ *  token AND there is a channel to send on.
+ *
+ *  Exported because the answer decides something OUTSIDE this file. Relaying
+ *  an upstream tool's progress means handing the SDK an `onprogress`, which
+ *  makes it stamp a progress token onto the upstream request -- so a caller
+ *  that relays unconditionally changes the wire shape of every proxied call
+ *  to collect notifications the reporter would then drop on the floor. Callers
+ *  ask this first. Kept as the single source of the condition so it cannot
+ *  drift from the reporter's own early return below, which now uses it. */
+export function isProgressRequested(extra: ProgressExtra): boolean {
+  const token = extra?._meta?.progressToken;
+  return token !== undefined && token !== null && typeof extra?.sendNotification === "function";
+}
+
 // Returns a progress reporter for the current tool call. If the client
 // supplied a progressToken in _meta, notifications flow back to the client
 // as it progresses. If not, this is a no-op so callers never need to branch.
@@ -25,14 +46,13 @@ interface ProgressSender {
 // (message-only), or additionally say *how far along* with an absolute
 // progress/total pair. Message-only calls omit `total` so the client
 // renders an indeterminate progress bar rather than a misleading percentage.
-export function createProgressReporter(
-  extra: { sendNotification?: ProgressSender["sendNotification"]; _meta?: Record<string, unknown> } | undefined,
-): ProgressReporter {
-  const token = extra?._meta?.progressToken as string | number | undefined;
-  const send = extra?.sendNotification;
-  if (token === undefined || token === null || !send) {
+export function createProgressReporter(extra: ProgressExtra): ProgressReporter {
+  if (!isProgressRequested(extra)) {
     return () => {};
   }
+  // Non-null by isProgressRequested: it checked both of these.
+  const token = extra?._meta?.progressToken as string | number;
+  const send = extra?.sendNotification as ProgressSender["sendNotification"];
 
   // MCP requires progress to strictly increase per token. Two kinds of
   // calls share this one token: explicit milestones (caller supplies an
