@@ -241,6 +241,23 @@ Rather than putting credentials in a client config, keep a value in an encrypted
 
 At spawn time, if `YAW_MCP_VAULT_PASSPHRASE` is set in yaw-mcp's own env, it decrypts the referenced names and substitutes them into the child's env. If the passphrase is absent or a name isn't stored, the spawn is **refused** -- the literal `${secret:NAME}` is never passed through, since some servers would treat the placeholder as a real token. The value never leaves your machine.
 
+### Remote servers: `headers`
+
+A remote (HTTP/SSE) server spawns no process, so it has no env to put a credential in -- yaw-mcp warns and ignores `env` on a remote entry. Its credential channel is `headers`, which takes the same `${secret:NAME}` references:
+
+```jsonc
+{
+  "namespace": "linear",
+  "type": "remote",
+  "url": "https://mcp.linear.app/mcp",
+  "headers": {
+    "Authorization": "Bearer ${secret:linear}"
+  }
+}
+```
+
+Headers are resolved through the same fail-closed path: a missing or malformed reference refuses the **connect**, so no request is made at all rather than one carrying the literal to a third party. They apply to both transports, including the SSE stream.
+
 **Where the passphrase comes from.** Three ways, in the order you'll meet them:
 
 1. **`YAW_MCP_VAULT_PASSPHRASE` in yaw-mcp's own env** -- the `env` block of the *yaw-mcp* entry in your MCP client config, not the upstream server's (yaw-mcp strips its own secrets from the env of every child it starts: every server it spawns, the npm runs behind its self-upgrade and the daily sidecar refresh, and the compliance suite). This is the only option for a spawn, which happens over stdio with no terminal to prompt on.

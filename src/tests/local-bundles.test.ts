@@ -204,6 +204,60 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].runtime).toBeUndefined();
   });
 
+  it("propagates a remote server's headers from bundles.json", async () => {
+    // Same whitelist trap again, and here it would have made the field
+    // unreachable: `headers` is the only credential channel a remote upstream
+    // has, since it spawns no process and its `env` is ignored by design.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "remotey",
+          name: "Remote",
+          type: "remote",
+          url: "https://mcp.example.test/mcp",
+          headers: { Authorization: "Bearer ${secret:tok}", "X-Trace": "1" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].headers).toEqual({ Authorization: "Bearer ${secret:tok}", "X-Trace": "1" });
+  });
+
+  it("drops blank header values and blank header names", async () => {
+    // Blank is dropped for a DIFFERENT reason than `env`'s empty-string seed:
+    // nothing is inherited on a remote entry, so a blank header is a
+    // half-finished edit. Sending `Authorization:` with an empty value reads
+    // to a server as a malformed credential rather than as none at all.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "remotey",
+          name: "Remote",
+          type: "remote",
+          url: "https://mcp.example.test/mcp",
+          headers: { Authorization: "", "X-Blank": "   ", "  ": "v", "X-Good": " kept ", "X-Num": 42 },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    // The surviving value keeps its own whitespace (a header value can
+    // legitimately contain spaces); only the NAME is trimmed.
+    expect(r.config?.servers[0].headers).toEqual({ "X-Good": " kept " });
+  });
+
+  it("treats a non-object headers value as absent", async () => {
+    for (const bad of ["Authorization: x", 42, null, ["a"]]) {
+      writeBundles(synthHome, {
+        version: 1,
+        servers: [{ namespace: "remotey", name: "Remote", type: "remote", url: "https://x.test/mcp", headers: bad }],
+      });
+      const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+      expect(r.config?.servers[0].headers, JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+
   it("propagates a per-server complianceGrade from bundles.json", async () => {
     // Same whitelist trap as runtime and connectTimeoutMs, and this one
     // disabled a security-shaped feature rather than a tuning knob. grades.json

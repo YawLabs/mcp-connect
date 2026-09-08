@@ -147,6 +147,27 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
         ) as Record<string, string>)
       : undefined;
   const url = typeof e.url === "string" ? e.url : undefined;
+  // HTTP headers for a REMOTE server, the channel a remote upstream takes its
+  // credential through (types.ts). Same fixed-whitelist rule as every field
+  // above: absent here means dropped at load, and a `headers` block would have
+  // been silently discarded.
+  //
+  // Blank values are dropped for a DIFFERENT reason than `env`'s. There the
+  // empty string is a deliberate "required, but not stored here" seed that
+  // would clobber an inherited shell value; here nothing is inherited, and a
+  // blank header is either a half-finished edit or a `${secret:...}` the user
+  // meant to fill in. Sending `Authorization:` with an empty value reads to a
+  // server as a malformed credential rather than as no credential, so the
+  // clearer failure is to omit it. Keys are trimmed and must be non-blank:
+  // a whitespace-only header name cannot be put on the wire at all.
+  const headers =
+    e.headers && typeof e.headers === "object" && !Array.isArray(e.headers)
+      ? (Object.fromEntries(
+          Object.entries(e.headers as Record<string, unknown>)
+            .filter(([k, v]) => k.trim() !== "" && typeof v === "string" && v.trim() !== "")
+            .map(([k, v]) => [k.trim(), v as string]),
+        ) as Record<string, string>)
+      : undefined;
   const description = typeof e.description === "string" ? e.description : undefined;
   // Per-server runtime override. "oam" hosts the server on the oam runtime
   // (connectToUpstream's resolveOamSpawn rewrites node/npx -> `oam run`).
@@ -230,6 +251,7 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     args,
     env,
     url,
+    headers,
     isActive,
     connectTimeoutMs,
     description,
