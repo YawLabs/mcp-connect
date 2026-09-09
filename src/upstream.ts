@@ -977,6 +977,33 @@ async function connectToUpstreamOnce(
     // _commonHeaders(), so this covers the POSTs and the SSE GET stream alike
     // -- including SSE, which applies them inside the custom fetch it hands
     // EventSource. Passing `undefined` is inert in both.
+    // Reject a value the wire cannot carry BEFORE the transport is built.
+    // Node's Headers throws a raw TypeError on a CR, LF or NUL, and it throws
+    // from inside the SDK constructor below -- outside the try that classifies
+    // a malformed url. Measured before this guard: a stray newline in a header
+    // was reported to the user as `Remote server at <url> refused the
+    // connection`, which is a lie (nothing was ever sent) that sends them to
+    // check the remote server's auth and uptime instead of their own config.
+    // Same reasoning, and the same fix, as the invalid-url guard a few lines
+    // up; measured against that sibling, both now answer in well under a
+    // second and both still spend runActivateOne's one retry, so this guard
+    // is consistent with it rather than better.
+    //
+    // The NAME is reported and the VALUE never is: this runs AFTER vault
+    // resolution, so the offending value can be a decrypted secret, and the
+    // whole point of the vault is that it does not turn up in an error string.
+    if (resolvedHeaders) {
+      const badHeader = Object.entries(resolvedHeaders).find(([, v]) => /[\r\n\0]/.test(v));
+      if (badHeader) {
+        throw new ActivationError(
+          withConfigPointer(
+            `Server "${config.namespace}" header "${badHeader[0]}" has a value containing a newline or NUL, which cannot be sent as an HTTP header`,
+            config,
+          ),
+          "unknown",
+        );
+      }
+    }
     const requestInit = resolvedHeaders ? { headers: resolvedHeaders } : undefined;
     if (config.transport === "sse") {
       transport = new SSEClientTransport(url, { requestInit });

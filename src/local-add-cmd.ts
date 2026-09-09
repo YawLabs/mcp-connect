@@ -153,6 +153,14 @@ function parseHeaderFlag(v: string | undefined, bag: Record<string, string>): st
   // the user just asked for would send an unauthenticated request and leave
   // them reading a 401 with no sign their flag did nothing.
   if (value === "") return `--header: ${name} has no value`;
+  // A CR, LF or NUL cannot be sent as a header value -- Node's Headers throws
+  // on one. upstream.ts refuses it at connect time too (bundles.json is
+  // hand-editable, so that is the load-bearing guard); catching it here means
+  // the typo is refused while the user is still looking at the command that
+  // made it, rather than at their next session.
+  if (/[\r\n\0]/.test(value)) {
+    return `--header: ${name} value contains a newline or NUL`;
+  }
   bag[name] = value;
   return null;
 }

@@ -2904,6 +2904,48 @@ describe("connectToUpstream remote-entry diagnostics", () => {
     }
   });
 
+  it("refuses a header value carrying CR/LF/NUL, naming the header but never the value", async () => {
+    // Node's Headers throws a raw TypeError on these, from inside the SDK
+    // constructor -- outside the try that classifies a malformed url. Before
+    // this guard the user was told `Remote server at <url> refused the
+    // connection`, which is a lie: nothing was ever sent, and it points them
+    // at the remote server instead of their own config.
+    vi.mocked(hasSecretRefs).mockReturnValue(false);
+
+    for (const bad of ["v\r\nX-Injected: 1", "v\nx", "v\0x"]) {
+      _sdkBehavior.remoteConstructions = [];
+      await expect(
+        connectToUpstream(makeRemoteConfig({ headers: { "X-Bad": bad, Authorization: "Bearer fine" } })),
+      ).rejects.toThrow(/header "X-Bad" has a value containing a newline or NUL/);
+      // Refused BEFORE the transport exists, so nothing reaches the wire.
+      expect(_sdkBehavior.remoteConstructions).toHaveLength(0);
+    }
+  });
+
+  it("keeps the offending header VALUE out of the error, because it may be a decrypted secret", async () => {
+    // The check runs after vault resolution, so the bad value can be a secret
+    // the vault just decrypted. Reporting it would undo the point of the vault.
+    vi.mocked(hasSecretRefs).mockReturnValue(true);
+    vi.mocked(loadVault).mockResolvedValue({} as never);
+    vi.mocked(unlock).mockResolvedValue(Buffer.alloc(32));
+    vi.mocked(resolveSecretRefs).mockReturnValue({
+      resolved: { Authorization: "Bearer sup3r-s3cret\nX-Injected: 1" },
+      missing: [],
+      malformed: [],
+    } as never);
+    process.env.YAW_MCP_VAULT_PASSPHRASE = "pw";
+    try {
+      await connectToUpstream(makeRemoteConfig({ headers: { Authorization: "Bearer ${secret:tok}" } })).catch(
+        (e: Error) => {
+          expect(e.message).toContain('header "Authorization"');
+          expect(e.message).not.toContain("sup3r-s3cret");
+        },
+      );
+    } finally {
+      process.env.YAW_MCP_VAULT_PASSPHRASE = undefined;
+    }
+  });
+
   it("passes no requestInit for a remote entry with no headers", async () => {
     await connectToUpstream(makeRemoteConfig()).catch(() => {});
     await connectToUpstream(makeRemoteConfig({ headers: {} })).catch(() => {});

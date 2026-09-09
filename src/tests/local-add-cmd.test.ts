@@ -188,6 +188,17 @@ describe("parseAddArgs", () => {
     }
   });
 
+  it("rejects a header value carrying a newline or NUL", () => {
+    // Refused while the user is still looking at the command that made the
+    // typo. upstream.ts refuses it at connect time too, which is the
+    // load-bearing guard since bundles.json is hand-editable.
+    for (const bad of ["a\rb", "a\nb", "a\0b"]) {
+      const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--header", `X-H: ${bad}`]);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+      expect(!r.ok && r.error).toContain("newline or NUL");
+    }
+  });
+
   it("rejects a --transport that is not one of the two real ones", () => {
     const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--transport", "websocket"]);
     expect(r.ok).toBe(false);
