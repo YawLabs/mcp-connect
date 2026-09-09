@@ -130,6 +130,98 @@ describe("parseAddArgs", () => {
     const r = parseAddArgs(["github", "--env", "GITHUB_PERSONAL_ACCESS_TOKEN=ghp_x"]);
     expect(r.ok && r.options.envOverrides?.GITHUB_PERSONAL_ACCESS_TOKEN).toBe("ghp_x");
   });
+
+  // Defining a server directly. Before these flags the catalog's 80 entries
+  // were the only thing `add` could reach, and anything else meant hand-editing
+  // bundles.json -- the exact friction the command exists to remove.
+
+  it("takes a launch line with --command", () => {
+    const r = parseAddArgs(["mytool", "--command", "npx -y @scope/my-mcp@latest"]);
+    expect(r.ok && r.options.command).toBe("npx -y @scope/my-mcp@latest");
+  });
+
+  it("takes a url and repeatable headers with --url", () => {
+    const r = parseAddArgs([
+      "remotey",
+      "--url",
+      "https://mcp.example.test/mcp",
+      "--header",
+      "Authorization: Bearer ${secret:tok}",
+      "--header",
+      "X-Trace: 1",
+    ]);
+    expect(r.ok && r.options.url).toBe("https://mcp.example.test/mcp");
+    expect(r.ok && r.options.headers).toEqual({ Authorization: "Bearer ${secret:tok}", "X-Trace": "1" });
+  });
+
+  it("splits a header on the FIRST colon, so a value keeps its own", () => {
+    // `Bearer` blobs and URLs contain colons; a greedy split truncates them.
+    const r = parseAddArgs(["r", "--url", "https://a.test/mcp", "--header", "X-Endpoint: https://b.test:8443/x"]);
+    expect(r.ok && r.options.headers).toEqual({ "X-Endpoint": "https://b.test:8443/x" });
+  });
+
+  it("refuses --command together with --url", () => {
+    const r = parseAddArgs(["x", "--command", "npx foo", "--url", "https://a.test/mcp"]);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.error).toContain("mutually exclusive");
+  });
+
+  it("refuses a flag that belongs to the other mode instead of dropping it", () => {
+    // Accepting-and-ignoring is how a user ends up unable to work out why the
+    // token they passed is not being sent.
+    const header = parseAddArgs(["x", "--command", "npx foo", "--header", "A: b"]);
+    expect(!header.ok && header.error).toContain("--header applies to a remote server");
+
+    const transport = parseAddArgs(["x", "--command", "npx foo", "--transport", "sse"]);
+    expect(!transport.ok && transport.error).toContain("--transport applies to a remote server");
+
+    // `env` is not merely unused on a remote entry -- upstream.ts ignores it
+    // outright, because there is no child process to put it in.
+    const env = parseAddArgs(["x", "--url", "https://a.test/mcp", "--env", "FOO=bar"]);
+    expect(!env.ok && env.error).toContain("--env does not apply to a remote server");
+  });
+
+  it("rejects a malformed --header rather than guessing", () => {
+    for (const bad of ["no-colon", ":novalue", "Bad Name: v", "A:", "A:    "]) {
+      const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--header", bad]);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("rejects a header value carrying a newline or NUL", () => {
+    // Refused while the user is still looking at the command that made the
+    // typo. upstream.ts refuses it at connect time too, which is the
+    // load-bearing guard since bundles.json is hand-editable.
+    for (const bad of ["a\rb", "a\nb", "a\0b"]) {
+      const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--header", `X-H: ${bad}`]);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+      expect(!r.ok && r.error).toContain("newline or NUL");
+    }
+  });
+
+  it("rejects a --transport that is not one of the two real ones", () => {
+    const r = parseAddArgs(["x", "--url", "https://a.test/mcp", "--transport", "websocket"]);
+    expect(r.ok).toBe(false);
+  });
+
+  it("rejects a value-taking flag that swallowed the next flag", () => {
+    // `--command --dry-run` would otherwise set command="--dry-run" and
+    // silently drop the dry run -- the same trap --catalog already guards.
+    for (const argv of [
+      ["x", "--command", "--dry-run"],
+      ["x", "--url", "--json"],
+      ["x", "--description", "--json"],
+    ]) {
+      expect(parseAddArgs(argv).ok, argv.join(" ")).toBe(false);
+    }
+  });
+
+  it("names what the missing positional IS, per mode", () => {
+    expect(!parseAddArgs(["--command", "npx foo"]).ok && parseAddArgs(["--command", "npx foo"])).toMatchObject({
+      error: expect.stringContaining("server name"),
+    });
+    expect(parseAddArgs(["a", "b"])).toMatchObject({ error: expect.stringContaining("server slug") });
+  });
   it("rejects malformed --env", () => {
     expect(parseAddArgs(["github", "--env", "nope"]).ok).toBe(false);
   });
@@ -303,6 +395,210 @@ describe("runAdd", () => {
     const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
     const entry = loaded.config?.servers.find((s) => s.namespace === "tailscale");
     expect(entry?.env?.TAILSCALE_API_KEY).toBe("tskey-x");
+  });
+
+  it("writes a local entry from --command without fetching the catalog at all", async () => {
+    // The no-fetch part is the point, not an optimisation: the catalog being
+    // a curated front door rather than the only door means a server it does
+    // not list must not depend on reaching it. It also makes this the one
+    // add path that works offline.
+    const io = captureIO();
+    let fetched = false;
+    const r = await runAdd({
+      slug: "mytool",
+      command: "npx -y @scope/my-mcp@latest --flag",
+      description: "does a thing",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => {
+        fetched = true;
+        return [];
+      },
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(fetched).toBe(false);
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "mytool");
+    expect(entry?.type).toBe("local");
+    expect(entry?.command).toBe("npx");
+    // Tokenized by the same splitter the catalog's launch lines use, so a
+    // quoted argument behaves identically however the entry was added.
+    expect(entry?.args).toEqual(["-y", "@scope/my-mcp@latest", "--flag"]);
+    expect(entry?.description).toBe("does a thing");
+  });
+
+  it("never prints a header VALUE in --json, the way env is already redacted", async () => {
+    // headers is the credential channel for a remote server, so an
+    // Authorization value here is a live bearer token -- and this envelope is
+    // what gets piped into CI logs and pasted into bug reports. Shipped
+    // briefly printing `envKeys: [...]` next to a full `Bearer <token>` in one
+    // output. A ${secret:NAME} reference would be safe to print, but the
+    // envelope cannot tell the reader which one it holds without printing it.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer LITERAL-TOKEN-abc123" },
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io2.out.push(s),
+      err: (s) => io2.err.push(s),
+    });
+    const stdout = io2.out.join("");
+    expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
+    const parsed = JSON.parse(stdout);
+    expect(parsed.entry.headers).toBeUndefined();
+    expect(parsed.entry.headerNames).toEqual(["Authorization"]);
+  });
+
+  it("renders a remote --dry-run as its url, not as an undefined command", async () => {
+    // The preview hand-rolled `command + args`, which a remote entry has
+    // neither of -- so every --url dry run printed a literal
+    // "command: undefined ". renderLaunch already knows the url shape.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer LITERAL-TOKEN-abc123" },
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io2.out.push(s),
+      err: (s) => io2.err.push(s),
+    });
+    const stdout = io2.out.join("");
+    expect(stdout).toContain("HTTP https://mcp.example.test/mcp");
+    expect(stdout).not.toContain("undefined");
+    // Same redaction as the json envelope: names, never values.
+    expect(stdout).toContain("header names: Authorization");
+    expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
+  });
+
+  it("writes a remote entry from --url, with headers and no command", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer ${secret:tok}" },
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    const entry = loaded.config?.servers.find((s) => s.namespace === "remotey");
+    expect(entry?.type).toBe("remote");
+    expect(entry?.url).toBe("https://mcp.example.test/mcp");
+    expect(entry?.transport).toBe("streamable-http");
+    expect(entry?.headers).toEqual({ Authorization: "Bearer ${secret:tok}" });
+    // The two shapes are exclusive: a stray `command: ""` on a remote entry
+    // would read to the loader as a stdio server with no executable.
+    expect(entry?.command).toBeUndefined();
+    expect(entry?.args).toBeUndefined();
+  });
+
+  it("honours --transport sse on a remote entry", async () => {
+    const io = captureIO();
+    await runAdd({
+      slug: "ssey",
+      url: "https://mcp.example.test/sse",
+      transport: "sse",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "ssey")?.transport).toBe("sse");
+  });
+
+  it("refuses a url it could never connect to, at add time rather than at connect time", async () => {
+    // upstream.ts does classify a malformed url as a permanent config error,
+    // but that is a failure the user meets in their next session. Refusing
+    // here keeps the unusable entry out of bundles.json entirely.
+    for (const url of ["not-a-url", "ftp://a.test/mcp", "//a.test/mcp"]) {
+      const io = captureIO();
+      const r = await runAdd({
+        slug: "bad",
+        url,
+        home: synthHome,
+        cwd: synthCwd,
+        env: {},
+        out: (s) => io.out.push(s),
+        err: (s) => io.err.push(s),
+      });
+      expect(r.exitCode, url).toBe(2);
+      expect(r.written, url).toEqual([]);
+    }
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "bad")).toBeUndefined();
+  });
+
+  it("refuses a --command with no executable in it", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "empty",
+      command: '""',
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    // The same degenerate quoted-empty launch line the catalog path already
+    // refuses -- it would otherwise be written as a server with no command
+    // and fail opaquely at spawn time.
+    expect(r.exitCode).toBe(2);
+  });
+
+  it("records the catalog's compliance grade so the floor has something to gate on", async () => {
+    // End of the chain this fix reconnected. The catalog publishes an A-F
+    // grade; before, `add` dropped it and validateEntry dropped it again, so
+    // grades.json -- written only by a manual `yaw-mcp audit` -- was the sole
+    // supplier. Until the user ran that per server, everything was ungraded,
+    // ungraded always passes, and YAW_MCP_MIN_COMPLIANCE refused nothing.
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "graded",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => [
+        { slug: "graded", name: "Graded", install: { command: "npx -y graded-mcp" }, complianceGrade: "B" },
+      ],
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "graded")?.complianceGrade).toBe("B");
+  });
+
+  it("writes no grade for an ungraded catalog entry, leaving it to pass as before", async () => {
+    const io = captureIO();
+    const r = await runAdd({
+      slug: "plain",
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      fetchCatalog: async () => [{ slug: "plain", name: "Plain", install: { command: "npx -y plain-mcp" } }],
+      out: (s) => io.out.push(s),
+      err: (s) => io.err.push(s),
+    });
+    expect(r.exitCode).toBe(0);
+    const loaded = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(loaded.config?.servers.find((s) => s.namespace === "plain")?.complianceGrade).toBeUndefined();
   });
 
   it("treats a whitespace-only --env required value as missing (no blank-ish persist)", async () => {
@@ -483,7 +779,7 @@ describe("runAdd", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(io.text()).toContain('would write Fetch as namespace "fetch"');
-    expect(io.text()).toContain("command: npx -y @yawlabs/fetch-mcp");
+    expect(io.text()).toContain("launch: $ npx -y @yawlabs/fetch-mcp");
   });
 
   it("--dry-run text says 'would update' once the entry exists, and lists env KEY names only", async () => {
@@ -869,7 +1165,7 @@ describe("runAdd re-add preserves user state", () => {
     expect(r.exitCode).toBe(0);
     expect(io.text()).toContain('would update Fetch as namespace "fetch"');
     expect(io.text()).toMatch(/would stay disabled and NOT load/);
-    expect(io.text()).toContain("command: npx -y @yawlabs/fetch-mcp");
+    expect(io.text()).toContain("launch: $ npx -y @yawlabs/fetch-mcp");
     // ...and a dry run still writes nothing: the stale entry is untouched.
     expect(rawServers()[0].isActive).toBe(false);
     expect(rawServers()[0].args).toEqual(["-y", "stale"]);

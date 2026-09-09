@@ -85,6 +85,47 @@ describe("resolveCatalogSlug", () => {
     );
   });
 
+  // The catalog publishes an A-F grade per server, and until it was carried
+  // through here nothing did: `add` wrote no grade, validateEntry dropped one
+  // if hand-written, and grades.json (which only `yaw-mcp audit` writes) was
+  // the sole supplier -- so on a fresh install every server was ungraded, and
+  // ungraded always passes, which left YAW_MCP_MIN_COMPLIANCE gating nothing.
+  it("carries an A-F compliance grade through to the resolved server", async () => {
+    for (const grade of ["A", "B", "C", "D", "F"]) {
+      const servers: CatalogServer[] = [{ slug: "g", install: { command: "npx -y g" }, complianceGrade: grade }];
+      const result = await resolveCatalogSlug("g", { fetchCatalog: makeFetch(servers) });
+      expect(result.complianceGrade, grade).toBe(grade);
+    }
+  });
+
+  it("normalizes case, since the grades cache uppercases and the two must rank alike", async () => {
+    const servers: CatalogServer[] = [{ slug: "g", install: { command: "npx -y g" }, complianceGrade: " b " }];
+    const result = await resolveCatalogSlug("g", { fetchCatalog: makeFetch(servers) });
+    expect(result.complianceGrade).toBe("B");
+  });
+
+  it("drops a grade that is not A-F rather than copying it into the user's file", async () => {
+    // Stricter here than compliance.ts's classifyGrade on purpose. An
+    // unrecognized letter in the user's OWN bundles.json is worth surfacing as
+    // possible tampering, so validateEntry passes those through. This value
+    // arrives over the network and is about to be written INTO that file, so
+    // anything unexpected is catalog corruption -- copying it in would
+    // manufacture the very tamper signal the other path exists to report.
+    for (const bad of ["ZZZ", "A+", "", "   ", "1", 4, null, {}]) {
+      const servers: CatalogServer[] = [
+        { slug: "g", install: { command: "npx -y g" }, complianceGrade: bad as unknown as string },
+      ];
+      const result = await resolveCatalogSlug("g", { fetchCatalog: makeFetch(servers) });
+      expect(result.complianceGrade, JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+
+  it("leaves the grade undefined when the catalog entry has none", async () => {
+    const servers: CatalogServer[] = [{ slug: "g", install: { command: "npx -y g" } }];
+    const result = await resolveCatalogSlug("g", { fetchCatalog: makeFetch(servers) });
+    expect(result.complianceGrade).toBeUndefined();
+  });
+
   // -------------------------------------------------------------------------
   // Remote-server refusal. A remote/HTTP entry has no stdio spawn command, so
   // tokenizing its URL would write a broken bundles.json entry that fails at

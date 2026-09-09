@@ -42,6 +42,10 @@ export interface CatalogServer {
   requiredEnv?: CatalogRequiredEnv[];
   repo?: string;
   homepage?: string;
+  /** Published A-F grade from the Yaw MCP compliance suite. Typed as a bare
+   *  string because this is remote data: normalizeCatalogGrade decides what
+   *  is acceptable, rather than a cast asserting the wire was well-formed. */
+  complianceGrade?: string;
 }
 
 /** The resolved launch shape `add`/`try` consume. command + args are split
@@ -56,6 +60,11 @@ export interface ResolvedCatalogServer {
   description?: string;
   source?: string;
   docUrl?: string;
+  /** The catalog's published grade, A-F, or undefined when the catalog has
+   *  none or the value did not survive normalizeCatalogGrade. `add` writes it
+   *  into bundles.json so YAW_MCP_MIN_COMPLIANCE has something to gate on
+   *  before the user has run `yaw-mcp audit` on the server themselves. */
+  complianceGrade?: "A" | "B" | "C" | "D" | "F";
 }
 
 export type FetchCatalog = (url: string) => Promise<CatalogServer[]>;
@@ -315,7 +324,25 @@ export async function resolveCatalogSlug(
     description: typeof entry.description === "string" ? entry.description : undefined,
     source,
     docUrl: source,
+    complianceGrade: normalizeCatalogGrade(entry.complianceGrade),
   };
+}
+
+/** Accept a catalog grade only when it is exactly one of the A-F letters.
+ *
+ *  Deliberately STRICTER than compliance.ts's classifyGrade, which keeps an
+ *  unrecognized letter as a distinct "unrecognized" signal rather than
+ *  collapsing it to ungraded. That signal is worth having for a value in the
+ *  user's OWN bundles.json, where a garbled grade plausibly means tampering
+ *  or a bad hand-edit and the user should be told. It is not worth having
+ *  here: this value arrives over the network and is about to be written into
+ *  that same file, so anything unexpected is catalog corruption, and copying
+ *  it in would manufacture the very tamper signal the other path exists to
+ *  report. Unknown becomes ungraded, and ungraded passes. */
+function normalizeCatalogGrade(raw: unknown): "A" | "B" | "C" | "D" | "F" | undefined {
+  if (typeof raw !== "string") return undefined;
+  const up = raw.trim().toUpperCase();
+  return up === "A" || up === "B" || up === "C" || up === "D" || up === "F" ? up : undefined;
 }
 
 export { DEFAULT_CATALOG_URL };

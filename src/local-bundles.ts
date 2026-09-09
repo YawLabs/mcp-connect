@@ -147,6 +147,27 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
         ) as Record<string, string>)
       : undefined;
   const url = typeof e.url === "string" ? e.url : undefined;
+  // HTTP headers for a REMOTE server, the channel a remote upstream takes its
+  // credential through (types.ts). Same fixed-whitelist rule as every field
+  // above: absent here means dropped at load, and a `headers` block would have
+  // been silently discarded.
+  //
+  // Blank values are dropped for a DIFFERENT reason than `env`'s. There the
+  // empty string is a deliberate "required, but not stored here" seed that
+  // would clobber an inherited shell value; here nothing is inherited, and a
+  // blank header is either a half-finished edit or a `${secret:...}` the user
+  // meant to fill in. Sending `Authorization:` with an empty value reads to a
+  // server as a malformed credential rather than as no credential, so the
+  // clearer failure is to omit it. Keys are trimmed and must be non-blank:
+  // a whitespace-only header name cannot be put on the wire at all.
+  const headers =
+    e.headers && typeof e.headers === "object" && !Array.isArray(e.headers)
+      ? (Object.fromEntries(
+          Object.entries(e.headers as Record<string, unknown>)
+            .filter(([k, v]) => k.trim() !== "" && typeof v === "string" && v.trim() !== "")
+            .map(([k, v]) => [k.trim(), v as string]),
+        ) as Record<string, string>)
+      : undefined;
   const description = typeof e.description === "string" ? e.description : undefined;
   // Per-server runtime override. "oam" hosts the server on the oam runtime
   // (connectToUpstream's resolveOamSpawn rewrites node/npx -> `oam run`).
@@ -187,6 +208,29 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     );
   }
 
+  // Per-server compliance grade. Carried for the same reason as `runtime` and
+  // `connectTimeoutMs` above -- the return below is a fixed whitelist, so a
+  // field missing from it is DROPPED -- and this was the next instance of that
+  // bug. hydrateComplianceGrades (server.ts) and runList both say outright
+  // that bundles.json "never carries a grade of its own", which was true only
+  // because this line was missing: grades.json, written by `yaw-mcp audit`
+  // one server at a time, was the sole supplier, so on a fresh install every
+  // server was ungraded and YAW_MCP_MIN_COMPLIANCE gated nothing at all.
+  // `yaw-mcp add` now records the catalog's published grade here.
+  //
+  // Any non-empty string is passed through, NOT just A-F, and that is
+  // deliberate: compliance.ts three-way classifies a grade as graded,
+  // ungraded, or UNRECOGNIZED, and treats the third as a signal of
+  // misconfiguration or tampering rather than a synonym for ungraded.
+  // Narrowing here would make that arm unreachable from the one file a user
+  // hand-edits, which is exactly where a garbled letter is worth reporting.
+  // Uppercased to match the grades cache's own normalization so "a" and "A"
+  // cannot rank differently.
+  const complianceGrade =
+    typeof e.complianceGrade === "string" && e.complianceGrade.trim() !== ""
+      ? (e.complianceGrade.trim().toUpperCase() as UpstreamServerConfig["complianceGrade"])
+      : undefined;
+
   // Default isActive=true in local mode -- if the user wrote a server
   // into bundles.json they presumably want it loadable. Toggle off with
   // explicit `"isActive": false`.
@@ -207,10 +251,12 @@ function validateEntry(entry: unknown, warnings: string[]): UpstreamServerConfig
     args,
     env,
     url,
+    headers,
     isActive,
     connectTimeoutMs,
     description,
     runtime,
+    complianceGrade,
   };
 }
 

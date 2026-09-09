@@ -585,11 +585,45 @@ const CALL_TIMEOUT = resolveTimeoutEnv("MCP_CALL_TIMEOUT", 60_000);
 // string was always there, so `content[0].text` type-checked and handed them
 // `undefined` at runtime on any non-text tool result. The two fault paths and
 // the catch below do always produce text; the union is what the union has.
+/** One upstream progress notification, as the SDK hands it to `onprogress`. */
+export interface UpstreamProgress {
+  progress: number;
+  total?: number;
+  message?: string;
+}
+
+/** The two things the DOWNSTREAM request carries that an upstream call needs.
+ *
+ *  Both used to stop at this function's parameter list. The CallToolRequest
+ *  handler in server.ts receives an `extra` holding the client's abort signal
+ *  and its progress token, but routeToolCall took four arguments and `extra`
+ *  was not one of them -- so the call below went out with a timeout and
+ *  nothing else, and two things the client asked for died at the hop:
+ *
+ *  - Cancellation. The downstream abort tore down yaw-mcp's own handler while
+ *    the awaited upstream call ran on to completion (or to CALL_TIMEOUT). The
+ *    reverse direction was already careful about this: upstream-originated
+ *    elicitation / sampling / roots each forward `extra.signal` (upstream.ts).
+ *  - Progress. Without `onprogress` the SDK injects no `_meta.progressToken`
+ *    into the upstream request, so a long-running upstream tool was never even
+ *    ASKED to report progress, and the client watched a blank wait. */
+export interface RouteToolCallOptions {
+  /** The downstream request's abort signal. Forwarding it makes the SDK send
+   *  `notifications/cancelled` upstream and reject the pending call. */
+  signal?: AbortSignal;
+  /** Relay for upstream progress. Supply it ONLY when the downstream client
+   *  actually asked for progress: passing it makes the SDK add a progress
+   *  token to the upstream request, so an unconditional callback would change
+   *  the wire shape of every proxied call to buy notifications nothing reads. */
+  onprogress?: (p: UpstreamProgress) => void;
+}
+
 export async function routeToolCall(
   toolName: string,
   args: Record<string, unknown>,
   toolRoutes: Map<string, ToolRoute>,
   activeConnections: Map<string, UpstreamConnection>,
+  options?: RouteToolCallOptions,
 ): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }> {
   const route = toolRoutes.get(toolName);
 
@@ -630,7 +664,17 @@ export async function routeToolCall(
       // take the SDK's structured-output validation with it. `undefined` keeps
       // the SDK default; the request options belong in the third slot.
       undefined,
-      { timeout: CALL_TIMEOUT },
+      // `signal` and `onprogress` are passed straight through, undefined and
+      // all: the SDK guards both (`options?.signal?.throwIfAborted()`, and
+      // `if (options?.onprogress)` before it registers a token), so an absent
+      // one is inert and needs no conditional spread here.
+      //
+      // `resetTimeoutOnProgress` is deliberately NOT set. It would let a
+      // progress-reporting upstream push past CALL_TIMEOUT indefinitely,
+      // which is a change to how long a call may run -- a separate decision
+      // from restoring the two signals the client already sent, and one that
+      // wants its own bound (maxTotalTimeout) rather than riding in here.
+      { timeout: CALL_TIMEOUT, signal: options?.signal, onprogress: options?.onprogress },
     );
 
     return result as { content: Array<{ type: string; text?: string }>; isError?: boolean };

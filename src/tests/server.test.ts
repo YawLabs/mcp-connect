@@ -3112,8 +3112,13 @@ describe("ConnectServer", () => {
       expect(parsed.ok).toBe(true);
       // "second" step output: single text item -> parsed as string.
       expect(parsed.result).toBe("PR #42 body");
-      // Both steps should have landed in the output map.
-      expect(Object.keys(parsed.steps).sort()).toEqual(["first", "second"]);
+      // Small intermediates ride along even with an explicit `return`: the
+      // values a caller cannot reconstruct after a side effect are small, and
+      // losing them to save a few hundred bytes is a bad trade. `stepKeys` is
+      // added either way. See the large-payload case below for the other half.
+      expect(Object.keys(parsed).sort()).toEqual(["ok", "result", "stepKeys", "steps"]);
+      expect(parsed.stepKeys.slice().sort()).toEqual(["first", "second"]);
+      expect(parsed.steps.first).toBe(42);
       // The second upstream call must have received the resolved value,
       // not the raw $ref marker -- otherwise the resolver never fired.
       // "42" parses as the number 42 via JSON.parse, so number (not string).
@@ -3123,6 +3128,103 @@ describe("ConnectServer", () => {
         name: "get_pr",
         arguments: { number: 42 },
       });
+    });
+
+    it("keeps every output when no `return` selects one", async () => {
+      // The other half of the contract. Without an explicit `return` the
+      // caller has not said which value it wants, `result` is just the last
+      // step's, and the intermediates are the only view of what the pipeline
+      // computed -- so they stay. Trimming here would remove data on behalf
+      // of a caller who never asked for anything narrower.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["list_prs", "get_pr"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "42" }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "PR #42 body" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "first", tool: "gh_list_prs", args: {} },
+          { id: "second", tool: "gh_get_pr", args: {} },
+        ],
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.ok).toBe(true);
+      expect(parsed.result).toBe("PR #42 body");
+      expect(Object.keys(parsed).sort()).toEqual(["ok", "result", "steps"]);
+      // `first` is the NUMBER 42: parseStepPayload JSON-parses a single text
+      // block, so "42" lands as a number, exactly as the $ref test above
+      // notes. Asserting the string here was my error, not the code's.
+      expect(parsed.steps).toEqual({ first: 42, second: "PR #42 body" });
+      expect(parsed.stepKeys).toBeUndefined();
+    });
+
+    it("shrinks the payload when `return` names a step, rather than echoing what it skipped", async () => {
+      // The point of the change, stated as a measurement rather than a shape:
+      // the documented example is `a = list(); b = get(a[0]); return b`, and
+      // the reason to write `return b` is to not be handed `a` again. Here
+      // the skipped step is a large list, so an echo is unmistakable.
+      const priv = getPrivate(server);
+      const bigList = JSON.stringify(Array.from({ length: 200 }, (_, i) => ({ number: i, title: `pr ${i}` })));
+      const conn = makeConnection("gh", ["list_prs", "get_pr"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: bigList }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "PR #0 body" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const steps = [
+        { id: "a", tool: "gh_list_prs", args: {} },
+        { id: "b", tool: "gh_get_pr", args: { number: { $ref: "a.0.number" } } },
+      ];
+      const selected = await priv.handleToolCall("mcp_connect_exec", { steps, return: "b" });
+      const text = selected.content[0].text;
+
+      expect(JSON.parse(text).result).toBe("PR #0 body");
+      // Over the echo budget, so the list the caller did not select is dropped,
+      // along with a second copy of the value it did.
+      expect(text).not.toContain("pr 199");
+      expect(text.match(/PR #0 body/g)).toHaveLength(1);
+      expect(JSON.parse(text).steps).toBeUndefined();
+      // And it is dramatically smaller than the un-selected form would be.
+      expect(text.length).toBeLessThan(bigList.length / 10);
+    });
+
+    it("keeps a small side-effect result even when `return` names a later step", async () => {
+      // The case that makes the budget necessary rather than merely nice. exec
+      // declares idempotentHint:false, and this file's own preflight test says
+      // re-running a pipeline whose step 0 files an issue "files a second
+      // one". So on `a = create_issue(); b = comment(a.number); return b`,
+      // dropping `a` destroys the new issue's number with no safe way to get
+      // it back -- and "re-run with a different return" is the one recovery
+      // the rest of the file treats as a hazard. Small payload, so it stays.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue", "comment"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: '{"number":4242,"url":"https://x.test/i/4242"}' }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "commented" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "a", tool: "gh_create_issue", args: {} },
+          { id: "b", tool: "gh_comment", args: { n: { $ref: "a.number" } } },
+        ],
+        return: "b",
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.result).toBe("commented");
+      // The irreplaceable part of the side effect survives.
+      expect(parsed.steps.a).toEqual({ number: 4242, url: "https://x.test/i/4242" });
     });
 
     it("fails the whole pipeline and surfaces partial outputs when a step errors", async () => {

@@ -250,7 +250,7 @@ export const META_TOOLS = {
     description: [
       "Run a short DECLARATIVE pipeline of upstream tool calls in a single round-trip. Use this when you already know the exact 2-4 tool calls to make and one call's output feeds another's args — e.g. `a = gh_list_prs(); b = gh_get_pr(a[0].number); return b`. NOT a code sandbox: there is no expression language, no loops, no branching, no arithmetic. The only control flow is sequential step execution; the only data-flow primitive is `{\"$ref\": \"<stepId>[.path.to.value]\"}` which substitutes a prior step's output (or a nested field of it) into the next step's args. Paths support dot keys and `[N]` / `.N` array indexing. Each step's `tool` is a namespaced upstream tool name: an already-loaded server is called directly, and a not-yet-loaded server whose tools are known from cache is loaded on first use exactly as a direct tools/call would be — that adds its tools to this session, and can still be refused (server cap, compliance floor). A name that is neither loaded nor cached fails the step.",
       `Max ${MAX_EXEC_STEPS} steps per exec.`,
-      "If any step fails, the whole pipeline fails and returns `{ ok: false, failedStep, error, partial: { ...completed outputs } }`. On success returns `{ ok: true, result: <return-step output>, steps: { ...all outputs } }`. Prefer this over back-to-back tool calls when the chain is deterministic — it saves prompt-token replay and client round-trips.",
+      "If any step fails, the whole pipeline fails and returns `{ ok: false, failedStep, error, partial: { ...completed outputs } }`. On success the shape depends on whether you named a `return`: WITH one you get `{ ok: true, result: <that step's output>, stepKeys: [...] }` — plus `steps` as well while the intermediate outputs stay small (about 4 KB), so a created issue's id survives while a long list you skipped is not replayed at you; WITHOUT one you get `{ ok: true, result: <last step's output>, steps: { ...all outputs } }`. Name a `return` whenever you only need one value: it is what stops a LARGE intermediate output (a long list you only wanted one element of) from being replayed back into your context. Prefer this over back-to-back tool calls when the chain is deterministic — it saves prompt-token replay and client round-trips.",
     ].join(" "),
     inputSchema: {
       type: "object" as const,
@@ -292,7 +292,7 @@ export const META_TOOLS = {
         return: {
           type: "string",
           description:
-            "Optional: id of the step whose output should be surfaced as `result`. Defaults to the last step's id (or its positional index).",
+            "Optional: id of the step whose output should be surfaced as `result`. Defaults to the last step's id (or its positional index). Naming a step is NOT just a selection: it also adds `stepKeys`, and once the intermediate outputs exceed roughly 4 KB it drops `steps` from the response so a large payload you skipped is not replayed back to you. Below that they are all still returned.",
         },
       },
       required: ["steps"],

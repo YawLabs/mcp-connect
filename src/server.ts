@@ -49,7 +49,7 @@ import { log } from "./logger.js";
 import { computeSecretsReport, META_TOOL_NAMES, META_TOOLS } from "./meta-tools.js";
 import { PackDetector } from "./pack-detect.js";
 import { isPersistenceDisabled, loadState, type PersistedToolCacheEntry, saveState } from "./persistence.js";
-import { createProgressReporter, type ProgressReporter } from "./progress.js";
+import { createProgressReporter, isProgressRequested, type ProgressReporter } from "./progress.js";
 import {
   type BuiltinResource,
   brandRoutingFault,
@@ -205,6 +205,17 @@ export const MAX_VAULT_PASSPHRASE_PROMPTS = 2;
  *  budget: these credentials are the child's, not yaw-mcp's, so a wrong
  *  GITHUB_TOKEN says nothing about the next server's. */
 const MAX_CREDENTIAL_PROMPTS = 2;
+
+/** How many bytes of intermediate step output an exec echoes back when the
+ *  caller named an explicit `return`.
+ *
+ *  Under it, every binding rides along: the values a caller cannot reconstruct
+ *  after a side-effecting step (an issue number, a created URL) are small, and
+ *  losing them to save a few hundred bytes is a bad trade. Over it, only
+ *  `stepKeys` -- that is the large skipped payload whose replay this exists to
+ *  avoid. Sized well above a handful of ids and well below a list worth
+ *  paging through. */
+export const EXEC_ECHO_BUDGET_BYTES = 4096;
 
 // Last baseline the clamp warning in resolveIdleThreshold fired for. Keyed on
 // the VALUE, not a boolean, so a session (or a test) that changes the env to a
@@ -998,13 +1009,20 @@ export class ConnectServer {
   }
 
   // Overlay the A-F grades `yaw-mcp audit` cached in ~/.yaw-mcp/grades.json
-  // onto the loaded server list. That cache is the ONLY supplier of
-  // `complianceGrade` in local mode — validateEntry drops unknown fields, so
-  // a grade never rides along in bundles.json. Without this overlay every
-  // server is permanently ungraded, which silently disables the
-  // YAW_MCP_MIN_COMPLIANCE gate (ungraded always passes) and blanks the
-  // `[A]`-`[F]` badge in discover. Mirrors the same overlay `yaw-mcp list`
-  // applies (local-add-cmd.ts runList) so the CLI and the server agree.
+  // onto the loaded server list, and note the DIRECTION: the cache goes on
+  // top. A bundles.json entry can now carry a grade of its own -- `yaw-mcp
+  // add` records the catalog's published one, and validateEntry passes it
+  // through -- so the two suppliers can disagree, and the locally-measured
+  // letter has to win. The cached one was produced by running the suite
+  // against the bytes on THIS machine; the config one is a claim the catalog
+  // published at add time, about a version that may since have moved.
+  //
+  // This overlay used to be the only supplier, which is what made
+  // YAW_MCP_MIN_COMPLIANCE inert on a fresh install: `audit` has to be run
+  // per server by hand, so until it had been, every server was ungraded, and
+  // ungraded always passes. Also blanks the `[A]`-`[F]` badge in discover.
+  // Mirrors the same overlay `yaw-mcp list` applies (local-add-cmd.ts
+  // runList) so the CLI and the server agree.
   //
   // `home` is a parameter rather than a field so tests can point it at a
   // synthetic ~/.yaw-mcp without running the whole of start().
@@ -1496,7 +1514,11 @@ export class ConnectServer {
   private async handleToolCall(
     name: string,
     args: Record<string, unknown>,
-    extra?: { sendNotification?: any; _meta?: Record<string, unknown> },
+    // `signal` rides along with the two progress fields because the SDK's
+    // RequestHandlerExtra has always carried it -- it was simply never read,
+    // so a downstream cancel aborted this handler and left the upstream call
+    // running. The proxy path below forwards it.
+    extra?: { sendNotification?: any; _meta?: Record<string, unknown>; signal?: AbortSignal },
     // When deferLearning is set (exec steps), the proxy path does NOT record
     // the cross-session learning signal — handleExec records step-level,
     // cascading-blame credit instead so a failing consumer doesn't wrongly
@@ -1576,7 +1598,7 @@ export class ConnectServer {
       return this.attachGuideNudge(this.handleSuggest());
     }
     if (name === META_TOOLS.exec.name) {
-      const result = await this.handleExec(args);
+      const result = await this.handleExec(args, extra?.signal);
       return this.attachGuideNudge(result);
     }
     if (name === META_TOOLS.bundles.name) {
@@ -1795,7 +1817,20 @@ export class ConnectServer {
     // between the initial lookup and this call can't misdirect us.
     let result: { content: Array<{ type: string; text?: string }>; isError?: boolean };
     try {
-      result = await routeToolCall(name, args, routes, this.connections);
+      result = await routeToolCall(name, args, routes, this.connections, {
+        // Cancellation crosses the hop: the SDK sends notifications/cancelled
+        // upstream and rejects the pending call, instead of leaving it to run
+        // to CALL_TIMEOUT after the client that wanted it has gone.
+        signal: extra?.signal,
+        // Relay upstream progress under the DOWNSTREAM token, and only when
+        // the client asked -- see isProgressRequested. `progress` is the same
+        // reporter the meta-tool branches use, so its monotonic clamp keeps
+        // the sequence legal even if activation already emitted under this
+        // token earlier in the call.
+        onprogress: isProgressRequested(extra)
+          ? (p) => progress(p.message ?? `${route?.namespace ?? "upstream"} working`, p.progress, p.total)
+          : undefined,
+      });
     } finally {
       if (callNamespace !== undefined) {
         const remaining = (this.inflightCalls.get(callNamespace) ?? 1) - 1;
@@ -4447,6 +4482,10 @@ export class ConnectServer {
   // top level of the model's reasoning.
   private async handleExec(
     args: Record<string, unknown>,
+    // The downstream request's abort signal, forwarded to each step so a
+    // cancelled pipeline actually stops. Deliberately NOT the whole `extra`:
+    // see the step dispatch below for why exec withholds the progress half.
+    signal?: AbortSignal,
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     const validation = validateExecRequest(args);
     if (!validation.ok) {
@@ -4635,8 +4674,13 @@ export class ConnectServer {
       // and pack-detector logic so exec steps behave identically to
       // direct calls — the caller pays no per-step cost in surprises.
       //
-      // `extra` is omitted so exec steps don't fight for the top-level
-      // progress token; the exec itself emits no progress.
+      // The progress half of `extra` is still withheld so exec steps don't
+      // fight for the top-level progress token; the exec itself emits no
+      // progress. The SIGNAL is forwarded, though: that reasoning was only
+      // ever about the token, and without it a cancelled pipeline kept
+      // dispatching its remaining steps. Passing an object carrying nothing
+      // but `signal` keeps the old behaviour exactly -- createProgressReporter
+      // returns its no-op when there is no token and no sendNotification.
       // Step-level (process) reward: defer the proxy path's learning signal
       // and attribute credit per step here, using the $ref dependency graph
       // so a step that fails on bad INPUT it consumed from an upstream step
@@ -4659,10 +4703,15 @@ export class ConnectServer {
       }
       let stepResult: { content: Array<{ type: string; text?: string }>; isError?: boolean };
       try {
-        stepResult = await this.handleToolCall(step.tool, resolvedArgs, undefined, {
-          deferLearning: true,
-          deferIdleTracking: true,
-        });
+        stepResult = await this.handleToolCall(
+          step.tool,
+          resolvedArgs,
+          { signal },
+          {
+            deferLearning: true,
+            deferIdleTracking: true,
+          },
+        );
       } catch (err) {
         // Every ordinary exit from this method settles idle tracking (and
         // with it releases the pins). An unexpected throw must not be the
@@ -4758,19 +4807,39 @@ export class ConnectServer {
     // server between two steps of this exec.
     await settleIdleTracking();
 
+    // An EXPLICIT `return` is the caller telling us which output it wants,
+    // and echoing `steps` anyway hands back everything it just said it did
+    // not -- plus a verbatim second copy of the value it did. The tool exists
+    // to spend fewer tokens than the equivalent back-to-back calls; on the
+    // documented example (`a = gh_list_prs(); b = gh_get_pr(a[0].number);
+    // return b`) it was returning the whole PR list and `b` twice.
+    //
+    // Dropping them UNCONDITIONALLY was wrong, and the reason is in this same
+    // file. exec declares idempotentHint:false, and the preflight hoist exists
+    // precisely because step 0 can FILE AN ISSUE -- its test says re-running
+    // "files a second one". So on `a = create_issue(); b = comment(a.number);
+    // return b`, discarding `a` destroys the new issue's number and URL, and
+    // the recovery this comment used to suggest -- re-run naming a different
+    // `return` -- is the one action the rest of the file treats as a hazard.
+    //
+    // Size separates the two cases, and separates them cleanly: the bindings a
+    // caller cannot reconstruct are small (an id, a URL, a status), while the
+    // ones worth not replaying are large (the 200-element list the caller
+    // wanted one element of). So keep every intermediate while the whole set
+    // is small, and fall back to names only once echoing it is the cost this
+    // change was made to avoid. `stepKeys` is present on both explicit-return
+    // shapes, so "which steps ran" never depends on the size.
+    const body = !explicitReturn
+      ? { ok: true, result: finalResult, steps: bindings }
+      : JSON.stringify(bindings).length > EXEC_ECHO_BUDGET_BYTES
+        ? { ok: true, result: finalResult, stepKeys }
+        : { ok: true, result: finalResult, stepKeys, steps: bindings };
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              ok: true,
-              result: finalResult,
-              steps: bindings,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(body, null, 2),
         },
       ],
     };

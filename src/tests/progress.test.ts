@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createProgressReporter } from "../progress.js";
+import { createProgressReporter, isProgressRequested } from "../progress.js";
 
 describe("createProgressReporter", () => {
   afterEach(() => {
@@ -184,5 +184,44 @@ describe("createProgressReporter", () => {
     });
     report("numeric");
     expect(send.mock.calls[0]![0].params.progressToken).toBe(7);
+  });
+});
+
+describe("isProgressRequested", () => {
+  // The predicate exists so server.ts can decide whether to relay an upstream
+  // tool's progress. That decision is not cosmetic: handing the SDK an
+  // onprogress makes it stamp a progress token onto the UPSTREAM request, so
+  // relaying unconditionally would change the wire shape of every proxied
+  // call to collect notifications the reporter then drops.
+  const send = (): Promise<void> => Promise.resolve();
+
+  it("is true only when a token AND a channel are both present", () => {
+    expect(isProgressRequested({ sendNotification: send, _meta: { progressToken: "t" } })).toBe(true);
+    expect(isProgressRequested({ sendNotification: send, _meta: { progressToken: 0 } })).toBe(true);
+    expect(isProgressRequested({ sendNotification: send, _meta: {} })).toBe(false);
+    expect(isProgressRequested({ _meta: { progressToken: "t" } })).toBe(false);
+    expect(isProgressRequested({ sendNotification: send, _meta: { progressToken: null } })).toBe(false);
+    expect(isProgressRequested(undefined)).toBe(false);
+  });
+
+  it("agrees with whether the reporter actually emits", () => {
+    // Drift guard. These are two views of one condition, and if they ever
+    // disagree the failure is silent in both directions: a relay wired up for
+    // a reporter that discards, or progress asked for and never forwarded.
+    const cases = [
+      { sendNotification: send, _meta: { progressToken: "t" } },
+      { sendNotification: send, _meta: { progressToken: 7 } },
+      { sendNotification: send, _meta: { progressToken: 0 } },
+      { sendNotification: send, _meta: {} },
+      { sendNotification: send, _meta: { progressToken: null } },
+      { _meta: { progressToken: "t" } },
+      undefined,
+    ];
+    for (const extra of cases) {
+      const spy = vi.fn().mockResolvedValue(undefined);
+      const withSpy = extra === undefined ? undefined : { ...extra, sendNotification: extra.sendNotification && spy };
+      createProgressReporter(withSpy)("probe");
+      expect(spy.mock.calls.length > 0, JSON.stringify(extra ?? null)).toBe(isProgressRequested(withSpy));
+    }
   });
 });

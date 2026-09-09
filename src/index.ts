@@ -12,6 +12,7 @@ import { parseResetLearningArgs, RESET_LEARNING_USAGE, runResetLearning } from "
 import { parseSecretsArgs, runSecrets } from "./secrets-cmd.js";
 import { ConnectServer } from "./server.js";
 import { parseServersArgs, runServersCommand } from "./servers-cmd.js";
+import { registerShutdownTriggers } from "./shutdown-triggers.js";
 import { parseSidecarsArgs, runSidecarsInstall } from "./sidecars-cmd.js";
 import { suggestFlag, suggestSubcommand } from "./subcommands.js";
 import { parseTrustArgs, runTrust } from "./trust-cmd.js";
@@ -553,8 +554,12 @@ async function runServer(): Promise<void> {
     process.exit(0);
   };
 
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  // SIGTERM/SIGINT plus stdin end/close. The stdin half is what makes this
+  // work on Windows, where a client ends the broker by closing the pipe
+  // rather than by signalling it; without it shutdown() never ran there and
+  // the upstream servers this process spawned were never torn down. See
+  // shutdown-triggers.ts for why stdin is not resumed here.
+  registerShutdownTriggers(shutdown, { proc: process, stdin: process.stdin });
 
   server.start({ config }).catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);

@@ -18,6 +18,12 @@ const TIMING_SENSITIVE = [
   "src/tests/error-category.test.ts",
   "src/tests/install-targets.test.ts",
   "src/tests/uv-bootstrap.test.ts",
+  // Same class as the two above: spawns the real broker plus a real upstream
+  // and asserts BOTH settle within a budget after stdin closes. "Never exits"
+  // is the regression it guards, so the budget cannot be relaxed into
+  // "eventually" -- which makes it exactly the kind of assertion that must be
+  // measured on an idle box.
+  "src/tests/shutdown-on-stdin-close.test.ts",
 ];
 
 export default defineConfig({

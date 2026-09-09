@@ -33,7 +33,31 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+// Every case here spawnSyncs a real bash running a real script, and there are
+// 55 of them: ~142 s of wall clock for the file, so ~2.6 s a case on an idle
+// box. None of them ASSERTS a duration -- they assert on the script's stdout
+// -- so the only clock that matters is the harness's patience, and the global
+// 30 s testTimeout was it.
+//
+// That was enough until the suite grew: the default run packs the parallel
+// files onto every core at once, and under that contention a single case was
+// observed taking 30.3 s and failing the whole run. Twice, non-deterministically,
+// on a green tree. The same file passes standalone in 142 s.
+//
+// So this is NOT a TIMING_SENSITIVE file (vitest.config.ts) -- that project is
+// for assertions whose SUBJECT is a budget, where isolating the file is what
+// makes the number meaningful, and moving a 142 s file into that sequential
+// group would put all of it on the critical path. Here the deadline is
+// incidental, so the fix is to stop measuring patience in units set for
+// in-process unit tests. 5 minutes is ~2x the file's entire standalone
+// runtime, so no single case can plausibly reach it without being genuinely
+// wedged, which is the failure this still catches.
+//
+// release.sh runs this suite as a release gate, so a flake here blocks a
+// release for a reason that has nothing to do with the release.
+vi.setConfig({ testTimeout: 300_000, hookTimeout: 300_000 });
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const releaseShPath = join(repoRoot, "release.sh");

@@ -204,6 +204,112 @@ describe("loadLocalBundles", () => {
     expect(r.config?.servers[0].runtime).toBeUndefined();
   });
 
+  it("propagates a remote server's headers from bundles.json", async () => {
+    // Same whitelist trap again, and here it would have made the field
+    // unreachable: `headers` is the only credential channel a remote upstream
+    // has, since it spawns no process and its `env` is ignored by design.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "remotey",
+          name: "Remote",
+          type: "remote",
+          url: "https://mcp.example.test/mcp",
+          headers: { Authorization: "Bearer ${secret:tok}", "X-Trace": "1" },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].headers).toEqual({ Authorization: "Bearer ${secret:tok}", "X-Trace": "1" });
+  });
+
+  it("drops blank header values and blank header names", async () => {
+    // Blank is dropped for a DIFFERENT reason than `env`'s empty-string seed:
+    // nothing is inherited on a remote entry, so a blank header is a
+    // half-finished edit. Sending `Authorization:` with an empty value reads
+    // to a server as a malformed credential rather than as none at all.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [
+        {
+          namespace: "remotey",
+          name: "Remote",
+          type: "remote",
+          url: "https://mcp.example.test/mcp",
+          headers: { Authorization: "", "X-Blank": "   ", "  ": "v", "X-Good": " kept ", "X-Num": 42 },
+        },
+      ],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    // The surviving value keeps its own whitespace (a header value can
+    // legitimately contain spaces); only the NAME is trimmed.
+    expect(r.config?.servers[0].headers).toEqual({ "X-Good": " kept " });
+  });
+
+  it("treats a non-object headers value as absent", async () => {
+    for (const bad of ["Authorization: x", 42, null, ["a"]]) {
+      writeBundles(synthHome, {
+        version: 1,
+        servers: [{ namespace: "remotey", name: "Remote", type: "remote", url: "https://x.test/mcp", headers: bad }],
+      });
+      const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+      expect(r.config?.servers[0].headers, JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+
+  it("propagates a per-server complianceGrade from bundles.json", async () => {
+    // Same whitelist trap as runtime and connectTimeoutMs, and this one
+    // disabled a security-shaped feature rather than a tuning knob. grades.json
+    // (written only by `yaw-mcp audit`, one server at a time, by hand) was the
+    // sole supplier of a grade, so on a fresh install every server was ungraded
+    // -- and ungraded always passes, which made YAW_MCP_MIN_COMPLIANCE gate
+    // nothing at all. `yaw-mcp add` now records the catalog's published grade,
+    // which only reaches the gate if this field survives the load.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "graded", name: "Graded", command: "npx", args: ["-y", "g-mcp"], complianceGrade: "B" }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].complianceGrade).toBe("B");
+  });
+
+  it("uppercases a lowercase grade so it cannot rank differently", async () => {
+    // The grades cache uppercases on read; a config grade that did not would
+    // sort as unrecognized and silently stop gating.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "graded", name: "Graded", command: "npx", args: ["-y", "g-mcp"], complianceGrade: "c" }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].complianceGrade).toBe("C");
+  });
+
+  it("passes an UNRECOGNIZED grade through rather than narrowing to A-F", async () => {
+    // Deliberate. compliance.ts three-way classifies a grade -- graded,
+    // ungraded, unrecognized -- and treats the third as a sign of
+    // misconfiguration or tampering, NOT as a synonym for ungraded. Narrowing
+    // here would make that arm unreachable from the one file a user hand-edits,
+    // which is exactly where a garbled letter is worth reporting.
+    writeBundles(synthHome, {
+      version: 1,
+      servers: [{ namespace: "weird", name: "Weird", command: "npx", args: ["-y", "w-mcp"], complianceGrade: "ZZZ" }],
+    });
+    const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+    expect(r.config?.servers[0].complianceGrade).toBe("ZZZ");
+  });
+
+  it("treats a blank or non-string grade as absent", async () => {
+    for (const bad of ["", "   ", 42, null, {}]) {
+      writeBundles(synthHome, {
+        version: 1,
+        servers: [{ namespace: "blank", name: "Blank", command: "npx", args: ["-y", "b-mcp"], complianceGrade: bad }],
+      });
+      const r = await loadLocalBundles({ home: synthHome, cwd: synthCwd });
+      expect(r.config?.servers[0].complianceGrade, JSON.stringify(bad)).toBeUndefined();
+    }
+  });
+
   it("propagates a per-server connectTimeoutMs from bundles.json", async () => {
     // validateEntry returns a fixed whitelist, so a field missing from it is
     // dropped at load. bundles.json is the only server source, and nothing else
