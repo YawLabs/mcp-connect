@@ -431,6 +431,56 @@ describe("runAdd", () => {
     expect(entry?.description).toBe("does a thing");
   });
 
+  it("never prints a header VALUE in --json, the way env is already redacted", async () => {
+    // headers is the credential channel for a remote server, so an
+    // Authorization value here is a live bearer token -- and this envelope is
+    // what gets piped into CI logs and pasted into bug reports. Shipped
+    // briefly printing `envKeys: [...]` next to a full `Bearer <token>` in one
+    // output. A ${secret:NAME} reference would be safe to print, but the
+    // envelope cannot tell the reader which one it holds without printing it.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer LITERAL-TOKEN-abc123" },
+      json: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io2.out.push(s),
+      err: (s) => io2.err.push(s),
+    });
+    const stdout = io2.out.join("");
+    expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
+    const parsed = JSON.parse(stdout);
+    expect(parsed.entry.headers).toBeUndefined();
+    expect(parsed.entry.headerNames).toEqual(["Authorization"]);
+  });
+
+  it("renders a remote --dry-run as its url, not as an undefined command", async () => {
+    // The preview hand-rolled `command + args`, which a remote entry has
+    // neither of -- so every --url dry run printed a literal
+    // "command: undefined ". renderLaunch already knows the url shape.
+    const io2 = captureIO();
+    await runAdd({
+      slug: "remotey",
+      url: "https://mcp.example.test/mcp",
+      headers: { Authorization: "Bearer LITERAL-TOKEN-abc123" },
+      dryRun: true,
+      home: synthHome,
+      cwd: synthCwd,
+      env: {},
+      out: (s) => io2.out.push(s),
+      err: (s) => io2.err.push(s),
+    });
+    const stdout = io2.out.join("");
+    expect(stdout).toContain("HTTP https://mcp.example.test/mcp");
+    expect(stdout).not.toContain("undefined");
+    // Same redaction as the json envelope: names, never values.
+    expect(stdout).toContain("header names: Authorization");
+    expect(stdout).not.toContain("LITERAL-TOKEN-abc123");
+  });
+
   it("writes a remote entry from --url, with headers and no command", async () => {
     const io = captureIO();
     const r = await runAdd({
@@ -729,7 +779,7 @@ describe("runAdd", () => {
     });
     expect(r.exitCode).toBe(0);
     expect(io.text()).toContain('would write Fetch as namespace "fetch"');
-    expect(io.text()).toContain("command: npx -y @yawlabs/fetch-mcp");
+    expect(io.text()).toContain("launch: $ npx -y @yawlabs/fetch-mcp");
   });
 
   it("--dry-run text says 'would update' once the entry exists, and lists env KEY names only", async () => {
@@ -1115,7 +1165,7 @@ describe("runAdd re-add preserves user state", () => {
     expect(r.exitCode).toBe(0);
     expect(io.text()).toContain('would update Fetch as namespace "fetch"');
     expect(io.text()).toMatch(/would stay disabled and NOT load/);
-    expect(io.text()).toContain("command: npx -y @yawlabs/fetch-mcp");
+    expect(io.text()).toContain("launch: $ npx -y @yawlabs/fetch-mcp");
     // ...and a dry run still writes nothing: the stale entry is untouched.
     expect(rawServers()[0].isActive).toBe(false);
     expect(rawServers()[0].args).toEqual(["-y", "stale"]);

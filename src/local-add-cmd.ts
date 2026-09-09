@@ -304,10 +304,23 @@ export function parseAddArgs(
  *  posture printRemovalPreview, the dry-run text output and trust-cmd's env
  *  line already take. Read the values from bundles.json if you need them. */
 function jsonEntry(entry: Partial<UpstreamServerConfig>): Record<string, unknown> {
-  const { env, ...rest } = entry;
+  const { env, headers, ...rest } = entry;
   const out: Record<string, unknown> = { ...rest };
   const keys = Object.keys(env ?? {});
   if (keys.length > 0) out.envKeys = keys;
+  // `headers` gets the SAME treatment, for the same reason and more sharply:
+  // it is the credential channel for a remote server, so an Authorization
+  // value here is a live bearer token, and this envelope is the thing that
+  // gets piped into CI logs and pasted into bug reports. Redacting env while
+  // printing headers in the clear was the shape this had when headers were
+  // first added -- one output showed `envKeys: [...]` next to a full
+  // `Bearer <token>`.
+  //
+  // Names only, like env: a `${secret:NAME}` reference is safe to print, but a
+  // LITERAL token passed with --header is not, and the envelope cannot tell
+  // the reader which one it holds without printing it.
+  const headerNames = Object.keys(headers ?? {});
+  if (headerNames.length > 0) out.headerNames = headerNames;
   return out;
 }
 
@@ -627,8 +640,17 @@ export async function runAdd(opts: AddCommandOptions): Promise<AddCommandResult>
           ? `as namespace "${previewNamespace}"`
           : `keeping existing namespace "${previewNamespace}"`;
       print(`yaw-mcp add (dry-run): would ${preview.replaced ? "update" : "write"} ${server.name} ${nsNote}`);
-      print(`  command: ${previewEntry.command} ${(previewEntry.args ?? []).join(" ")}`);
+      // Through renderLaunch, not a hand-rolled `command + args`: a REMOTE
+      // entry has neither, so the old line rendered a literal
+      // "command: undefined " for every --url add. renderLaunch already knows
+      // the three shapes (argv, url, neither) and is what the removal preview
+      // and the trust gate print, so the preview now agrees with them.
+      print(`  launch: ${renderLaunch(previewEntry)}`);
       if (previewEntry.env) print(`  env keys: ${Object.keys(previewEntry.env).join(", ")}`);
+      // Header NAMES only. A --header value can be a live bearer token, and
+      // --dry-run exists to be pasted into a bug report -- the same reason
+      // env is printed by key here and redacted in the --json envelope.
+      if (previewEntry.headers) print(`  header names: ${Object.keys(previewEntry.headers).join(", ")}`);
       // Same note the real run prints, in the conditional voice -- an add over
       // a hand-disabled entry keeps it disabled (mergeServerEntry rule 3), so
       // a preview that ended on the usual success line told the user this

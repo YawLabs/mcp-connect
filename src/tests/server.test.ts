@@ -3112,14 +3112,13 @@ describe("ConnectServer", () => {
       expect(parsed.ok).toBe(true);
       // "second" step output: single text item -> parsed as string.
       expect(parsed.result).toBe("PR #42 body");
-      // An explicit `return` selects one output, so the others are NOT echoed
-      // back. Both step names still appear, so a caller can see the whole
-      // pipeline ran and re-run with a different `return` to get a value it
-      // skipped -- what it does not get is every intermediate replayed into
-      // its context alongside a second copy of the one it asked for.
-      expect(Object.keys(parsed).sort()).toEqual(["ok", "result", "stepKeys"]);
+      // Small intermediates ride along even with an explicit `return`: the
+      // values a caller cannot reconstruct after a side effect are small, and
+      // losing them to save a few hundred bytes is a bad trade. `stepKeys` is
+      // added either way. See the large-payload case below for the other half.
+      expect(Object.keys(parsed).sort()).toEqual(["ok", "result", "stepKeys", "steps"]);
       expect(parsed.stepKeys.slice().sort()).toEqual(["first", "second"]);
-      expect(parsed.steps).toBeUndefined();
+      expect(parsed.steps.first).toBe(42);
       // The second upstream call must have received the resolved value,
       // not the raw $ref marker -- otherwise the resolver never fired.
       // "42" parses as the number 42 via JSON.parse, so number (not string).
@@ -3188,12 +3187,44 @@ describe("ConnectServer", () => {
       const text = selected.content[0].text;
 
       expect(JSON.parse(text).result).toBe("PR #0 body");
-      // The list the caller explicitly did not select is absent, and so is a
-      // second copy of the value it did.
+      // Over the echo budget, so the list the caller did not select is dropped,
+      // along with a second copy of the value it did.
       expect(text).not.toContain("pr 199");
       expect(text.match(/PR #0 body/g)).toHaveLength(1);
+      expect(JSON.parse(text).steps).toBeUndefined();
       // And it is dramatically smaller than the un-selected form would be.
       expect(text.length).toBeLessThan(bigList.length / 10);
+    });
+
+    it("keeps a small side-effect result even when `return` names a later step", async () => {
+      // The case that makes the budget necessary rather than merely nice. exec
+      // declares idempotentHint:false, and this file's own preflight test says
+      // re-running a pipeline whose step 0 files an issue "files a second
+      // one". So on `a = create_issue(); b = comment(a.number); return b`,
+      // dropping `a` destroys the new issue's number with no safe way to get
+      // it back -- and "re-run with a different return" is the one recovery
+      // the rest of the file treats as a hazard. Small payload, so it stays.
+      const priv = getPrivate(server);
+      const conn = makeConnection("gh", ["create_issue", "comment"]);
+      conn.client.callTool = vi
+        .fn()
+        .mockResolvedValueOnce({ content: [{ type: "text", text: '{"number":4242,"url":"https://x.test/i/4242"}' }] })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "commented" }] });
+      priv.connections.set("gh", conn);
+      priv.config = makeConfig([makeServerConfig({ namespace: "gh" })]);
+      priv.rebuildRoutes();
+
+      const result = await priv.handleToolCall("mcp_connect_exec", {
+        steps: [
+          { id: "a", tool: "gh_create_issue", args: {} },
+          { id: "b", tool: "gh_comment", args: { n: { $ref: "a.number" } } },
+        ],
+        return: "b",
+      });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.result).toBe("commented");
+      // The irreplaceable part of the side effect survives.
+      expect(parsed.steps.a).toEqual({ number: 4242, url: "https://x.test/i/4242" });
     });
 
     it("fails the whole pipeline and surfaces partial outputs when a step errors", async () => {

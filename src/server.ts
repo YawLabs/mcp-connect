@@ -206,6 +206,17 @@ export const MAX_VAULT_PASSPHRASE_PROMPTS = 2;
  *  GITHUB_TOKEN says nothing about the next server's. */
 const MAX_CREDENTIAL_PROMPTS = 2;
 
+/** How many bytes of intermediate step output an exec echoes back when the
+ *  caller named an explicit `return`.
+ *
+ *  Under it, every binding rides along: the values a caller cannot reconstruct
+ *  after a side-effecting step (an issue number, a created URL) are small, and
+ *  losing them to save a few hundred bytes is a bad trade. Over it, only
+ *  `stepKeys` -- that is the large skipped payload whose replay this exists to
+ *  avoid. Sized well above a handful of ids and well below a list worth
+ *  paging through. */
+export const EXEC_ECHO_BUDGET_BYTES = 4096;
+
 // Last baseline the clamp warning in resolveIdleThreshold fired for. Keyed on
 // the VALUE, not a boolean, so a session (or a test) that changes the env to a
 // different out-of-range value is told again, while a steady out-of-range value
@@ -4803,15 +4814,26 @@ export class ConnectServer {
     // documented example (`a = gh_list_prs(); b = gh_get_pr(a[0].number);
     // return b`) it was returning the whole PR list and `b` twice.
     //
-    // `stepKeys` still names every step that ran, so nothing becomes
-    // invisible: the caller can see the pipeline completed end to end, and
-    // ask for a value it skipped by re-running with a different `return`.
-    // Without an explicit return there is nothing to have selected, so the
-    // full bindings stay -- that is the shape a caller relying on the last
-    // step's value alongside its intermediates already gets.
-    const body = explicitReturn
-      ? { ok: true, result: finalResult, stepKeys }
-      : { ok: true, result: finalResult, steps: bindings };
+    // Dropping them UNCONDITIONALLY was wrong, and the reason is in this same
+    // file. exec declares idempotentHint:false, and the preflight hoist exists
+    // precisely because step 0 can FILE AN ISSUE -- its test says re-running
+    // "files a second one". So on `a = create_issue(); b = comment(a.number);
+    // return b`, discarding `a` destroys the new issue's number and URL, and
+    // the recovery this comment used to suggest -- re-run naming a different
+    // `return` -- is the one action the rest of the file treats as a hazard.
+    //
+    // Size separates the two cases, and separates them cleanly: the bindings a
+    // caller cannot reconstruct are small (an id, a URL, a status), while the
+    // ones worth not replaying are large (the 200-element list the caller
+    // wanted one element of). So keep every intermediate while the whole set
+    // is small, and fall back to names only once echoing it is the cost this
+    // change was made to avoid. `stepKeys` is present on both explicit-return
+    // shapes, so "which steps ran" never depends on the size.
+    const body = !explicitReturn
+      ? { ok: true, result: finalResult, steps: bindings }
+      : JSON.stringify(bindings).length > EXEC_ECHO_BUDGET_BYTES
+        ? { ok: true, result: finalResult, stepKeys }
+        : { ok: true, result: finalResult, stepKeys, steps: bindings };
 
     return {
       content: [
